@@ -27,11 +27,11 @@ SHA, this directory, and the sysroot. `build.sh` verifies that by setting
 `KCONFIG_NOTIMESTAMP`, busybox's own opt-out; without it the version banner
 carries the wall clock and the fingerprint changes on every run.
 
-    8ac4b568651297a87df7f3cb4c4d2c79ec3262d090036d93391c8759ee887e4f
+    68218d3b875b2a4d9bc77e523a4e6168ee29cd611ec44f8e8049ef2844d9fb68
 
 ## The patches
 
-Five, each one concern, each with its reasoning in the header.
+Six, each one concern, each with its reasoning in the header.
 
 **`0001-samsara-feature-ledger.patch`** — `include/platform.h`
 
@@ -101,6 +101,22 @@ function rather than a misplaced startup file.
 wrong one: `scripts/Makefile.build` feeds `LDFLAGS` to the intermediate `ld -r`
 links that assemble each directory's `built-in.o`, so a `crt1.o` there gets its
 `_start` copied into every one of them, and they then collide with the real one.
+
+**`0006-do-not-feed-compiler-flags-to-ld.patch`** — `scripts/Makefile.lib`
+
+`ld_flags` strips only `-Wl,` options before handing `LDFLAGS` to the
+intermediate `ld -r` links, so everything else goes to `ld` verbatim -- including
+the flags only a compiler driver understands. `-static-pie` and `-fPIE` are what
+this port links with (see *Configuration*), and ld rejects them by name, so an
+`ld -r` step fails with "unknown argument" naming a flag the caller never typed at
+the `ld` step. The error is about a relocatable link that has nothing to do with
+how the final link is shaped.
+
+Dropping them is right rather than merely convenient: a `-r` link combines objects
+into one and does not produce an executable, so it has no use for an executable's
+link mode. The flags still reach the link that does matter -- the final one, driven
+through `$(CC)`, which is where `scripts/trylink` hands `LDFLAGS` straight to the
+compiler.
 
 ## The headers
 
@@ -203,12 +219,33 @@ reduced version of itself but a program that fails when used.
   denied a choice it could have used.
 - **`nice`, `taskset`, `ionice`** — one CPU, and a nice value nothing reads.
 
+## Status
+
+The binary builds, is embedded in the kernel image, and runs: the installer
+populates `/bin` with 107 links to it and then `execve`s `/bin/true`, `/bin/echo`
+and `/bin/ls` through their own paths, which is the only route to the applet
+dispatch and therefore the only honest test that the links resolve.
+
 ## Known limitations
+
+- **No thread block, so no `malloc`.** mlibc's allocator is a `thread_local`, and
+  the kernel loader does not lay out a thread block or set `%fs` for a freshly
+  exec'd image. mlibc normally has its dynamic loader do that; here the kernel is
+  the loader, and it does not do it. So the *first* allocation in any process
+  reads a thread pointer the kernel never set, and faults.
+
+  This is the next piece of work and it gates a shell: `ash` allocates almost
+  immediately, and an applet that cannot allocate is a program that cannot run.
+  `ports/busybox/README`'s sibling problem, in `ports/mlibc`, is that `setenv` and
+  `unsetenv` reach the same allocator -- so a C program here can read its
+  environment but not change it. `user/chello.c` says so in the source, next to
+  the checks that are deliberately absent because of it.
 
 - `id`, `whoami` and `groups` are enabled and resolve the caller's name through the
   passwd database, which is why the mlibc port carries the `getpwnam`/`getpwuid`
-  sysdeps for this port. They are the only applets here that need it, and a shell with
-  no `id` is a shell you cannot check anything with.
+  sysdeps for this port and the kernel seeds `/etc/passwd`. They are the only
+  applets here that need it, and a shell with no `id` is a shell you cannot check
+  anything with.
 - `CONFIG_FEATURE_SH_READLINE` and `CONFIG_FEATURE_SH_HISTORY` do not exist in 1.37.
   ash's line editor is not optional and not a separate symbol; nothing was lost, and
   the absence of the symbols is why they are absent from `config` rather than set to
