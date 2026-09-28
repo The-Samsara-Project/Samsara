@@ -852,6 +852,33 @@ extern "Rust" {
     pub fn vfs_devfs_register(name: &str, dev: *mut ()) -> Result<(), i32>;
     /// Register a block device
     pub fn vfs_devfs_register_block(name: &str, dev: *mut ()) -> Result<(), i32>;
+    /// Register a character device into `/dev/<dir>/<name>`, creating `dir` if
+    /// it does not exist. Used for `/dev/pts/<n>`.
+    pub fn vfs_devfs_register_in_dir(dir: &str, name: &str, dev: *mut ()) -> Result<(), i32>;
+}
+
+/// Register a character device into a devfs subdirectory, e.g. `/dev/pts/3`.
+///
+/// Separate from [`register_char_device`] because the Linux pty layout puts
+/// slaves in a subdirectory, and a program that has been handed `/dev/pts/3` by
+/// `ptsname(3)` has to be able to open exactly that. A flat name would leave
+/// `ptsname` reporting a path that does not exist.
+pub fn register_char_device_in_dir(
+    dir: &str,
+    name: &str,
+    dev: Arc<dyn CharDevice>,
+) -> DriverResult<()> {
+    let raw = Box::into_raw(Box::new(dev)) as *mut ();
+    let res = unsafe { vfs_devfs_register_in_dir(dir, name, raw) };
+    if res.is_err() {
+        // SAFETY: `raw` came from `Box::into_raw` of a `Box<Arc<dyn CharDevice>>`.
+        unsafe {
+            let _ = *Box::from_raw(raw as *mut Arc<dyn CharDevice>);
+        }
+        Err(DriverError::IoError)
+    } else {
+        Ok(())
+    }
 }
 
 /// Register a character device instance with the kernel devfs.

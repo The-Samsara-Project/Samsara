@@ -6,7 +6,7 @@
 // One static-PIE binary embeds every command; the shell (and any other caller)
 // forks, execs this image with an argv whose argv[0] names the command, then
 // reaps it with waitpid. All output goes to the session's PTY slave
-// (`/dev/pts0`), from where the kernel line discipline (OPOST) forwards it to
+// (`/dev/pts/0`), from where the kernel line discipline (OPOST) forwards it to
 // the terminal emulator on the master side.
 
 #![no_std]
@@ -22,11 +22,11 @@ use nutcracker_rt::syscall::{self, O_RDWR};
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    let fd = match syscall::open("/dev/pts0", O_RDWR, 0) {
+    let fd = match syscall::open("/dev/pts/0", O_RDWR, 0) {
         Ok(fd) => fd,
         Err(e) => {
             // No tty to report to; serial is the only remaining sink.
-            nutcracker_rt::println!("[samutils] open /dev/pts0 failed: {}", e);
+            nutcracker_rt::println!("[samutils] open /dev/pts/0 failed: {}", e);
             syscall::proc_exit_code(1);
         }
     };

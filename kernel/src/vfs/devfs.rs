@@ -107,15 +107,18 @@ impl Vnode for CharDeviceNode {
 /// `/dev/mouse0` existed, so a subdirectory node is all that is needed to make
 /// a nested path resolve: the VFS already walks components with `lookup`.
 pub struct DevSubdir {
-    name: &'static str,
+    /// The name this directory is published under, owned rather than `&'static
+    /// str` because a subdirectory name can be computed at runtime -- `/dev/pts`
+    /// is created on demand rather than declared up front.
+    name: String,
     children: Spinlock<BTreeMap<String, VnodeRef>>,
 }
 
 impl DevSubdir {
     /// Create an empty subdirectory.
-    pub fn new(name: &'static str) -> Self {
+    pub fn new(name: &str) -> Self {
         DevSubdir {
-            name,
+            name: String::from(name),
             children: Spinlock::new(BTreeMap::new()),
         }
     }
@@ -126,8 +129,8 @@ impl DevSubdir {
     }
 
     /// The directory's own name, for diagnostics.
-    pub fn name(&self) -> &'static str {
-        self.name
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -520,6 +523,60 @@ pub fn path_of(target: &VnodeRef) -> Option<String> {
         .map(|(path, _)| path.clone())
 }
 
+/// Register `node` inside `/dev/<dir>/<name>`, creating `dir` if needed.
+///
+/// Used for `/dev/pts/<n>`. Linux keeps pty slaves in a subdirectory rather
+/// than flat in `/dev`, and the distinction is not cosmetic: `ptsname(3)`
+/// returns a *path*, so a libc that reports `/dev/pts/0` is naming a file that
+/// has to open. Publishing the slaves flat as `/dev/pts0` left every program's
+/// `ptsname` -- and every hand-rolled equivalent -- pointing at nothing, and the
+/// failure surfaced at the first open of the program's own terminal.
+///
+/// The directory is created on demand rather than assumed, because the
+/// multiplexer can be opened before or after the boot pair is registered and
+/// either may be the first to need it.
+pub fn register_in_dir(dir: &str, name: &str, node: VnodeRef) -> Result<(), FsError> {
+    let sub = subdir(dir);
+    sub.insert(name, node.clone());
+    // The reverse index too, or `ttyname` cannot find the device. Inserting
+    // into the subdirectory makes the path *resolve*; recording it is what makes
+    // it *discoverable*, and a terminal needs both -- it is handed the path and
+    // then has to recognise it as its own.
+    record(alloc::format!("/dev/{}/{}", dir, name), node);
+    Ok(())
+}
+
+/// Every devfs subdirectory, by the name it is published under.
+///
+/// Held alongside the published `VnodeRef` rather than recovered from it. A
+/// `VnodeRef` is a `&dyn Vnode`, and turning one back into an `Arc<DevSubdir>`
+/// needs an `Any` supertrait the trait does not have -- the only ways through are
+/// an unsafe vtable cast, which is sound only while every subdirectory really is
+/// a `DevSubdir`, or a raw-pointer round trip. Keeping the typed handle is both
+/// safer and clearer, and it is what lets `register_in_dir` find the same object
+/// the path resolves to.
+static SUBDIRS: Spinlock<BTreeMap<String, alloc::sync::Arc<DevSubdir>>> =
+    Spinlock::new(BTreeMap::new());
+
+/// The named devfs subdirectory, created on first use and reused after.
+fn subdir(dir: &str) -> alloc::sync::Arc<DevSubdir> {
+    if let Some(existing) = SUBDIRS.lock().get(dir) {
+        return existing.clone();
+    }
+    let fresh = alloc::sync::Arc::new(DevSubdir::new(dir));
+    // Publish the path entry as well, so `/dev/<dir>` resolves for a program
+    // that lists the directory rather than one that already knows the name.
+    if let Some(root) = DEV_DIR.lock().as_ref() {
+        root.devices
+            .lock()
+            .insert(String::from(dir), fresh.clone() as VnodeRef);
+    }
+    SUBDIRS
+        .lock()
+        .insert(String::from(dir), fresh.clone());
+    fresh
+}
+
 /// Publish an already-populated subdirectory at `/dev/<name>`.
 ///
 /// Separate from [`register`] because the caller has already filled the
@@ -537,6 +594,9 @@ pub fn register_subdir(name: &str, dir: Arc<DevSubdir>) -> Result<(), FsError> {
     // because a subdirectory is normally populated *before* it is published --
     // the input device builds its tree first and is then registered -- so at
     // insert time the full path does not exist yet.
+    SUBDIRS
+        .lock()
+        .insert(String::from(name), dir.clone());
     record(base.clone(), node);
     for (child_name, child) in dir.children.lock().iter() {
         record(alloc::format!("{}/{}", base, child_name), child.clone());

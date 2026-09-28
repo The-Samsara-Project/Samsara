@@ -86,7 +86,7 @@ pub fn open_read(who: &str, path: &str, out: &mut Tty) -> Option<usize> {
 
 /// Open the tty for reading (used by `cat`/`grep`/`wc` with no file args).
 pub fn open_tty_in() -> Option<usize> {
-    syscall::open("/dev/pts0", O_RDONLY, 0).ok()
+    syscall::open("/dev/pts/0", O_RDONLY, 0).ok()
 }
 
 /// Human-readable rendition of a (negative) kernel errno.

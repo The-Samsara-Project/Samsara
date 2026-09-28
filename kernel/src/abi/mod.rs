@@ -950,7 +950,7 @@ fn acquire_controlling_tty(task: usize, node: &crate::vfs::VnodeRef) {
     if !node.is_terminal() {
         return;
     }
-    let sid = crate::task::sched::task_groups(task).1;
+    let sid = crate::task::sched::task_groups(task).sid;
     node.acquire_session(sid);
 }
 
@@ -966,11 +966,18 @@ fn acquire_controlling_tty(task: usize, node: &crate::vfs::VnodeRef) {
 /// the other's keystrokes.
 fn open_ptmx(task: usize, accmode: u32, status: u32) -> Option<i64> {
     let (master, index) = crate::drivers::pty::open_ptmx()?;
-    let name = alloc::format!("pts{}", index);
+    let name = alloc::format!("{}", index);
     let slave = crate::drivers::pty::slave_of(&master);
-    if crate::vfs::devfs::register(&name, alloc::sync::Arc::new(
-        crate::drivers::pty::PtySlaveDevice::new(slave),
-    ))
+    // Published as `/dev/pts/<n>`, which is the path `ptsname(3)` reports.
+    // A program handed that name by the libc then has to be able to open it,
+    // and a flat `/dev/pts<n>` would leave every `ptsname` naming nothing.
+    if crate::vfs::devfs::register_in_dir(
+        "pts",
+        &name,
+        crate::vfs::devfs::anonymous(alloc::sync::Arc::new(
+            crate::drivers::pty::PtySlaveDevice::new(slave),
+        )),
+    )
     .is_err()
     {
         return Some(errno::EIO);
@@ -2680,7 +2687,7 @@ fn sys_getpgid(pid: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i6
         Err(e) => return e,
     };
     let target = if pid == 0 { task } else { pid as usize };
-    let (pgid, _) = crate::task::sched::task_groups(target);
+    let pgid = crate::task::sched::task_groups(target).pgid;
     if pgid == 0 {
         errno::ESRCH
     } else {
@@ -2701,7 +2708,7 @@ fn sys_getsid(pid: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64
         Err(e) => return e,
     };
     let target = if pid == 0 { task } else { pid as usize };
-    let (_, sid) = crate::task::sched::task_groups(target);
+    let sid = crate::task::sched::task_groups(target).sid;
     if sid == 0 {
         errno::ESRCH
     } else {

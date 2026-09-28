@@ -23,6 +23,7 @@ use spin::Mutex;
 use driver_common::{
     DriverError, DriverResult, CharDevice, DeviceInfo, DeviceClass, DeviceCapabilities,
     DriverRegistration, DriverEntry, register_char_device,
+    register_char_device_in_dir,
 };
 
 mod ldisc;
@@ -55,10 +56,12 @@ extern "Rust" {
 }
 
 /// Kernel bridge: may the calling task hand its terminal's foreground role to
-/// process group `pgid`? Enforces the POSIX rule that the group must belong to
-/// the calling task's session. Returns 1 when allowed.
+/// process group `pgid`? Enforces the POSIX rule that the caller and the target
+/// group must both belong to the *terminal's* session -- which is why `tty_sid`
+/// is a parameter and not something the callee looks up itself. Returns true
+/// when allowed.
 extern "Rust" {
-    fn tty_check_pgrp(pgid: u64) -> bool;
+    fn tty_check_pgrp(pgid: u64, tty_sid: u64) -> bool;
 }
 
 /// Set of task ids waiting for readiness on one direction of a terminal.
@@ -588,11 +591,15 @@ impl PtySlave {
                 if pgid == 0 {
                     return Err(DriverError::InvalidArgument);
                 }
-                // POSIX: only a member of the terminal's session may hand the
-                // foreground role to a process group in that same session. The
-                // kernel bridge enforces the membership half.
+                // POSIX: only a member of the terminal's *own* session may hand
+                // the foreground role to a group in that same session. Both
+                // halves are checked, and the terminal's session is passed in
+                // because only the driver knows it -- a check made without it
+                // would have to fall back to the caller's session, which is a
+                // different thing and lets one session take over another's
+                // terminal.
                 // SAFETY: the kernel exports this symbol (kernel/src/lib.rs).
-                let ok = unsafe { tty_check_pgrp(pgid as u64) };
+                let ok = unsafe { tty_check_pgrp(pgid as u64, self.get_sid() as u64) };
                 if !ok {
                     return Err(DriverError::InvalidArgument);
                 }
@@ -909,7 +916,7 @@ impl CharDevice for PtySlaveDevice {
 /// Samsara previously bound `/dev/ptmx` to one fixed pair at init, which made
 /// every user of the multiplexer share a single terminal. This device fixes
 /// that: pair 0 stays reserved for the boot-time console front end (which
-/// refers to `/dev/pts0` by name), and each open of `/dev/ptmx` hands out a
+/// refers to `/dev/pts/0` by name), and each open of `/dev/ptmx` hands out a
 /// fresh pair from 1 upward.
 pub struct PtmxDevice;
 
@@ -951,9 +958,14 @@ pub fn slave_of(master: &Arc<PtyMaster>) -> Arc<PtySlave> {
 /// Register the boot-time pty pair plus the `/dev/ptmx` multiplexer.
 pub fn register_devices() -> DriverResult<()> {
     // Pair 0 is the boot console's terminal, published under a fixed name
-    // because the installer and terminal refer to `/dev/pts0` directly.
+    // because the installer and terminal refer to `/dev/pts/0` directly.
     let (_master0, slave0) = allocate()?;
-    register_char_device("pts0", Arc::new(PtySlaveDevice { slave: slave0.clone() }))?;
+    // The boot pair's slave is `/dev/pts/0`, in the same directory every later
+    // multiplexer-allocated slave lands in. One layout for all of them, so a
+    // program that constructs a path by substituting an index -- which is what
+    // `ptsname(3)` returns and what this port's `forkpty` builds -- works for
+    // pair 0 as well as for the pairs allocated afterwards.
+    register_char_device_in_dir("pts", "0", Arc::new(PtySlaveDevice { slave: slave0.clone() }))?;
     // The master of pair 0 is reachable as `/dev/ptmx0` for anything that
     // wants to drive the console terminal directly; `/dev/ptmx` itself is the
     // allocating multiplexer.
@@ -962,7 +974,7 @@ pub fn register_devices() -> DriverResult<()> {
         register_char_device("ptmx0", Arc::new(PtyMasterDevice { master: m }))?;
     }
     register_char_device("ptmx", Arc::new(PtmxDevice))?;
-    driver_common::kinfo!("pty: registered ptmx (multiplexer) and pts0 (boot console)");
+    driver_common::kinfo!("pty: registered ptmx (multiplexer) and pts/0 (boot console)");
     Ok(())
 }
 

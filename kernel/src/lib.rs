@@ -248,14 +248,32 @@ pub extern "Rust" fn tty_signal(pgid: u32, sig: u32) {
 /// could point its terminal at a group it does not own and lose track of its
 /// own jobs.
 #[no_mangle]
-pub extern "Rust" fn tty_check_pgrp(pgid: u64) -> bool {
-    let sid = crate::task::sched::current_sid();
-    if sid == 0 {
+pub extern "Rust" fn tty_check_pgrp(pgid: u64, tty_sid: u64) -> bool {
+    // A terminal may only be manipulated by a member of *its own* session, and
+    // only to hand the foreground to a group in that same session.
+    //
+    // The previous version compared the target group against the *caller's*
+    // session and never looked at the terminal's, so a process in session A
+    // could set the foreground of a terminal belonging to session B to a group
+    // in A. That hands control of B's terminal to A: B's shell loses the
+    // terminal it is supposed to own, and signals meant for B's foreground job
+    // go to A's. The driver knows the terminal's session and simply was not
+    // being told, so the check could not be made correctly from where it was.
+    if tty_sid == 0 {
+        // The terminal has no session, so there is nothing to be a member of.
         return false;
     }
+    if crate::task::sched::current_sid() != tty_sid as u32 {
+        return false;
+    }
+    // The target must be a live process group in the terminal's session. An
+    // empty group means the id names nothing, which is the case that matters:
+    // a process that is not a group leader has a pid that is not a valid pgid,
+    // and setting the foreground to it would record a group that can never be
+    // waited on or signalled.
     crate::task::sched::tasks_in_group(pgid as u32)
         .first()
-        .map(|t| crate::task::sched::task_groups(*t).0 == sid)
+        .map(|t| crate::task::sched::task_groups(*t).sid == tty_sid as u32)
         .unwrap_or(false)
 }
 
@@ -411,6 +429,30 @@ pub extern "Rust" fn vfs_devfs_register(name: &str, dev: *mut ()) -> Result<(), 
     // via `Box::into_raw`. The box is consumed and the `Arc` adopted.
     let boxed = unsafe { Box::from_raw(dev as *mut Arc<dyn CharDevice>) };
     crate::vfs::devfs::register(name, *boxed).map_err(|e| e.into())
+}
+
+/// Register a driver-provided character device into `/dev/<dir>/<name>`.
+///
+/// Used for the pty slaves, which Linux keeps in `/dev/pts/` rather than flat in
+/// `/dev`. The directory is created on demand.
+///
+/// `dev` must be a `Box::into_raw`'d `Arc<dyn CharDevice>` produced by the
+/// driver.
+#[no_mangle]
+pub extern "Rust" fn vfs_devfs_register_in_dir(
+    dir: &str,
+    name: &str,
+    dev: *mut (),
+) -> Result<(), i32> {
+    // SAFETY: `dev` must be a `Box<Arc<dyn CharDevice>>` produced by the driver
+    // via `Box::into_raw`. The box is consumed and the `Arc` adopted.
+    let boxed = unsafe { Box::from_raw(dev as *mut Arc<dyn CharDevice>) };
+    crate::vfs::devfs::register_in_dir(
+        dir,
+        name,
+        crate::vfs::devfs::anonymous((*boxed).clone()),
+    )
+    .map_err(|e| e.into())
 }
 
 /// Register a driver-provided block device into devfs at `name`.

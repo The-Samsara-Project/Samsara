@@ -6,7 +6,7 @@
 // please it by IPC instead of poking DEBUG_WRITE directly. It answers `Call`s
 // with "ok", logs `Notify`s, reports `Irq` events, and — when the notify
 // comes from the keyboard server — feeds the bytes into the console
-// PTY master so the shell on `/dev/pts0` receives them.
+// PTY master so the shell on `/dev/pts/0` receives them.
 
 #![no_std]
 #![no_main]
@@ -14,7 +14,7 @@
 use nutcracker_rt::ipc::{self, MsgFrame};
 use nutcracker_rt::{println, syscall};
 
-/// The master end of pair 0, the pty whose slave is `/dev/pts0`.
+/// The master end of pair 0, the pty whose slave is `/dev/pts/0`.
 ///
 /// Deliberately not `/dev/ptmx`: that name is a multiplexer which allocates a
 /// fresh, unrelated pair on every open. See the comment at the open below.
@@ -25,12 +25,12 @@ pub extern "C" fn _start() -> ! {
     println!("[consoled] console server online");
 
     // The keyboard driver forwards decoded keys here; we feed them into the
-    // console PTY master, so a terminal reading `/dev/pts0` receives them.
+    // console PTY master, so a terminal reading `/dev/pts/0` receives them.
     //
     // `/dev/ptmx0`, NOT `/dev/ptmx`. This is the distinction that decides whether
     // the installer works at all:
     //
-    //   - `/dev/pts0` is pair 0, the boot console, published under a fixed name
+    //   - `/dev/pts/0` is pair 0, the boot console, published under a fixed name
     //     because the installer and terminal open that path by name.
     //   - `/dev/ptmx0` is that pair's master -- the other end of *that* pty.
     //   - `/dev/ptmx` is a multiplexer. Opening it does not give you pair 0;
@@ -69,10 +69,10 @@ pub extern "C" fn _start() -> ! {
             ipc::Kind::Notify => {
                 // Keystrokes from the keyboard driver (endpoint 3) are routed to
                 // the console pty: `/dev/ptmx0` is the master of pair 0, whose
-                // slave is `/dev/pts0` -- the terminal end. `/dev/ptmx` is the
+                // slave is `/dev/pts/0` -- the terminal end. `/dev/ptmx` is the
                 // *multiplexer*, and opening it would allocate an unrelated
                 // pair, so keystrokes would go to a terminal nobody reads.
-                // `/dev/pts0`. Anything else is logged as before.
+                // `/dev/pts/0`. Anything else is logged as before.
                 if frame.from as u64 == syscall::EP_INPUTD {
                     if let Some(fd) = master {
                         println!("[consoled] key @{}", syscall::uptime_ms());

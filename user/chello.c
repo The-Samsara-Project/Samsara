@@ -14,6 +14,9 @@
 #include <string.h>
 #include <poll.h>
 #include <stdint.h>
+
+/* The boot console pty slave: the only terminal a test process can reach. */
+#define KEY_SLAVE_PATH "/dev/pts/0"
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/random.h>
@@ -53,7 +56,7 @@ int main(void) {
 	// isatty(3) must agree with the kernel. This is the check that motivated
 	// the TTY work: a stub that always answers "yes" makes stdio line-buffer a
 	// file, which silently corrupts redirected output.
-	int fd = open("/dev/pts0", O_RDWR, 0);
+	int fd = open("/dev/pts/0", O_RDWR, 0);
 	if (fd < 0) {
 		printf("[chello] SKIP terminal checks: %s\n", strerror(errno));
 	} else {
@@ -266,7 +269,7 @@ int main(void) {
 		check(0, "pipe() for fstat");
 	}
 
-	int tf = open("/dev/pts0", O_RDWR, 0);
+	int tf = open("/dev/pts/0", O_RDWR, 0);
 	if (tf >= 0) {
 		int ok = fstat(tf, &sb) == 0;
 		check(ok && S_ISCHR(sb.st_mode), "fstat: terminal is S_IFCHR");
@@ -275,7 +278,7 @@ int main(void) {
 		check(ok && sb.st_size == 0, "fstat: terminal size is 0");
 		close(tf);
 	} else {
-		check(0, "open /dev/pts0 for fstat");
+		check(0, "open /dev/pts/0 for fstat");
 	}
 
 	// st_dev/st_ino are a file's identity. Two files must differ, and the same
@@ -614,7 +617,7 @@ int main(void) {
 	}
 
 	// The boot pty must be one pair, not two. `consoled` feeds keystrokes into
-	// the master of pair 0 and the installer reads `/dev/pts0`; if those two
+	// the master of pair 0 and the installer reads `/dev/pts/0`; if those two
 	// ends are not the same pty, every key goes to a terminal nobody reads and
 	// the installer freezes with no error anywhere. A keypress still looks like
 	// it was "handled" on the way in, so a boot log shows nothing wrong.
@@ -626,18 +629,18 @@ int main(void) {
 	// for it and would fail at random.
 	//
 	// So ask the driver instead. `/dev/ptmx0` must report pair 0 (the slave
-	// published as `/dev/pts0`), and a freshly opened `/dev/ptmx` must report
+	// published as `/dev/pts/0`), and a freshly opened `/dev/ptmx` must report
 	// something else, because that name is an allocating multiplexer and
 	// mistaking it for pair 0's master is the mistake being ruled out.
 	int m0 = open("/dev/ptmx0", O_RDWR, 0);
-	int s0 = open("/dev/pts0", O_RDWR, 0);
+	int s0 = open("/dev/pts/0", O_RDWR, 0);
 	if (m0 < 0 || s0 < 0) {
-		check(0, "/dev/ptmx0 and /dev/pts0 open");
+		check(0, "/dev/ptmx0 and /dev/pts/0 open");
 	} else {
-		check(1, "/dev/ptmx0 and /dev/pts0 open");
+		check(1, "/dev/ptmx0 and /dev/pts/0 open");
 		int n0 = -1;
 		check(ioctl(m0, TIOCGPTN, &n0) == 0, "TIOCGPTN on /dev/ptmx0");
-		check(n0 == 0, "/dev/ptmx0 drives pair 0 (/dev/pts0)");
+		check(n0 == 0, "/dev/ptmx0 drives pair 0 (/dev/pts/0)");
 
 		int mx = open("/dev/ptmx", O_RDWR, 0);
 		if (mx < 0) {
@@ -811,6 +814,89 @@ int main(void) {
 			      "select will not report a read end as writable");
 			close(sv[0]);
 			close(sv[1]);
+		}
+	}
+
+	// Process groups and terminal ownership.
+	//
+	// A spawned child inherits its parent's group, so its own pid is not a
+	// valid pgid until it creates one -- which is why setpgid(0,0) has to
+	// work before anything can be handed the terminal.
+	{
+		pid_t me = getpid();
+		pid_t sid_before = getsid(0);
+		pid_t before = getpgrp();
+		check(before > 0, "getpgrp reports a group");
+		check(sid_before > 0, "getsid reports a session");
+
+		// Creating a group: the create-a-group form, not the join-an-existing
+		// one. If this fails, no process can ever become a group leader and
+		// job control is impossible.
+		check(setpgid(0, 0) == 0, "setpgid(0,0) creates a group");
+		check(getpgrp() == me, "getpgrp is our own pid after setpgid");
+
+		// A process group is not a session. Creating a group must leave the
+		// session untouched -- otherwise a later setsid() is refused and a
+		// program doing the ordinary setpgid-then-setsid sequence breaks.
+		check(getsid(0) == sid_before, "setpgid left the session alone");
+
+		// /dev/pts/0 belongs to whichever session first opened it, which is
+		// not this one. TIOCSPGRP must therefore be *refused*: a process
+		// outside a terminal's session has no business redirecting it, and
+		// letting it would hand one session control of another's terminal.
+		int boot_tty = open(KEY_SLAVE_PATH, O_RDWR, 0);
+		if (boot_tty >= 0) {
+			pid_t tsid = 0;
+			ioctl(boot_tty, TIOCGSID, &tsid);
+			if (tsid != 0 && tsid != sid_before) {
+				pid_t want = me;
+				check(ioctl(boot_tty, TIOCSPGRP, &want) != 0,
+				      "TIOCSPGRP refused from another session");
+			} else {
+				// We do own it; the positive case is covered below.
+			}
+			close(boot_tty);
+		}
+
+		// A pty this process opens itself is claimed by *this* session, so
+		// the positive case is legitimate here: create a group, take the
+		// terminal, read it back.
+		int master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+		if (master < 0) {
+			printf("[chello] SKIP terminal pgrp: no /dev/ptmx\n");
+		} else {
+			int idx = -1;
+			if (ioctl(master, TIOCGPTN, &idx) != 0 || idx < 0) {
+				check(0, "TIOCGPTN on a fresh pair");
+			} else {
+				char path[32];
+				snprintf(path, sizeof path, "/dev/pts/%d", idx);
+				int tty = open(path, O_RDWR);
+				check(tty >= 0, "open a freshly allocated pty slave");
+				if (tty >= 0) {
+					pid_t tsid = 0;
+					check(ioctl(tty, TIOCGSID, &tsid) == 0 && tsid == sid_before,
+					      "TIOCGSID reports our own session");
+					pid_t want = me;
+					check(ioctl(tty, TIOCSPGRP, &want) == 0,
+					      "TIOCSPGRP to our own group");
+					pid_t got = 0;
+					check(ioctl(tty, TIOCGPGRP, &got) == 0 && got == me,
+					      "foreground pgrp round-trip");
+					// Handing the terminal to a group that does not exist
+					// must be refused, or the terminal ends up owned by a
+					// group nothing can be waited on or signalled in.
+					pid_t ghost = (pid_t)(me + 0x70000000);
+					check(ioctl(tty, TIOCSPGRP, &ghost) != 0,
+					      "TIOCSPGRP refuses a group that does not exist");
+					// ... and the foreground must survive the refusal.
+					pid_t still = 0;
+					check(ioctl(tty, TIOCGPGRP, &still) == 0 && still == me,
+					      "refused TIOCSPGRP left the foreground alone");
+					close(tty);
+				}
+				close(master);
+			}
 		}
 	}
 

@@ -1359,13 +1359,37 @@ pub fn current_sid() -> u32 {
 }
 
 /// Group and session of kernel task `task`.
-pub fn task_groups(task: usize) -> (u32, u32) {
+/// A task's process group and session, by name.
+///
+/// This was a bare `(u32, u32)` and every caller had to remember which field
+/// was which. That is not a hypothetical mistake: the terminal's foreground
+/// check read `.0` believing it was the session, and it is the process group --
+/// so it compared a group against a session, which is a comparison that is
+/// almost never true and whose failure looks like an unrelated permission
+/// error. Two of the four call sites had resorted to destructuring with a
+/// leading underscore, which is the shape of code written by someone who does
+/// not trust the tuple either.
+///
+/// Named fields make the mistake impossible to compile.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Groups {
+    /// Process group the task belongs to.
+    pub pgid: u32,
+    /// Session the task belongs to.
+    pub sid: u32,
+}
+
+/// Group and session of kernel task `task`.
+pub fn task_groups(task: usize) -> Groups {
     SCHED
         .lock()
         .tasks
         .get(&TaskId(task))
-        .map(|t| (t.pgid, t.sid))
-        .unwrap_or((0, 0))
+        .map(|t| Groups {
+            pgid: t.pgid,
+            sid: t.sid,
+        })
+        .unwrap_or(Groups { pgid: 0, sid: 0 })
 }
 
 /// Move `target` into process group `pgid`.
@@ -1395,21 +1419,62 @@ pub fn setpgid(target: usize, pgid: u32) -> bool {
             return false;
         }
     }
-    // The destination group must already exist and share this session.
-    let dest_sid = g
-        .tasks
-        .values()
-        .find(|t| t.pgid == pgid)
-        .map(|t| t.sid);
-    match dest_sid {
-        Some(sid) if sid == t_sid => {}
-        _ => return false,
+    // The destination group must be in the same session as the target.
+    //
+    // The subtlety is that `setpgid(0, 0)` *creates* a group rather than
+    // joining one, so the group does not exist yet and cannot be found. The
+    // previous code required it to exist already, which meant the
+    // create-a-group form could never succeed for anything: `find` looked for a
+    // task whose pgid equals the caller's own pid, and a spawned child inherits
+    // its parent's group, so there was never one. No process could become a
+    // group leader at all. Job control is therefore impossible, and a program
+    // following the ordinary sequence -- become a group leader, then hand the
+    // terminal to it -- cannot work no matter what it does.
+    //
+    // So there are two cases rather than one:
+    //
+    //   - `pgid == target`: the caller is creating a group led by itself. Valid
+    //     unless a group in *another* session already holds that id, which
+    //     would mean two unrelated groups sharing an id.
+    //   - otherwise: joining an existing group, which must already be in this
+    //     session.
+    if pgid == target as u32 {
+        if g
+            .tasks
+            .values()
+            .any(|t| t.pgid == pgid && t.sid != t_sid)
+        {
+            return false;
+        }
+    } else {
+        let dest_sid = g
+            .tasks
+            .values()
+            .find(|t| t.pgid == pgid)
+            .map(|t| t.sid);
+        match dest_sid {
+            Some(sid) if sid == t_sid => {}
+            _ => return false,
+        }
     }
+
+    // POSIX: a process group leader may not be moved into another group, which
+    // is what stops a group id being reused while it still has a leader. Only
+    // relevant when the target is not the caller, since a caller moving itself
+    // is giving up leadership rather than taking it away from anyone.
+    if target != cur && t_pgid == target as u32 {
+        return false;
+    }
+
     if let Some(t) = g.tasks.get_mut(&TaskId(target)) {
         t.pgid = pgid;
-        // Leading a new group is recorded so `getpgrp`-style reporting and
-        // orphaned-group detection can tell a leader from a member.
-        t.session_leader = pgid == target as u32;
+        // Deliberately *not* touching `session_leader`. That flag means "this
+        // task's sid equals its own pid" and is what `setsid` consults to refuse
+        // a second call. Deriving it from group leadership instead -- as this
+        // did -- meant an ordinary `setpgid(0, 0)` marked the process a session
+        // leader, so the `setsid()` a program might well call next failed with
+        // EPERM. Owning a process group and owning a session are different
+        // things, and conflating them broke a completely ordinary sequence.
         let _ = t_pgid;
     }
     true

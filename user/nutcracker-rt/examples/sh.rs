@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Harsh Nikarsa
 //
-// The native PTY shell. It runs on the slave side (`/dev/pts0`) and re-arms a
+// The PTY shell. It runs on the slave side (`/dev/pts/0`) and re-arms a
 // sane termios at startup: the installer left the PTY raw, and this shell
 // wants the kernel's line discipline (drivers/pty, modelled on zinnia's
 // device/tty) to do echo, VERASE/VKILL editing and line completion, so it
@@ -171,10 +171,10 @@ fn run_external(fd: usize, cmd: &str, words: &[String]) {
 pub extern "C" fn _start() -> ! {
     println!("[sh] shell starting");
 
-    let fd = match syscall::open("/dev/pts0", syscall::O_RDWR, 0) {
+    let fd = match syscall::open("/dev/pts/0", syscall::O_RDWR, 0) {
         Ok(fd) => fd,
         Err(e) => {
-            println!("[sh] open /dev/pts0 failed: {}", e);
+            println!("[sh] open /dev/pts/0 failed: {}", e);
             syscall::proc_exit_code(1);
         }
     };

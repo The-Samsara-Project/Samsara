@@ -211,3 +211,15 @@ names a program but carries no new environment, so it cannot supply one).
 
 auxv entries delivered: `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`,
 `AT_BASE` (0 for static PIE), `AT_ENTRY`.
+
+## pty device layout
+
+Pty slaves live in a `/dev/pts` subdirectory: `/dev/pts/0` is the boot console
+pair, and each `open("/dev/ptmx")` allocates a new pair published as
+`/dev/pts/<n>`. The masters are `/dev/ptmx0` (the master of pair 0) and
+`/dev/ptmx` (the allocating multiplexer).
+
+This is the Linux layout and it is load-bearing rather than cosmetic:
+`ptsname(3)` returns a *path*, so a program that has been handed `/dev/pts/3`
+must be able to open exactly that. The slaves used to be published flat as
+`/dev/pts<n>`, which left every `ptsname` reporting a path that did not exist.

@@ -85,7 +85,7 @@ use alloc::vec::Vec;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // Allocate a private pair rather than using the boot console's `/dev/pts0`.
+    // Allocate a private pair rather than using the boot console's `/dev/pts/0`.
     // The installer is itself blocked reading that terminal, so a shared pair
     // would let it consume this test's keystrokes — whichever reader won the
     // race would take the data, and the other would wait forever.
@@ -96,7 +96,10 @@ pub extern "C" fn _start() -> ! {
             syscall::proc_exit_code(1);
         }
     };
-    // Linux reports the pair index with TIOCGPTN; the slave is /dev/pts<index>.
+    // Linux reports the pair index with TIOCGPTN; the slave lives at
+    // /dev/pts/<index> -- in a subdirectory, as Linux lays pty slaves out. That
+    // is also the path `ptsname(3)` reports, so building it here exercises the
+    // same thing a real program would rely on.
     let mut index = 0i32;
     check(
         syscall::ioctl(master, syscall::TIOCGPTN, &mut index).is_ok() && index > 0,
@@ -104,7 +107,7 @@ pub extern "C" fn _start() -> ! {
     );
     let slave_path = [b'/'; 64];
     let mut path = [0u8; 32];
-    let text = b"/dev/pts";
+    let text = b"/dev/pts/";
     path[..text.len()].copy_from_slice(text);
     let mut digits = [0u8; 8];
     let mut n = index as u32;
@@ -124,7 +127,7 @@ pub extern "C" fn _start() -> ! {
         off += 1;
     }
     let _ = slave_path;
-    let fd = match syscall::open(core::str::from_utf8(&path[..off]).unwrap_or("/dev/pts0"), O_RDWR, 0) {
+    let fd = match syscall::open(core::str::from_utf8(&path[..off]).unwrap_or("/dev/pts/0"), O_RDWR, 0) {
         Ok(fd) => fd,
         Err(e) => {
             println!("[termiostst] FAIL open allocated slave: {e}");
@@ -186,19 +189,56 @@ pub extern "C" fn _start() -> ! {
     );
 
     // --- process groups --------------------------------------------------
-    let mut pgid = syscall::get_pid() as u32;
-    check(syscall::ioctl(fd, syscall::TIOCSPGRP, &mut pgid).is_ok(), "TIOCSPGRP");
+    //
+    // The order here is the order a real program uses, and it matters: a spawned
+    // child inherits its parent's process group, so this process's own pid is
+    // not a process group id until it creates one. Handing the terminal to that
+    // pid first would be asking to set the foreground to a group that does not
+    // exist, and a correct kernel refuses that -- which is what it did.
+    let pid = syscall::get_pid() as u32;
+
+    // Before: this process is a member of some inherited group, not its own.
+    let inherited = syscall::getpgrp();
+    check(inherited != 0, "getpgrp reports a group");
+    check(
+        inherited != pid || syscall::setsid().is_ok(),
+        "a non-leader does not claim to lead a group",
+    );
+
+    // Become a group leader. This is the step that makes `pid` a valid pgid.
+    check(syscall::setpgid(0, 0).is_ok(), "setpgid(0,0) creates a group");
+    check(syscall::getpgrp() == pid, "getpgrp is our own pid after setpgid");
+    // The session is unchanged by creating a process group: those are separate
+    // things, and conflating them is exactly the bug this ordering would hide.
+    check(
+        syscall::getsid(0) != 0 && syscall::getsid(0) as u32 != pid,
+        "setpgid did not make us a session leader",
+    );
+
+    // Now the terminal can be handed to that group.
+    let mut pgid = pid;
+    check(
+        syscall::ioctl(fd, syscall::TIOCSPGRP, &mut pgid).is_ok(),
+        "TIOCSPGRP to our own group",
+    );
     let mut pgid_back = 0u32;
     check(
-        syscall::ioctl(fd, syscall::TIOCGPGRP, &mut pgid_back).is_ok() && pgid_back == pgid,
+        syscall::ioctl(fd, syscall::TIOCGPGRP, &mut pgid_back).is_ok() && pgid_back == pid,
         "foreground pgrp round-trip",
+    );
+    // Setting the foreground to a group that does not exist must be refused, or
+    // the terminal ends up owned by a group nothing can be waited on or
+    // signalled in.
+    let mut ghost = pid.wrapping_add(0x7000_0000);
+    check(
+        syscall::ioctl(fd, syscall::TIOCSPGRP, &mut ghost).is_err(),
+        "TIOCSPGRP refuses a group that does not exist",
     );
     let mut sid = 0u32;
     check(
         syscall::ioctl(fd, syscall::TIOCGSID, &mut sid).is_ok() && sid == syscall::getsid(0) as u32,
         "TIOCGSID reports our session",
     );
-    check(syscall::getpgrp() == syscall::get_pid() as u32, "getpgrp");
     check(
         syscall::setpgid(0, syscall::get_pid() as u32).is_ok(),
         "setpgid(self) is allowed",
@@ -347,7 +387,7 @@ pub extern "C" fn _start() -> ! {
     check(syscall::poll(&mut pf4, 20).unwrap_or(0) == 0, "TCIFLUSH discarded the buffered line");
 
     // --- O_NONBLOCK returns EAGAIN instead of waiting --------------------
-    let nb = match syscall::open(core::str::from_utf8(&path[..off]).unwrap_or("/dev/pts0"), O_RDWR | syscall::O_NONBLOCK, 0) {
+    let nb = match syscall::open(core::str::from_utf8(&path[..off]).unwrap_or("/dev/pts/0"), O_RDWR | syscall::O_NONBLOCK, 0) {
         Ok(f) => f,
         Err(e) => {
             println!("[termiostst] FAIL reopen O_NONBLOCK: {e}");

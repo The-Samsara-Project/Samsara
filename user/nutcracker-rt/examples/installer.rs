@@ -7,7 +7,7 @@
 // the console server and keyboard driver. It:
 //   * owns the display (FB_INFO + MAP_PHYS + CONSOLE_DETACH) and draws a
 //     menu-driven setup wizard straight into the framebuffer,
-//   * receives keystrokes by reading the console PTY slave (/dev/pts0):
+//   * receives keystrokes by reading the console PTY slave (/dev/pts/0):
 //     inputd -> consoled -> PTY master -> this process,
 //   * writes its configuration to /etc (ramfs, or the ext2 root when one is
 //     mounted over it),
@@ -59,7 +59,7 @@ const HOSTNAME_CONF: &str = "/etc/hostname";
 const INIT_CONF: &str = "/etc/init.conf";
 
 /// The setup wizard answers on this PTY slave for keyboard input.
-const KEY_SLAVE: &str = "/dev/pts0";
+const KEY_SLAVE: &str = "/dev/pts/0";
 
 // --- Framebuffer rendering ------------------------------------------------
 // The 8x8 console font, VGA palette and cell rasterizer are shared with the
