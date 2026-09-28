@@ -253,7 +253,75 @@ extern "x86-interrupt" fn page_fault(frame: InterruptFrame, error: u64) {
         },
         unsafe{REG_DUMP[6]}, unsafe{REG_DUMP[13]}, unsafe{REG_DUMP[12]},
     );
+    handle_user_fault(frame, cr2, error);
     die("unhandled page fault", error);
+}
+
+/// The page-fault error-code bit that says the access came from ring 3.
+const PF_USER: u64 = 1 << 2;
+
+/// End the process that faulted, rather than the machine.
+///
+/// A fault from user mode is the *program's* bug -- a null dereference, a
+/// wild pointer, a stack that ran out -- and the machine's job is to make the
+/// program deal with it, not to stop. Halting on a user fault means one bad
+/// pointer anywhere takes down every other process, which on a system whose whole
+/// point is a userland is the wrong trade in every direction.
+///
+/// It is also the reason an intermittent fault here was so hard to chase: a user
+/// program's null dereference presented identically to a genuine kernel fault,
+/// because both ended in the same panic, so the log said "unhandled page fault"
+///// and the register dump was all zeroes whether the cause was fbterm's child or
+/// something structural.
+///
+/// SIGSEGV goes through the normal signal path, so a process that *catches* it
+/// sees a catchable signal and one that blocks it has the signal pended. If that
+/// left the process running, though, returning here would re-execute the faulting
+/// instruction and fault again -- an unkillable infinite loop rather than a
+/// crash. So a non-fatal disposition still ends the process; a process that
+/// installs a SIGSEGV handler here gets it delivered and must not return to the
+/// faulting instruction, which is the same rule every system with a signal
+/// stack has.
+///
+/// Kernel-mode faults are untouched: `die` is still what happens, because a
+/// kernel fault means the kernel is wrong and continuing would be worse.
+fn handle_user_fault(frame: InterruptFrame, cr2: usize, error: u64) {
+    if error & PF_USER == 0 {
+        return;
+    }
+    // The scheduler's own context has no user address space, and neither does a
+    // process that was killed between the fault and here. A fault from one of
+    // those is a kernel fault wearing a user-mode error code -- a corrupt CR3 --
+    // and must not be attributed to a process that no longer exists.
+    let task = match crate::task::sched::current_task_id() {
+        Some(t) => t,
+        None => return,
+    };
+    if crate::task::sched::current_as_root().is_none() {
+        return;
+    }
+    if task.0 == crate::task::sched::SCHEDULER_ID {
+        return;
+    }
+
+    crate::log::kerror!(
+        "#PF in user task: killing pid {} (rip={:#x} cr2={:#x} err={:#x})",
+        task.0,
+        frame.rip,
+        cr2,
+        error
+    );
+
+    // Default disposition terminates here, inside `kill`. A caught or blocked
+    // SIGSEGV returns, and then this has to finish the job.
+    let _ = crate::sig::kill(task.0 as u64, crate::sig::SIGSEGV);
+
+    crate::log::kerror!(
+        "#PF: SIGSEGV was not fatal for pid {}; terminating rather than re-executing {:#x}",
+        task.0,
+        frame.rip
+    );
+    crate::task::sched::exit_current(128 + crate::sig::SIGSEGV as i32);
 }
 
 /// The CR3 currently loaded in the MMU. Read directly rather than trusting
