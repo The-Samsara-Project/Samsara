@@ -174,7 +174,7 @@ const PROGRAMS: [Program; 15] = [
 ];
 
 /// Default search path for spawned programs. `samutils` lives in `/bin`, and
-/// the native terminal's shell in `/bin` as well; `/usr/bin` is included so a
+/// a shell in `/bin` as well; `/usr/bin` is included so a
 /// later port has somewhere obvious to install.
 pub const DEFAULT_PATH: &str = "/bin:/usr/bin";
 
@@ -256,13 +256,36 @@ pub fn spawn_program_args(
     }
     let (cr3, entry, rsp) = build_image(index, &args, &env).map_err(|e| e as i32)?;
     let p = &PROGRAMS[index];
+    // Whether there is a parent decides the descriptor table, and it has to be
+    // read *before* the spawn: `spawn_user_ep` copies the caller's table when
+    // there is one, and the question of what to do about descriptors 0-2 is
+    // answered differently in the two cases.
+    let parent = crate::task::sched::current_task_id();
     let tid = crate::task::sched::spawn_user_ep(p.name, cr3, entry, rsp, p.endpoint, args, env, cwd);
-    install_standard_fds(tid.0);
+    match parent {
+        // A user-space spawn inherits the caller's descriptor table, including
+        // anything the caller did to it.
+        //
+        // This has to be explicit. `spawn_user_ep` copies the process group,
+        // session and endpoint from the parent but deliberately does not touch
+        // descriptors, so without this the child starts with an empty table:
+        // every read and write fails with EBADF, `isatty(0)` is false, and a
+        // program that checks its standard descriptors before doing anything
+        // else gives up silently. Installing /dev/console unconditionally, which
+        // is what happened before, is the opposite mistake -- it threw away the
+        // caller's arrangement, so a caller could not hand a child a terminal,
+        // a file, or a deliberately closed descriptor.
+        Some(parent) => crate::vfs::fdtab::copy_table(parent.0, tid.0),
+        // Kernel boot: no caller to inherit from, so the newborn needs a set of
+        // standard descriptors of its own or every write to fd 1 fails with
+        // EBADF and the program's output is lost.
+        None => install_standard_fds(tid.0),
+    }
     // A process spawned from user space (via `PROC_SPAWN`) becomes a child of
     // its spawner so the caller can reap it with `waitpid` — the installer
     // relies on this to supervise the boot tests it launches. During kernel
     // boot there is no current user task, so no parent is recorded.
-    if let Some(parent) = crate::task::sched::current_task_id() {
+    if let Some(parent) = parent {
         crate::task::sched::set_parent(tid, parent);
     }
     // Give the newborn process its identity before it can ever run.
@@ -293,8 +316,11 @@ pub fn spawn_program_args(
 /// All three point at `/dev/console`. A fresh descriptor table hands out the
 /// lowest free slot, so installing three times yields 0, 1, 2 in order.
 ///
-/// Processes spawned by another process keep that process's descriptors, which
-/// is what makes `sh`'s redirections work.
+/// Only called for a process with no parent. A process spawned by another
+/// inherits that process's descriptor table wholesale, because a caller that
+/// has gone to the trouble of arranging a child's descriptors -- a terminal on
+/// stdin, an output file on stdout -- means it. Overwriting them here is what
+/// used to make that impossible.
 fn install_standard_fds(task: usize) {
     let Ok(node) = crate::vfs::devfs::console_node() else {
         return;
@@ -306,7 +332,7 @@ fn install_standard_fds(task: usize) {
 
 /// Spawn the boot-time user environment: the console server, the keyboard
 /// driver, then the interactive installer. Everything else — the example
-/// programs, the native terminal and its shell — is launched on demand by the
+/// programs, and the terminal — is launched on demand by the
 /// installer, which is the first thing the user actually talks to.
 pub fn start_first_user() {
     let _ = spawn_program(PROG_CONSOLED);

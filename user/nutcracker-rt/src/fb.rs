@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Harsh Nikarsa
 //
 // Framebuffer rasterization shared by the display-owning user-space
-// programs (the setup wizard and the native terminal emulator). All
+// programs (the setup wizard, and anything drawing before fbterm starts). All
 // renderable text is ASCII: the 8x8 console font has no non-ASCII glyphs.
 
 use alloc::string::String;

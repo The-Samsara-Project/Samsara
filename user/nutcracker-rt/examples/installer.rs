@@ -12,8 +12,8 @@
 //   * writes its configuration to /etc (ramfs, or the ext2 root when one is
 //     mounted over it),
 //   * can launch and supervise the boot self-tests (forkx, pipetest, ...),
-//   * on Finish re-attaches the kernel console (CONSOLE_ATTACH), spawns the
-//     native terminal and its shell, and exits.
+//   * on Finish detaches the kernel console (CONSOLE_DETACH), puts the console
+//     PTY on the child's descriptor 0, spawns fbterm, and exits.
 //
 // All renderable text is ASCII: the 8x8 console font has no non-ASCII glyphs.
 
@@ -63,7 +63,7 @@ const KEY_SLAVE: &str = "/dev/pts0";
 
 // --- Framebuffer rendering ------------------------------------------------
 // The 8x8 console font, VGA palette and cell rasterizer are shared with the
-// native terminal emulator (examples/term.rs) via the runtime's `fb` module,
+// terminal emulator (ports/fbterm) via the runtime's `fb` module,
 // so both display owners render text identically.
 use nutcracker_rt::fb::{Display, BLACK, BLUE, CYAN, DGREY, LGREY, LGREEN, WHITE, YELLOW};
 
@@ -901,7 +901,7 @@ fn screen_services(app: &mut App) -> Nav {
             ),
             (
                 0,
-                String::from("launch native terminal"),
+                String::from("hand the display to fbterm"),
                 String::from(if app.launch_term { "[x]" } else { "[ ]" }),
             ),
         ];
@@ -1016,7 +1016,7 @@ fn screen_about(app: &mut App) -> Nav {
         String::new(),
         String::from("This wizard is the boot-time front end: it configures the"),
         String::from("system, runs the self-test suite on demand, then hands"),
-        String::from("the display to the native terminal for normal use."),
+        String::from("the display to fbterm for normal use."),
     ];
     let c0 = cols / 2 - 40;
     let c1 = cols / 2 + 40;
@@ -1031,7 +1031,7 @@ fn screen_about(app: &mut App) -> Nav {
 fn screen_finish(app: &mut App) -> Nav {
     let cols = app.fb.cols();
     let rows = app.fb.rows();
-    app.frame("Finish", "Enter hands the display to the terminal, ESC = back");
+    app.frame("Finish", "Enter hands the display to fbterm, ESC = back");
     let mut lines = Vec::new();
     lines.push(format!("Hostname            : {}", app.hostname));
     lines.push(format!("Keyboard layout     : {}", app.keymap));
@@ -1044,10 +1044,10 @@ fn screen_finish(app: &mut App) -> Nav {
         ));
     }
     lines.push(String::from(
-        "The kernel console is re-attached (CONSOLE_ATTACH), then the",
+        "The kernel console is detached (CONSOLE_DETACH), then fbterm",
     ));
     lines.push(String::from(
-        "native terminal comes up with a shell on the PTY.",
+        "takes the display and starts a shell on its own PTY.",
     ));
     let c0 = cols / 2 - 35;
     let c1 = cols / 2 + 35;
@@ -1061,7 +1061,7 @@ fn screen_finish(app: &mut App) -> Nav {
                     let all: Vec<usize> = (0..TESTS.len()).collect();
                     app.frame("Finish", "running final self-test pass...");
                     app.run_tests(&all);
-                    app.frame("Finish", "Enter hands the display to the terminal, ESC = back");
+                    app.frame("Finish", "Enter hands the display to fbterm, ESC = back");
                     let mut lines = Vec::new();
                     let mut ok = 0;
                     for r in &app.results {

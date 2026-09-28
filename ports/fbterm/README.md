@@ -153,6 +153,18 @@ it clears the framebuffer and has nothing to display, because it spawns a shell
 with `forkpty` and there is no `/bin/sh` to exec yet. That is the gap busybox
 fills, and it is the next piece of work.
 
+The handoff into fbterm is done, and the sequence matters. The installer, on
+Finish: puts the console pty on the child's descriptor 0 with `dup2`; detaches
+the kernel console with `CONSOLE_DETACH` so nothing paints over fbterm; then
+spawns fbterm. Descriptors 1 and 2 stay `/dev/console`, which after the detach
+means the serial line only -- fbterm's drawing goes to the framebuffer directly
+and its diagnostics belong in the log.
+
+Verified from both ends: the framebuffer goes from the wizard's five colours to
+fbterm's clear, and fbterm reports `[input] terminal: /dev/pts0`, which is the
+observable proof that the descriptor it inherited is the pty and not
+`/dev/console`.
+
 The `ttyname_r` name check that used to be listed here is resolved: patch 0008
 replaces it with `isatty(3)`, and syscall 87 (`TTYNAME`) now lets a program ask
 the kernel for a descriptor's device path. fbterm starts, reports its terminal,

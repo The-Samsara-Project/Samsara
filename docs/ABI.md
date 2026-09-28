@@ -76,6 +76,20 @@ negative = negated errno (see table below).
 | 88 | `DUP`          | `(oldfd) -> newfd`                 | duplicate a descriptor, **sharing** its file offset; the lowest free descriptor |
 | 89 | `DUP2`         | `(oldfd, newfd) -> newfd`          | as `DUP` into a specific slot, closing what was there. `oldfd == newfd` succeeds and changes nothing |
 | 90 | `PSELECT6`     | `(nfds, r, w, e, timeout, sigmask) -> n` | `pselect(6)`, and what libc `select(3)` routes through. `fd_set` is Linux's: 1024 bits / 128 bytes. Readiness is reported by clearing the bits of descriptors that are not ready. A non-null `sigmask` returns `ENOSYS` |
+
+## Descriptor inheritance
+
+A process spawned from user space inherits its parent's descriptor table
+wholesale, including anything the parent did to it. A process spawned during
+kernel boot, having no parent to inherit from, gets descriptors 0-2 pointing at
+`/dev/console`.
+
+This is what makes `dup2(pts, 0)` before a spawn meaningful: the child comes up
+with the pty on standard input, which is how the installer hands the console
+terminal to fbterm. Installing `/dev/console` unconditionally instead would
+discard the caller's arrangement, and *not* copying the table leaves the child
+with nothing at all -- every read and write failing with `EBADF` and `isatty(0)`
+false, so a program that checks its descriptors first gives up silently.
 | ≥ `0x8000_0000_0000_0000` | experimental range | — | reserved for out-of-tree experiments, never standardized |
 
 `GET_ENV` (71) copies the calling process's environment in the same encoding as

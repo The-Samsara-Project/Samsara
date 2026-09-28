@@ -16,7 +16,7 @@
 // and a blue working directory.
 //
 // Everything it displays is written *back to the slave*; from there it travels
-// through the discipline (OPOST) to the master, where the native terminal
+// through the discipline (OPOST) to the master, where fbterm reads it
 // emulator renders it. Nothing here talks to the console directly.
 
 #![no_std]

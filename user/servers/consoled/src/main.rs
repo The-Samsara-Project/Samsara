@@ -5,7 +5,7 @@
 // the single consumer of the serial/console line in user space: other servers
 // please it by IPC instead of poking DEBUG_WRITE directly. It answers `Call`s
 // with "ok", logs `Notify`s, reports `Irq` events, and — when the notify
-// comes from the keyboard server — feeds the bytes into the native terminal's
+// comes from the keyboard server — feeds the bytes into the console
 // PTY master so the shell on `/dev/pts0` receives them.
 
 #![no_std]
@@ -25,7 +25,7 @@ pub extern "C" fn _start() -> ! {
     println!("[consoled] console server online");
 
     // The keyboard driver forwards decoded keys here; we feed them into the
-    // native terminal's PTY master so the shell on `/dev/pts0` receives them.
+    // console PTY master, so a terminal reading `/dev/pts0` receives them.
     //
     // `/dev/ptmx0`, NOT `/dev/ptmx`. This is the distinction that decides whether
     // the installer works at all:
@@ -68,7 +68,10 @@ pub extern "C" fn _start() -> ! {
             }
             ipc::Kind::Notify => {
                 // Keystrokes from the keyboard driver (endpoint 3) are routed to
-                // the native terminal: `/dev/ptmx` is the master, the shell owns
+                // the console pty: `/dev/ptmx0` is the master of pair 0, whose
+                // slave is `/dev/pts0` -- the terminal end. `/dev/ptmx` is the
+                // *multiplexer*, and opening it would allocate an unrelated
+                // pair, so keystrokes would go to a terminal nobody reads.
                 // `/dev/pts0`. Anything else is logged as before.
                 if frame.from as u64 == syscall::EP_INPUTD {
                     if let Some(fd) = master {
