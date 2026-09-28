@@ -264,7 +264,7 @@ fn wait_readable(task: usize, node: &VnodeRef, status: u32) -> Result<(), FsErro
         // `poll_park` re-checks readiness under the device's own lock and
         // registers the task, so input arriving between the probe above and
         // this call cannot be lost. A `true` means it is already readable.
-        if node.poll_park(task) {
+        if node.poll_park(task, driver_common::POLLIN) {
             continue;
         }
         // Nothing registered and nothing ready would spin forever, so a device

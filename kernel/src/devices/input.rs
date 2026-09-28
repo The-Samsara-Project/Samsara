@@ -348,7 +348,7 @@ impl CharDevice for InputDevice {
             .unwrap_or(true)
     }
 
-    fn park(&self, task: usize) -> bool {
+    fn park(&self, task: usize, interest: u16) -> bool {
         let mut s = STATE.lock();
         if !s.outbox.is_empty() {
             return true;

@@ -1576,7 +1576,7 @@ fn wait_on_polls(task: usize, polls: &mut alloc::vec::Vec<PollFd>, tmo: i64) -> 
                 continue;
             }
             if let Some((node, _)) = slot {
-                if node.poll_park(task) {
+                if node.poll_park(task, polls[i].events) {
                     became = true;
                 }
             }

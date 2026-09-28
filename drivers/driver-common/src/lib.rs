@@ -289,7 +289,12 @@ pub trait CharDevice: Send + Sync {
     /// (no registration needed); `false` once `task` is queued. No-op for
     /// policies that cannot block (an output-only device). Only needed when
     /// `has_data` can be false.
-    fn park(&self, _task: usize) -> bool {
+    ///
+    /// `interest` is the same `POLL_*` mask the caller is waiting on, and a
+    /// device must honour it for the same reason [`Vnode::poll_park`] does:
+    /// reporting readiness for a direction nobody asked about turns a bounded
+    /// wait into a spin.
+    fn park(&self, _task: usize, _interest: u16) -> bool {
         false
     }
     /// Undo a [`park`] registration; idempotent.
@@ -748,11 +753,25 @@ pub trait Vnode: Send + Sync {
     /// parks, and the fallback is a timer-driven re-poll. Event-driven vnodes
     /// (pipes, byte-queue devices) override this to wake `task` from the
     /// `POLL_*` transition they trigger on their next state change.
-    fn poll_park(&self, _task: usize) -> bool {
-        if self.readable_now() || self.writable_now() {
-            return true;
+    fn poll_park(&self, _task: usize, interest: u16) -> bool {
+        // Only report ready for a direction the caller actually asked about.
+        //
+        // This is not a refinement, it is the difference between working and
+        // spinning forever. A node that answers "I am ready for *something*"
+        // to a caller that asked about one direction will say yes to a
+        // descriptor that is ready the wrong way, the caller re-probes, gets
+        // the same answer, and never parks -- a livelock at 100% CPU that looks
+        // exactly like a hang. Asking a pipe's read end whether it is writable
+        // is the case that exposes it: the end is legitimately ready to *read*
+        // and never ready to write.
+        let mut ready = 0u16;
+        if interest & POLLIN != 0 && self.readable_now() {
+            ready |= POLLIN;
         }
-        false
+        if interest & POLLOUT != 0 && self.writable_now() {
+            ready |= POLLOUT;
+        }
+        ready & interest != 0
     }
     /// Cancel a previously registered poll waiter; idempotent.
     fn poll_cancel(&self, _task: usize) {}

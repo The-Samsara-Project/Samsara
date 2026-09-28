@@ -32,37 +32,52 @@ export PATH := $(HOME)/.cargo/bin:$(PATH)
 # code-model=kernel config is scoped to kernel/.cargo/config.toml.
 USER_SERVERS   := consoled inputd
 USER_UTILS     := samutils
-USER_EXAMPLES  := hello forkx exectst pipetest credtst signaltst polltest termiostst sh term installer
+USER_EXAMPLES  := hello forkx exectst pipetest credtst signaltst polltest termiostst sh installer
 
-.PHONY: all kernel iso run run-fbterm debug clean user-bins mlibc fbterm fbterm-run
+.PHONY: all kernel iso run run-fbterm debug clean user-bins fbterm-run
 
 all: iso
 
-# Build mlibc (Nutcracker's libc port) into build/sysroot. Purely a convenience
-# wrapper around ports/mlibc/build.sh.
-mlibc:
-	./ports/mlibc/build.sh
+# The port sources, enumerated at parse time so a change to any file in a port
+# directory invalidates that port's stamp. The `build/` exclusion matters:
+# ports/mlibc/build.sh is itself a git clone of mlibc, and listing its tens of
+# thousands of files would make the dependency set enormous and unstable.
+MLIBC_INPUTS  := $(shell find ports/mlibc -type f -not -path '*/build/*' 2>/dev/null)
+FBTERM_INPUTS := $(shell find ports/fbterm -type f -not -path '*/build/*' 2>/dev/null)
 
-# Build fbterm (the ported Linux terminal emulator) into build/fbterm-build.
-# Separate from `all` on purpose: it needs a built mlibc sysroot, so folding it
-# into the default target would make a clean tree require the libc port before
-# anything else could be built. Run `make mlibc fbterm` for a terminal binary.
-fbterm:
-	./ports/fbterm/build.sh
-
-# Build fbterm and rebuild the kernel with it embedded, then produce a bootable
-# ISO that can actually spawn it. `make` alone does not do this: fbterm is not a
-# cargo target, it is built by ports/fbterm/build.sh against the mlibc sysroot,
-# and making the default target depend on that would require a libc port before
-# anything else could be built.
+# Stamps rather than phony prerequisites, so `make` does not rebuild a libc on
+# every invocation. Both build scripts are slow and both are deterministic, so
+# re-running one whose inputs have not changed can only waste a minute.
 #
-# The kernel is built into a separate target directory so a later plain `make`
-# still produces the fbterm-free ISO rather than silently keeping the feature.
-fbterm-run: fbterm
+# fbterm depends on the mlibc stamp because it links against the sysroot: a
+# rebuilt libc invalidates every object built against the old headers, and
+# without this the link would quietly mix two libc builds.
+build/.mlibc.stamp: $(MLIBC_INPUTS)
+	./ports/mlibc/build.sh
+	@mkdir -p build && touch $@
+
+build/.fbterm.stamp: $(FBTERM_INPUTS) build/.mlibc.stamp
+	./ports/fbterm/build.sh
+	@mkdir -p build && touch $@
+
+# Force a rebuild of either port, ignoring the stamps. For when a build script
+# itself has to change behaviour without its own contents changing.
+.PHONY: mlibc fbterm mlibc-force fbterm-force
+mlibc mlibc-force:
+	./ports/mlibc/build.sh
+	@mkdir -p build && touch build/.mlibc.stamp
+
+fbterm fbterm-force: build/.mlibc.stamp
+	./ports/fbterm/build.sh
+	@mkdir -p build && touch build/.fbterm.stamp
+
+# Build fbterm into a standalone ISO without disturbing the default build.
+# Kept for bisecting: a boot that misbehaves with fbterm embedded can be compared
+# against one that only has the kernel console.
+fbterm-run: build/.fbterm.stamp
 	@mkdir -p target/fbterm
 	cp build/fbterm-build/fbterm.elf target/user-fbterm.elf
-	cd kernel && CARGO_TARGET_DIR="$(CURDIR)/target/fbterm" \
-	    cargo build --release --features fbterm
+	cd kernel && CARGO_TARGET_DIR="$(CURDIR)/target/fbterm" cargo build --release
 	nasm -f elf64 -g -F dwarf boot/boot.s -o target/fbterm/boot.o
 	$(LLD) -nostdlib -static --gc-sections --no-dynamic-linker \
 	       -z noexecstack -T kernel/linker.ld \
@@ -81,7 +96,12 @@ fbterm-run: fbterm
 # ELFs for the kernel loader. `chello` is built here too even though it is the
 # one C image rather than a Rust one: the kernel embeds every program in its
 # image, so a missing user-*.elf is a build failure, not a skipped step.
-user-bins:
+# The libc and the terminal are prerequisites, not optional extras: the kernel
+# embeds fbterm's image unconditionally, so a `make` that skipped the ports would
+# fail at the include_bytes! in kernel/src/user.rs. Ordering them here means a
+# clean tree still builds with one command, at the cost of needing git, meson,
+# ninja and a freestanding clang -- which the mlibc port already required.
+user-bins: build/.mlibc.stamp build/.fbterm.stamp
 	cd user && CARGO_TARGET_DIR="$(CURDIR)/target/user" cargo build --release --target x86_64-unknown-none --examples --bins
 	@for b in $(USER_EXAMPLES); do cp \
 	    target/user/x86_64-unknown-none/release/examples/$$b target/user-$$b.elf; done
@@ -90,14 +110,10 @@ user-bins:
 	@for b in $(USER_UTILS); do cp \
 	    target/user/x86_64-unknown-none/release/$$b target/user-$$b.elf; done
 	@sh user/build-chhello.sh
-	@# fbterm is a ported C++ program built by its own script against the mlibc
-	@# sysroot, not a cargo target. Copied in only when it has been built, so a
-	@# tree without a sysroot still produces a working ISO; `make fbterm` builds
-	@# it. Not in the kernel's program table yet -- see ports/fbterm/README.md for
-	@# the outstanding ttyname check that keeps it from running yet.
-	@if [ -f build/fbterm-build/fbterm.elf ]; then \
-	    cp build/fbterm-build/fbterm.elf target/user-fbterm.elf; \
-	fi
+	@# fbterm is a ported C++ program built by ports/fbterm/build.sh against the
+	@# mlibc sysroot, not a cargo target, so it is copied into place here. The
+	@# kernel embeds it unconditionally as the system terminal.
+	@cp build/fbterm-build/fbterm.elf target/user-fbterm.elf
 	@ls -l target/user-*.elf
 
 kernel: user-bins

@@ -27,6 +27,3 @@ driver-common = { path = "../drivers/driver-common" }
 
 [features]
 default = []
-# Embed the ported fbterm image (ports/fbterm). Off by default so that a plain
-# `make` does not require an mlibc sysroot; `make fbterm-run` turns it on.
-fbterm = []

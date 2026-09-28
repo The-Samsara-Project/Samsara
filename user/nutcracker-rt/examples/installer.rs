@@ -41,10 +41,12 @@ const PROG_CREDTST: u64 = 5;
 const PROG_SIGNALTST: u64 = 6;
 const PROG_TERMIOS_TST: u64 = 7;
 const PROG_POLLTEST: u64 = 8;
-const PROG_TERM: u64 = 10;
 /// `chello`, the C program linked against the mlibc port. The only non-Rust
 /// user image, so it is what shows the libc port runs and not merely links.
-const PROG_CHELLO: u64 = 14;
+const PROG_CHELLO: u64 = 13;
+/// `fbterm`, the ported Linux terminal emulator. The installer hands it the
+/// display when setup finishes; see the `handoff` method.
+const PROG_FBTERM: u64 = 14;
 
 /// inputd's well-known IPC endpoint.
 const EP_INPUTD: u64 = 3;
@@ -534,13 +536,56 @@ impl App {
         }
     }
 
-    /// Hand the display back to the kernel console, optionally launch the
-    /// native terminal, and exit.
+    /// Release the display to fbterm, start it, and exit.
+    ///
+    /// The order here is the whole point, and each step exists because the one
+    /// after it would otherwise be undone or would not work:
+    ///
+    /// 1. **Put the pty slave on descriptor 0.** fbterm reads its keystrokes
+    ///    from stdin, so stdin has to be the terminal the keyboard driver is
+    ///    already feeding -- which is this process's `pts` descriptor, not
+    ///    `/dev/console`. `dup2` rather than a plain re-open because the child
+    ///    must *share* the same open file description: it inherits descriptors
+    ///    from us, and sharing is what keeps the line discipline in effect on
+    ///    both ends. Descriptor 0 is replaced; the wizard's own descriptor is
+    ///    left alone and is about to be closed by exit anyway.
+    ///
+    /// 2. **Detach the kernel console.** Until this point the kernel paints its
+    ///    own text over the framebuffer, and `/dev/console` writes to the
+    ///    framebuffer as well as the serial line. fbterm opens `/dev/fb0` and
+    ///    draws, so anything still painting would scribble over it -- and
+    ///    because `consoled` echoes every keystroke to the console, the symptom
+    ///    would be text reappearing over the terminal a second after it
+    ///    started, which reads as fbterm misrendering rather than as two
+    ///    programs sharing one framebuffer. Detaching stops the painting and
+    ///    keeps the serial log, so diagnostics are unaffected.
+    ///
+    /// 3. **Spawn fbterm.** Descriptors 1 and 2 are deliberately left as
+    ///    `/dev/console`, which after the detach means the serial line only.
+    ///    That is where fbterm's diagnostics should go: its drawing goes to the
+    ///    framebuffer directly, and anything it prints is a message about the
+    ///    program rather than part of its output.
+    ///
+    /// The detach happens *before* the spawn so that nothing paints over
+    /// fbterm's first frame, and the completion message is printed after the
+    /// detach too -- which means it reaches the serial log and not the screen,
+    /// which is right: the screen belongs to fbterm from here on.
     fn handoff(&mut self) -> ! {
-        let _ = syscall::console_attach();
+        // 1. The child reads keys from the pty, so give it the pty on stdin.
+        let pts = self.pts;
+        if syscall::dup2(pts as u64, 0).is_err() {
+            println!("[installer] could not put the terminal on stdin");
+        }
+
+        // 2. Stop the kernel console painting over the display.
+        if syscall::console_detach().is_err() {
+            println!("[installer] could not release the framebuffer");
+        }
+
+        // 3. Start the terminal.
         if self.launch_term {
-            println!("[installer] launching native terminal");
-            let _ = syscall::proc_spawn(PROG_TERM, None);
+            println!("[installer] handing the display to fbterm");
+            let _ = syscall::proc_spawn(PROG_FBTERM, None);
         }
         println!(
             "[installer] setup complete (hostname={}, keymap={})",
@@ -1057,11 +1102,17 @@ pub extern "C" fn _start() -> ! {
     let mut app = match App::new() {
         Some(a) => a,
         None => {
-            // No usable framebuffer or keyboard: go straight to the terminal.
-            println!("[installer] framebuffer/keyboard unavailable; skipping wizard");
-            syscall::nanosleep(300).ok();
-            let _ = syscall::proc_spawn(PROG_TERM, None);
-            syscall::proc_exit_code(0);
+            // No framebuffer or no keyboard: there is no display to run a
+            // terminal on, so there is nothing to hand off to. This used to
+            // start the terminal emulator anyway, which could only have failed
+            // for the same reason -- it needs the framebuffer too.
+            //
+            // So say what is missing and stop, rather than spawning a program
+            // that is certain to fail and leaving the reason to be guessed at
+            // from its absence.
+            println!("[installer] no framebuffer or keyboard; cannot run a terminal");
+            println!("[installer] the serial log above is all the output available");
+            syscall::proc_exit_code(1);
         }
     };
     println!(

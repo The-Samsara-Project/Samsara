@@ -309,24 +309,43 @@ impl Vnode for PipeEnd {
     /// Register `task` for a readiness wakeup, atomically with the readiness
     /// check (under the pipe lock), so a writer/reader/close between the two
     /// cannot be missed. Returns `true` when already ready.
-    fn poll_park(&self, task: usize) -> bool {
+    ///
+    /// The readiness test is gated on `interest`, and that gating is the whole
+    /// point of the parameter. A pipe end is ready in one direction and not the
+    /// other: a read end with data in it is ready to read and never ready to
+    /// write. Reporting "ready" to a caller that asked about the *other*
+    /// direction makes the poller cancel its registration and immediately
+    /// re-probe, get the same answer, and repeat -- forever, at full CPU, with
+    /// no error and no way to tell it from a hang.
+    ///
+    /// The registration is gated the same way, for the same reason: waiting to
+    /// be told about data on a descriptor nobody is reading would park a task
+    /// that is waiting to write, and the write event would never arrive because
+    /// it is not the event being watched for.
+    fn poll_park(&self, task: usize, interest: u16) -> bool {
         let cur = crate::task::TaskId(task);
+        let want_read = interest & driver_common::POLLIN != 0;
+        let want_write = interest & driver_common::POLLOUT != 0;
         let mut g = self.core.state.lock();
         match self.role {
             EndRole::Reader => {
-                if g.len > 0 || g.writers == 0 {
+                // A read end is never writable, so `want_write` contributes
+                // nothing here -- and saying otherwise is exactly the bug.
+                if want_read && (g.len > 0 || g.writers == 0) {
                     return true;
                 }
-                if !g.read_pollers.contains(&cur) {
+                if want_read && !g.read_pollers.contains(&cur) {
                     g.read_pollers.push_back(cur);
                 }
                 false
             }
             EndRole::Writer => {
-                if g.readers == 0 || g.space() > 0 {
+                // A write end is never readable: reads on it are not a thing a
+                // pipe offers, so `want_read` registers nothing.
+                if want_write && (g.readers == 0 || g.space() > 0) {
                     return true;
                 }
-                if !g.write_pollers.contains(&cur) {
+                if want_write && !g.write_pollers.contains(&cur) {
                     g.write_pollers.push_back(cur);
                 }
                 false

@@ -35,25 +35,23 @@ pub const PROG_SIGNALTST: usize = 6;
 pub const PROG_TERMIOS_TST: usize = 7;
 /// Index of the `poll` multiplexing exercise process.
 pub const PROG_POLLTEST: usize = 8;
-/// Index of the native terminal's replaceable shell (spawned by `term`).
+/// Index of the standalone shell, run directly on the console PTY.
 pub const PROG_SHELL: usize = 9;
-/// Index of the native PTY terminal emulator (spawned by the installer).
-pub const PROG_TERM: usize = 10;
 /// Index of the interactive setup wizard (the boot-time user front end).
-pub const PROG_INSTALLER: usize = 11;
+pub const PROG_INSTALLER: usize = 10;
 /// Index of the bounded exec target (reached via `exec()` from `forkx`).
-pub const PROG_EXECTST: usize = 12;
+pub const PROG_EXECTST: usize = 11;
 /// Index of the ring-3 utility multi-call binary (busybox-style `samutils`),
 /// spawned with an argv by the shell and other users.
-pub const PROG_SAMUTILS: usize = 13;
+pub const PROG_SAMUTILS: usize = 12;
 /// Index of `chello`, the C program linked against the mlibc port. It is the
 /// only non-Rust user image, so it is what proves the libc port runs rather
 /// than merely links; the installer runs it as a boot self-test.
-pub const PROG_CHELLO: usize = 14;
+pub const PROG_CHELLO: usize = 13;
 /// Index of `fbterm`, the ported Linux terminal emulator. Present in the table
 /// unconditionally so the index is stable whether or not the port has been
 /// built; see the table entry for how the image is gated.
-pub const PROG_FBTERM: usize = 15;
+pub const PROG_FBTERM: usize = 14;
 
 /// A boot-time user-space program.
 struct Program {
@@ -66,7 +64,7 @@ struct Program {
     image: &'static [u8],
 }
 
-const PROGRAMS: [Program; 16] = [
+const PROGRAMS: [Program; 15] = [
     Program {
         name: "hello",
         endpoint: None,
@@ -128,12 +126,6 @@ const PROGRAMS: [Program; 16] = [
         image: include_bytes!("../../target/user-sh.elf"),
     },
     Program {
-        name: "term",
-        endpoint: None,
-        root: false,
-        image: include_bytes!("../../target/user-term.elf"),
-    },
-    Program {
         name: "installer",
         endpoint: None,
         // The setup wizard runs privileged: it must stat/open block devices
@@ -177,10 +169,7 @@ const PROGRAMS: [Program; 16] = [
         name: "fbterm",
         endpoint: None,
         root: false,
-        #[cfg(feature = "fbterm")]
         image: include_bytes!("../../target/user-fbterm.elf"),
-        #[cfg(not(feature = "fbterm"))]
-        image: &[],
     },
 ];
 

@@ -33,7 +33,7 @@ use nutcracker_rt::syscall::{self, poll_events, PollFd};
 
 const MAX_LINE: usize = 512;
 /// Index of the samutils multi-call binary (matches kernel `PROG_SAMUTILS`).
-const PROG_SAMUTILS: u64 = 13;
+const PROG_SAMUTILS: u64 = 12;
 
 /// Write the whole slice to `fd`, tolerating short writes.
 fn write_all(fd: usize, bytes: &[u8]) {

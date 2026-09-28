@@ -18,7 +18,7 @@ use nutcracker_rt::syscall;
 
 /// Embedded program table index of the bounded `exectst` image (matches
 /// `kernel/src/user.rs`), the replacement for the looping `hello` demo.
-const PROG_EXECTST: u64 = 12;
+const PROG_EXECTST: u64 = 11;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {

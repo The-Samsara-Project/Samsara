@@ -776,15 +776,23 @@ impl CharDevice for PtyMasterDevice {
     /// Register `task` for a wakeup when the master has something to draw.
     /// Returns `true` when data is already queued, so the caller can skip the
     /// park entirely.
-    fn park(&self, task: usize) -> bool {
-        if self.master.closed.load(Ordering::Acquire) {
-            return true;
+    fn park(&self, task: usize, interest: u16) -> bool {
+        // Gated on POLLIN. Claiming "ready" because the master has queued input
+        // to a caller that asked only about writability is the livelock
+        // described on `Vnode::poll_park`: the poller cancels and re-probes
+        // forever. A master is always writable, so a POLLOUT-only wait never
+        // reaches here at all -- `poll_events` already reported it ready.
+        let want_read = interest & driver_common::POLLIN != 0;
+        if want_read {
+            if self.master.closed.load(Ordering::Acquire) {
+                return true;
+            }
+            if self.master.has_data() {
+                return true;
+            }
+            // SAFETY: the kernel exports this symbol (kernel/src/lib.rs).
+            self.master.read_waiters.register(unsafe { tty_current_task() });
         }
-        if self.master.has_data() {
-            return true;
-        }
-        // SAFETY: the kernel exports this symbol (kernel/src/lib.rs).
-        self.master.read_waiters.register(unsafe { tty_current_task() });
         let _ = task;
         false
     }
@@ -861,16 +869,21 @@ impl CharDevice for PtySlaveDevice {
     /// Register `task` for a wakeup when input (or an end-of-file from `^D`)
     /// is available on the slave. Returns `true` when the terminal is already
     /// readable, so the caller proceeds without parking.
-    fn park(&self, task: usize) -> bool {
-        if self.slave.closed.load(Ordering::Acquire) {
-            // Closed terminal: report ready so the reader observes EOF.
-            return true;
+    fn park(&self, task: usize, interest: u16) -> bool {
+        // Gated on POLLIN, for the same reason as the master above: readiness
+        // has to be reported for the direction the caller asked about.
+        let want_read = interest & driver_common::POLLIN != 0;
+        if want_read {
+            if self.slave.closed.load(Ordering::Acquire) {
+                // Closed terminal: report ready so the reader observes EOF.
+                return true;
+            }
+            if self.slave.has_data() {
+                return true;
+            }
+            // SAFETY: the kernel exports this symbol (kernel/src/lib.rs).
+            self.slave.read_waiters.register(unsafe { tty_current_task() });
         }
-        if self.slave.has_data() {
-            return true;
-        }
-        // SAFETY: the kernel exports this symbol (kernel/src/lib.rs).
-        self.slave.read_waiters.register(unsafe { tty_current_task() });
         let _ = task;
         false
     }

@@ -82,6 +82,9 @@ pub const IOCTL: u64 = 59;
 pub const FB_INFO: u64 = 60;
 /// Hand the framebuffer to this process: stop the kernel text console drawing.
 pub const CONSOLE_DETACH: u64 = 61;
+/// `(oldfd, newfd) -> newfd`. Duplicate a descriptor onto a specific slot,
+/// sharing its file offset. `oldfd == newfd` succeeds and changes nothing.
+pub const DUP2: u64 = 89;
 /// Hand the console back to the kernel (`CONSOLE_ATTACH`).
 pub const CONSOLE_ATTACH: u64 = 62;
 /// Copy this process's argument vector: an `argc` word (u64 LE) followed by
@@ -725,6 +728,26 @@ pub fn console_attach() -> Result<(), i64> {
         Err(r)
     } else {
         Ok(())
+    }
+}
+
+/// Duplicate `oldfd` onto `newfd`, closing whatever descriptor was there.
+///
+/// The duplicate shares the *open file description*, not just the underlying
+/// object, so the two descriptors share a file position. That is what makes this
+/// useful for handing a child a terminal: `dup2(pts, 0)` puts the pty slave on
+/// the child's standard input while leaving the parent's own descriptor alone
+/// and still usable.
+///
+/// `oldfd == newfd` succeeds and changes nothing, matching POSIX.
+pub fn dup2(oldfd: u64, newfd: u64) -> Result<u64, i64> {
+    // SAFETY: a pure descriptor-table operation; both arguments are plain
+    // integers and the kernel resolves them.
+    let r = unsafe { raw(DUP2, oldfd, newfd, 0, 0, 0, 0) };
+    if r < 0 {
+        Err(r)
+    } else {
+        Ok(r as u64)
     }
 }
 

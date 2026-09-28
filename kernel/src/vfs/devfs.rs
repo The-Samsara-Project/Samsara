@@ -74,13 +74,17 @@ impl Vnode for CharDeviceNode {
         r
     }
 
-    fn poll_park(&self, task: usize) -> bool {
+    fn poll_park(&self, task: usize, interest: u16) -> bool {
         // Re-check under the driver's own lock so a byte pushed between the
         // availability probe and the registration cannot be missed.
-        if self.dev.has_data() {
+        //
+        // Gated on the interest: a device with data is ready to *read*, and
+        // saying so to a caller waiting only for writability is the livelock
+        // described on `Vnode::poll_park`.
+        if interest & driver_common::POLLIN != 0 && self.dev.has_data() {
             return true;
         }
-        self.dev.park(task)
+        self.dev.park(task, interest)
     }
 
     fn poll_cancel(&self, task: usize) {

@@ -286,7 +286,7 @@ impl driver_common::CharDevice for KbdDevice {
         STATE.lock().queue.has_data()
     }
 
-    fn park(&self, task: usize) -> bool {
+    fn park(&self, task: usize, interest: u16) -> bool {
         let _ = task;
         STATE.lock().queue.poll_park()
     }
