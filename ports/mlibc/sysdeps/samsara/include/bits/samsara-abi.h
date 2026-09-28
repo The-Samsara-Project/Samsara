@@ -69,6 +69,19 @@
 #define SYSCALL_DUP            88
 #define SYSCALL_DUP2           89
 #define SYSCALL_PSELECT6       90
+/* `symlink(2)`: the link's contents are the target, stored verbatim. Recorded
+ * rather than resolved, because a relative target is meaningless without knowing
+ * the directory the link sits in -- resolving at creation time produces a link
+ * that breaks the moment it is moved, which is why relative links exist. */
+#define SYSCALL_SYMLINK        91
+/* `readlink(2)`: the stored target, no NUL appended, so a shell can compose a
+ * path from it without stripping anything. */
+#define SYSCALL_READLINK       92
+/* `lstat(2)`: `stat` that describes the link rather than what it names. A
+ * separate number rather than a flag in STAT's unused fourth argument, because
+ * STAT's shape is frozen and a program calling a three-argument syscall leaves
+ * that register holding whatever it had. */
+#define SYSCALL_LSTAT          93
 #define SYSCALL_GETUID          31
 #define SYSCALL_GETGID          32
 #define SYSCALL_GETEUID         33

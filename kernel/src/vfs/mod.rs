@@ -105,49 +105,246 @@ pub fn normalize_abs(path: &str) -> String {
     normalize(path)
 }
 
-/// Resolve an absolute path to a vnode, crossing mount points.
+/// How many symbolic links a single path resolution may follow.
+///
+/// POSIX's answer is 8 (`SYMLOOP_MAX`), and the value matters: a symlink that
+/// points at itself must fail rather than loop forever, and the failure has to be
+/// `ELOOP`. A limit that is too small breaks a legitimate chain -- a system whose
+/// `/lib` is a link, whose `/lib/foo` is a link, and whose `foo` is a link to
+/// somewhere else is not pathological -- and one that is too large turns a bug
+/// into a hang that looks like a slow machine.
+pub const SYMLOOP_MAX: usize = 8;
+
+/// How many components a single path resolution may examine, counting
+/// components consumed *and* components introduced by symlink expansion.
+///
+/// A second limit for the same reason, and it bounds a different attack: a chain
+/// where each link points at a path containing two links, so the link count stays
+/// under `SYMLOOP_MAX` while the path length grows exponentially. Without this,
+/// `a -> b/b`, `b -> a/a/a` and so on is a symlink loop that never trips the link
+/// counter. The bound is on work done, not on links seen.
+const MAX_RESOLVE_STEPS: usize = 256;
+
+/// Resolve an absolute path to a vnode, crossing mount points and following
+/// symbolic links.
+///
+/// The last component is followed too, which is what makes `open` work: a
+/// program that opens `/bin/ls` wants the executable, not the link. Callers that
+/// want the link itself use [`resolve_nofollow`] -- `lstat(2)`, and `readlink`.
 pub fn resolve(path: &str) -> Result<VnodeRef, FsError> {
-    let norm = normalize(path);
+    resolve_inner(path, true, None)
+}
+
+/// Resolve an absolute path to a vnode *without* following a final symbolic
+/// link. Intermediate components are still followed: a link to a directory
+/// cannot be entered without being followed, or `/link/etc/passwd` would break.
+pub fn resolve_nofollow(path: &str) -> Result<VnodeRef, FsError> {
+    resolve_inner(path, false, None)
+}
+
+/// Resolve a path, optionally checking search permission on every directory
+/// component against `cred`.
+///
+/// `follow_final` selects [`resolve_nofollow`] behaviour, and `cred` turns on the
+/// permission check. `None` means the check is skipped, which is what the
+/// kernel-internal callers want and what `resolve` has always done.
+pub fn resolve_with(
+    path: &str,
+    follow_final: bool,
+    cred: Option<&crate::cred::Credentials>,
+) -> Result<VnodeRef, FsError> {
+    resolve_inner(path, follow_final, cred)
+}
+
+fn resolve_inner(
+    path: &str,
+    follow_final: bool,
+    cred: Option<&crate::cred::Credentials>,
+) -> Result<VnodeRef, FsError> {
+    let start = normalize(path);
+
+    // `queue` holds the components still to be examined, in order.
+    //
+    // A queue of names rather than an index into one path string, because
+    // following a link splices a *new* path in front of whatever is left of the
+    // old one, and the leftovers have to survive that splice. A string with an
+    // index cannot express "these components, then those, then more".
+    //
+    // `dir` is the absolute path of the directory the next component lives in,
+    // maintained alongside the queue so that a *relative* link target can be
+    // resolved. Resolving a relative target needs the link's own directory, and
+    // the queue alone does not carry it: by the time the walker is one component
+    // into `/a/b/c`, `cur` is the `b` node and `/a` is no longer recoverable from
+    // the queue's tail. Keeping the prefix as text is what makes `b -> ../x` mean
+    // `/a/x` and not `/x`.
+    let mut queue: Vec<String> = Vec::new();
+    let mut dir = String::from("/");
+    let (mut cur, rest) = resolve_mount_root(&start)?;
+    for comp in pending_components(rest) {
+        queue.push(comp);
+    }
+
+    let mut links = 0usize;
+    let mut steps = 0usize;
+
+    while !queue.is_empty() {
+        steps += 1;
+        if steps > MAX_RESOLVE_STEPS {
+            return Err(FsError::TooManyLinks);
+        }
+        let comp = queue.remove(0);
+
+        match comp.as_str() {
+            "." => continue,
+            // A parent walk pops the directory prefix, which is what makes `..`
+            // mean the right thing after a link has moved the walk into a
+            // different subtree. At the root there is nowhere to go, so it stays.
+            //
+            // `..` also discards whatever is left in `queue`. That is required,
+            // not incidental: a component that is about to be dropped can never
+            // be reached, and leaving it would make `/a/link/../b` resolve
+            // `/a/b/target/b` -- the parent walk would be applied to the
+            // *target's* directory and then walk on past it.
+            ".." => {
+                dir = parent_of(&dir);
+                queue.clear();
+                if dir != "/" {
+                    cur = resolve(&dir)?;
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        if let Some(c) = cred {
+            if !search_ok(cur.as_ref(), c) {
+                return Err(FsError::AccessDenied);
+            }
+        }
+
+        // `dir` is the directory this component is looked up *in*, and that is
+        // what a relative symlink target has to be joined against. The prefix is
+        // therefore extended only once the component has been accepted as a real
+        // step into the tree -- not before the lookup, and not at all when the
+        // component turns out to be a link.
+        //
+        // Extending first is the mistake that makes relative links resolve as if
+        // they were absolute: with `dir` already advanced to `/tmp/ln`, a target
+        // of `target` joins to `/tmp/ln/target` instead of `/tmp/target`, and the
+        // link silently stops working the moment it is not sitting in `/`.
+        let next = cur.lookup(&comp)?;
+        let is_last = queue.is_empty();
+        if next.kind() == NodeKind::Symlink && !(is_last && !follow_final) {
+            links += 1;
+            if links > SYMLOOP_MAX {
+                return Err(FsError::TooManyLinks);
+            }
+            let target = next.symlink_target().ok_or(FsError::Invalid)?;
+            // An absolute target replaces the path outright. A relative one is
+            // joined to `dir` -- the directory the link was found in, which is
+            // exactly the directory POSIX says a relative link is relative to.
+            let resolved = if target.starts_with('/') {
+                normalize(&target)
+            } else {
+                let mut joined = String::from(&dir);
+                if joined != "/" {
+                    joined.push('/');
+                }
+                joined.push_str(&target);
+                normalize(&joined)
+            };
+            let (root, rest) = resolve_mount_root(&resolved)?;
+            cur = root;
+            // The directory the target's own first component lives in: everything
+            // up to the last component, which is the mount prefix plus whatever
+            // directory components the target path had.
+            let consumed = resolved.len() - rest.len();
+            dir = if consumed == 0 {
+                String::from("/")
+            } else {
+                String::from(&resolved[..consumed])
+            };
+            if dir.is_empty() {
+                dir = String::from("/");
+            }
+            // The target's components go in *front* of what is left of the old
+            // path, so `link/x` where link names `/y` resolves `/y/x` and not
+            // `/x`. Appending would silently drop the link's own trailing
+            // components, which is the bug this ordering is here to prevent.
+            splice_front(&mut queue, pending_components(rest));
+            continue;
+        }
+
+        dir = if dir == "/" {
+            alloc::format!("/{}", comp)
+        } else {
+            alloc::format!("{}/{}", dir, comp)
+        };
+        cur = next;
+    }
+    Ok(cur)
+}
+
+/// Push `items` onto the front of `queue`, preserving their order.
+fn splice_front(queue: &mut Vec<String>, items: Vec<String>) {
+    if items.is_empty() {
+        return;
+    }
+    let mut merged = items;
+    merged.append(queue);
+    *queue = merged;
+}
+
+/// The parent of an absolute normalized path. `"/"` is its own parent.
+fn parent_of(path: &str) -> String {
+    match path.rfind('/') {
+        None | Some(0) => String::from("/"),
+        Some(pos) => String::from(&path[..pos]),
+    }
+}
+
+fn search_ok(node: &dyn Vnode, cred: &crate::cred::Credentials) -> bool {
+    crate::cred::may_access(
+        cred,
+        node.uid(),
+        node.gid(),
+        node.mode(),
+        crate::cred::Access::Exec,
+    )
+}
+
+fn pending_components(rest: &str) -> Vec<String> {
+    rest.split('/')
+        .filter(|c| !c.is_empty())
+        .map(|c| String::from(c))
+        .collect()
+}
+
+/// Cross the mount table for `norm`, returning the mounted root and the part of
+/// the path still to be walked inside it.
+fn resolve_mount_root(norm: &str) -> Result<(VnodeRef, &str), FsError> {
     let m = MOUNTS.lock();
     let root = m.root.clone().ok_or(FsError::NotFound)?;
 
-    // Find longest matching mount prefix.
-    let mut node = root.clone();
-    let mut rest: &str = norm.as_str();
+    let mut node = root;
     let mut best_len = 0usize;
     for (mp, mvnode) in m.mounts.iter() {
-        let matches = norm.as_str() == mp.as_str() || norm.starts_with(&alloc::format!("{}/", mp));
+        let matches = norm == mp.as_str() || norm.starts_with(&alloc::format!("{}/", mp));
         if matches && mp.len() > best_len {
             best_len = mp.len();
             node = mvnode.clone();
         }
     }
-    if best_len > 0 {
-        rest = &norm[best_len..];
-        if let Some(stripped) = rest.strip_prefix('/') {
-            rest = stripped;
-        } else {
+    let rest = if best_len > 0 {
+        match norm[best_len..].strip_prefix('/') {
+            Some(stripped) => stripped,
             // Path is exactly the mount point itself.
-            return Ok(node);
+            None => "",
         }
-    } else if let Some(stripped) = norm.strip_prefix('/') {
-        rest = stripped;
-    }
-
-    let mut cur = node;
-    for comp in rest.split('/') {
-        if comp.is_empty() || comp == "." {
-            continue;
-        }
-        if comp == ".." {
-            continue; // ramfs dirs are flat; parent walk unsupported here
-        }
-        cur = cur.lookup(comp)?;
-        // Cross a mount if one sits on this exact node's path later; the
-        // prefix scan above already handled mounted subtrees during the
-        // string phase, which keeps resolution O(components).
-    }
-    Ok(cur)
+    } else {
+        norm.strip_prefix('/').unwrap_or("")
+    };
+    Ok((node, rest))
 }
 
 /// Resolve an absolute path to a vnode, like [`resolve`], checking search
@@ -157,57 +354,81 @@ pub fn resolve(path: &str) -> Result<VnodeRef, FsError> {
 /// they need read/write on the leaf (open), ownership (chmod/chown) or
 /// nothing at all (stat).
 pub fn resolve_checked(path: &str, cred: &crate::cred::Credentials) -> Result<VnodeRef, FsError> {
+    resolve_with(path, true, Some(cred))
+}
+
+/// As [`resolve_checked`], but a final symbolic link is not followed.
+///
+/// This is `lstat(2)`: the answer describes the link rather than what it names.
+/// [`resolve_checked`] is right for `stat`, `open`, `chmod` and `unlink`; a
+/// program asking what a directory entry *is* -- `ls -l` drawing the `@` marker,
+/// a shell testing `-L`, an installer refusing to clobber a link -- needs this.
+pub fn resolve_checked_nofollow(
+    path: &str,
+    cred: &crate::cred::Credentials,
+) -> Result<VnodeRef, FsError> {
+    resolve_with(path, false, Some(cred))
+}
+
+/// Create a symbolic link at `path` pointing at `target`.
+///
+/// `target` is stored verbatim. Resolving it is the path walker's job, and doing
+/// it here would make the link wrong the moment it moved: a relative target is
+/// meaningless without knowing the directory the link sits in, and this function
+/// is handed a path rather than the directory node.
+///
+/// A default mode of `0o777` is used. That is not a grant: on every system a
+/// symlink's own permission bits are ignored, because following one is a
+/// directory-traversal decision made about the *target* and the directories
+/// leading to it. `ls -l` still shows it, so the number is not invisible, and
+/// `0o777` is the value users expect to see. The alternative, `0o666`, implies
+/// write access that is equally meaningless and reads as though the link were a
+/// file.
+pub fn symlink_as(
+    path: &str,
+    target: &str,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    cred: &crate::cred::Credentials,
+) -> Result<(), FsError> {
+    if target.is_empty() {
+        // A link to nowhere is a mistake, and a silent one: every later
+        // operation on it fails with ENOENT pointing at a path the user never
+        // wrote. Rejecting it here names the actual problem.
+        return Err(FsError::Invalid);
+    }
     let norm = normalize(path);
-    let m = MOUNTS.lock();
-    let root = m.root.clone().ok_or(FsError::NotFound)?;
-
-    fn search_ok(node: &dyn Vnode, cred: &crate::cred::Credentials) -> bool {
-        crate::cred::may_access(
-            cred,
-            node.uid(),
-            node.gid(),
-            node.mode(),
-            crate::cred::Access::Exec,
-        )
+    let (parent, name) = match norm.rfind('/') {
+        Some(0) => ("/", &norm[1..]),
+        Some(pos) => (&norm[..pos], &norm[pos + 1..]),
+        None => return Err(FsError::NotFound),
+    };
+    if name.is_empty() {
+        return Err(FsError::NotFound);
     }
-
-    // Find longest matching mount prefix.
-    let mut node = root.clone();
-    let mut rest: &str = norm.as_str();
-    let mut best_len = 0usize;
-    for (mp, mvnode) in m.mounts.iter() {
-        let matches = norm.as_str() == mp.as_str() || norm.starts_with(&alloc::format!("{}/", mp));
-        if matches && mp.len() > best_len {
-            best_len = mp.len();
-            node = mvnode.clone();
-        }
+    let dir = resolve_checked(parent, cred)?;
+    if dir.kind() != NodeKind::Dir {
+        return Err(FsError::NotADirectory);
     }
-    if best_len > 0 {
-        rest = &norm[best_len..];
-        if let Some(stripped) = rest.strip_prefix('/') {
-            rest = stripped;
-        } else {
-            // Path is exactly the mount point itself.
-            return Ok(node);
-        }
-    } else if let Some(stripped) = norm.strip_prefix('/') {
-        rest = stripped;
+    if !crate::cred::may_access(
+        cred,
+        dir.uid(),
+        dir.gid(),
+        dir.mode(),
+        crate::cred::Access::Write,
+    ) {
+        return Err(FsError::AccessDenied);
     }
-
-    let mut cur = node;
-    for comp in rest.split('/') {
-        if comp.is_empty() || comp == "." {
-            continue;
-        }
-        if comp == ".." {
-            continue; // ramfs dirs are flat; parent walk unsupported here
-        }
-        if !search_ok(cur.as_ref(), cred) {
-            return Err(FsError::AccessDenied);
-        }
-        cur = cur.lookup(comp)?;
+    // A symlink whose own name already exists is EEXIST even if it points
+    // nowhere. The alternative -- succeeding because the target is missing, or
+    // failing because it is missing -- makes `symlink` depend on a path it is
+    // explicitly not responsible for, and the two cases are indistinguishable to
+    // a caller that has just fixed the target and is retrying.
+    if dir.lookup(name).is_ok() {
+        return Err(FsError::Exists);
     }
-    Ok(cur)
+    dir.create_symlink(name, target, uid, gid, mode).map(|_| ())
 }
 
 /// An open file description held by a task's descriptor table.

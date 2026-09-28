@@ -115,7 +115,20 @@ struct SamsaraSysdepTags :
 	SetEgid,
 	Dup,
 	Dup2,
-	Pselect
+	Pselect,
+	// Symbolic links. See Sysdeps<Symlink> in sysdeps.cpp: these are what let
+	// `/bin/ls` *be* the busybox image, which is how applet dispatch works on a
+	// system with one binary.
+	//
+	// The `Symlink`/`Readlink` pair and not `Symlinkat`/`Readlinkat`, because only
+	// these two are reachable without a directory descriptor here. mlibc's
+	// `symlinkat` and `readlinkat` ask for the `at` tags, which stay unimplemented
+	// and therefore answer ENOSYS through `sysdep_or_enosys` rather than
+	// panicking. That is the better failure: a dirfd-relative symlink has no
+	// meaning on a filesystem reached by path, and honouring one would mean
+	// openat's resolution becoming a full path walk of its own.
+	Symlink,
+	Readlink
 {};
 
 template<typename Tag>

@@ -73,6 +73,11 @@ unsigned char kind_to_dirent(unsigned kind) {
 	case 1: return DT_DIR;
 	case 2: return DT_CHR;
 	case 3: return DT_FIFO;
+	// DT_LNK, not DT_REG. `readdir` reports the type of the *entry*, and a
+	// program listing a directory -- `ls -F`, a shell's completion, a `find` that
+	// wants to descend -- needs to know which names to follow. A listing that
+	// called every link a regular file is a listing a program cannot trust.
+	case 4: return DT_LNK;
 	default: return DT_UNKNOWN;
 	}
 }
@@ -84,6 +89,12 @@ mode_t kind_to_ifmt(unsigned kind) {
 	case 1: return S_IFDIR;
 	case 2: return S_IFCHR;
 	case 3: return S_IFIFO;
+	// A symlink's own type. It has to be distinguished from S_IFREG because
+	// `ls -l` draws the `@`, a shell's `-L` test is `test -L`, and a program
+	// deciding whether to `chmod` something is asking about the link, not the
+	// target. Reporting a link as a regular file makes all three answer wrongly
+	// and none of them fail.
+	case 4: return S_IFLNK;
 	default: return S_IFCHR;
 	}
 }
@@ -132,6 +143,48 @@ int Sysdeps<Unlinkat>::operator()(int dirfd, const char *path, int flags) {
 	if (result < 0) {
 		return -result;
 	}
+	return 0;
+}
+
+int Sysdeps<Symlink>::operator()(const char *target_path, const char *link_path) {
+	// Recorded verbatim. The kernel does not resolve the target, and must not:
+	// a *relative* target is meaningless without knowing which directory the link
+	// sits in, so resolving at creation time would bake in an answer that is
+	// wrong the moment the link is moved -- which is the entire reason relative
+	// symlinks exist. This is what makes `/bin/ls -> /bin/busybox` a link that
+	// still works after `/bin` is itself a link to somewhere else.
+	//
+	// Both strings are passed with an explicit length, which is also what lets
+	// the kernel reject an embedded NUL instead of silently truncating: a
+	// program that wrote a target containing one would otherwise create a link
+	// to a different path than it believes it created.
+	if (!target_path || !link_path)
+		return EFAULT;
+	auto result = syscall(SYSCALL_SYMLINK, (long)target_path,
+	                      (long)strlen(target_path), (long)link_path,
+	                      (long)strlen(link_path));
+	if (result < 0) {
+		return -result;
+	}
+	return 0;
+}
+
+int Sysdeps<Readlink>::operator()(const char *path, void *buffer, size_t max_size,
+                                  ssize_t *length) {
+	if (!path)
+		return EFAULT;
+	if (!buffer && max_size)
+		return EFAULT;
+	auto result = syscall(SYSCALL_READLINK, (long)path, (long)strlen(path),
+	                      (long)buffer, (long)max_size);
+	if (result < 0) {
+		return -result;
+	}
+	// The kernel appends no NUL, and must not: a caller asking for the stored
+	// text wants the stored text, and a `readlink -f` in a shell composes the
+	// result into a path. Adding one would mean every caller had to strip it,
+	// and a caller that forgot would carry a stray NUL into the next syscall.
+	*length = result;
 	return 0;
 }
 
@@ -386,7 +439,18 @@ int Sysdeps<Stat>::operator()(mlibc::fsfd_target fsfdt, int fd, const char *path
 	}
 
 	KernelStat ks;
-	auto ret = syscall(SYSCALL_STAT, (long)path, (long)strlen(path), (long)&ks);
+	long ret;
+	// `flags` is not decoration. `lstat` and `realpath` both pass
+	// AT_SYMLINK_NOFOLLOW, and this port has `/bin/ls` as a symlink to
+	// `/bin/busybox` -- so a `stat` that ignored the flag would report the
+	// *executable* where the caller asked about the *link*, and `ls -l` would
+	// never draw the `@`. The two are separate syscalls (STAT and LSTAT) rather
+	// than one with a flag, because STAT's argument shape is frozen; see the
+	// LSTAT entry in the ABI table for why.
+	if (flags & AT_SYMLINK_NOFOLLOW)
+		ret = syscall(SYSCALL_LSTAT, (long)path, (long)strlen(path), (long)&ks);
+	else
+		ret = syscall(SYSCALL_STAT, (long)path, (long)strlen(path), (long)&ks);
 	if (ret < 0) {
 		return -ret;
 	}

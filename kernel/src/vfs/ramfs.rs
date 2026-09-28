@@ -28,6 +28,10 @@ struct RamDir {
 enum Inner {
     File(RamFile),
     Dir(RamDir),
+    /// A symbolic link. The target is a path, not content, and is kept behind
+    /// its own lock rather than in [`Meta`] so that the ordinary file write path
+    /// cannot reach it -- see [`Vnode::symlink_target`].
+    Symlink(Spinlock<String>),
 }
 
 /// Permission/ownership metadata shared by files and directories.
@@ -87,6 +91,7 @@ impl Vnode for RamNode {
         match self.inner {
             Inner::File(_) => NodeKind::File,
             Inner::Dir(_) => NodeKind::Dir,
+            Inner::Symlink(_) => NodeKind::Symlink,
         }
     }
 
@@ -126,6 +131,11 @@ impl Vnode for RamNode {
                 Ok(())
             }
             Inner::Dir(_) => Err(FsError::IsADirectory),
+            // Truncating a symlink has nothing to truncate. EACCES rather than
+            // EISDIR: the node is not a directory, and the error a caller can
+            // act on here is "you may not write through this", not "wrong node
+            // type" -- the type is already visible from `lstat`.
+            Inner::Symlink(_) => Err(FsError::AccessDenied),
         }
     }
 
@@ -140,11 +150,23 @@ impl Vnode for RamNode {
                 Ok(n)
             }
             Inner::Dir(_) => Err(FsError::IsADirectory),
+            // A symlink's target is deliberately not readable. `readlink(2)` is
+            // how a program asks, and it goes through `symlink_target()`. Serving
+            // the target here too would mean `cat` on a symlink printed its
+            // target, which is not what any system does and is a way to exfiltrate
+            // a path a program was not meant to learn.
+            Inner::Symlink(_) => Err(FsError::AccessDenied),
         }
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
         match &self.inner {
+            // A symlink is immutable through the normal file path, for the same
+            // reason it is not readable: the target is not content, and a
+            // `write` that landed here would be silently changing a path rather
+            // than writing bytes. Repointing a symlink is `rename`, and creating
+            // one is `symlink`.
+            Inner::Symlink(_) => Err(FsError::AccessDenied),
             Inner::File(f) => {
                 let mut data = f.data.lock();
                 let off = (offset as usize).min(MAX_FILE);
@@ -177,7 +199,46 @@ impl Vnode for RamNode {
                 .get(name)
                 .cloned()
                 .ok_or(FsError::NotFound),
-            Inner::File(_) => Err(FsError::NotADirectory),
+            Inner::File(_) | Inner::Symlink(_) => Err(FsError::NotADirectory),
+        }
+    }
+
+    fn symlink_target(&self) -> Option<String> {
+        match &self.inner {
+            Inner::Symlink(t) => Some(t.lock().clone()),
+            _ => None,
+        }
+    }
+
+    fn create_symlink(
+        &self,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+    ) -> Result<VnodeRef, FsError> {
+        match &self.inner {
+            Inner::Dir(d) => {
+                let mut kids = d.children.lock();
+                if kids.contains_key(name) {
+                    return Err(FsError::Exists);
+                }
+                let node = RamNode::new(
+                    Inner::Symlink(Spinlock::new(String::from(target))),
+                    uid,
+                    gid,
+                    mode,
+                );
+                kids.insert(String::from(name), node.clone());
+                Ok(node)
+            }
+            // A symlink is not a directory, whatever its target happens to be.
+            // Making this depend on the target would mean a symlink to a
+            // directory could be created inside one and then not traversed,
+            // which is the kind of rule that is only true until someone adds
+            // the case that needs it.
+            Inner::File(_) | Inner::Symlink(_) => Err(FsError::NotADirectory),
         }
     }
 
@@ -209,7 +270,7 @@ impl Vnode for RamNode {
                 kids.insert(String::from(name), node.clone());
                 Ok(node)
             }
-            Inner::File(_) => Err(FsError::NotADirectory),
+            Inner::File(_) | Inner::Symlink(_) => Err(FsError::NotADirectory),
         }
     }
 
@@ -225,7 +286,9 @@ impl Vnode for RamNode {
                 out.sort();
                 Ok(out)
             }
-            Inner::File(f) => {
+            // The `f` binding is unused; taken so the match arm reads as a
+            // statement about the node type rather than about its contents.
+            Inner::File(_) | Inner::Symlink(_) => {
                 let _ = format!(""); // keep format import used on no_std paths
                 Err(FsError::NotADirectory)
             }
@@ -241,13 +304,17 @@ impl Vnode for RamNode {
                     .map(|_| ())
                     .ok_or(FsError::NotFound)
             }
-            Inner::File(_) => Err(FsError::NotADirectory),
+            Inner::File(_) | Inner::Symlink(_) => Err(FsError::NotADirectory),
         }
     }
 
     fn size_hint(&self) -> u64 {
         match &self.inner {
             Inner::File(f) => f.data.lock().len() as u64,
+            // A symlink's size is its target's length, as on every other system.
+            // `ls -l` prints it, and a program checking whether a link is
+            // suspiciously long reads it.
+            Inner::Symlink(t) => t.lock().len() as u64,
             Inner::Dir(_) => 0,
         }
     }
@@ -256,6 +323,9 @@ impl Vnode for RamNode {
         // A directory's "offset" is a cookie into a listing, not a byte count,
         // and this filesystem hands out no cookie. Reporting it as unseekable
         // keeps stdio from treating a directory as a repositionable file.
+        //
+        // A symlink is unseekable for the same underlying reason: there is no
+        // content to position within. Its target is not bytes.
         matches!(self.inner, Inner::File(_))
     }
 

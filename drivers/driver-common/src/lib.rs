@@ -485,6 +485,14 @@ pub enum NodeKind {
     CharDevice = 2,
     /// FIFO/pipe (byte stream with EOF and blocking semantics).
     Pipe = 3,
+    /// Symbolic link: a node whose contents are a path, resolved by the path
+    /// walker rather than read by the caller.
+    ///
+    /// This is the last value, appended to the ABI's node-kind numbering, and it
+    /// has to stay that way: the discriminant is passed to user space as
+    /// `st_mode`'s type bits, so inserting a variant would re-type every
+    /// existing node. Append, as `docs/ABI.md` requires of the syscall table.
+    Symlink = 4,
 }
 
 impl core::fmt::Display for NodeKind {
@@ -494,6 +502,7 @@ impl core::fmt::Display for NodeKind {
             NodeKind::Dir => write!(f, "dir"),
             NodeKind::CharDevice => write!(f, "char"),
             NodeKind::Pipe => write!(f, "pipe"),
+            NodeKind::Symlink => write!(f, "symlink"),
         }
     }
 }
@@ -538,6 +547,14 @@ pub enum FsError {
     /// Blocking operation interrupted by a pending process signal (POSIX
     /// `EINTR`); syscalls may restart it if the handler requests `SA_RESTART`.
     Interrupted = -4,
+    /// Too many symbolic links followed (POSIX `ELOOP`).
+    ///
+    /// Distinct from `NotSupported` because it is not a missing feature. A path
+    /// that loops is a *path* problem, and a caller that gets `ENOSYS` will
+    /// reasonably conclude the symlink is not what it expected and go looking
+    /// elsewhere; a caller that gets `ELOOP` knows its own link chain is wrong.
+    /// -1 on the wire, which is `ELOOP`'s value.
+    TooManyLinks = -40,
 }
 
 /// Convenience: is this `EINTR`?
@@ -721,6 +738,37 @@ pub trait Vnode: Send + Sync {
     }
     /// List children as `(name, kind)` pairs.
     fn list(&self) -> Result<Vec<(String, NodeKind)>, FsError> {
+        Err(FsError::NotSupported)
+    }
+    /// The path this node points at, if it is a symbolic link.
+    ///
+    /// A trait method rather than a read of `read_at` because a symlink's target
+    /// is *not* file content. Reading it through `read_at` would make the target
+    /// readable, writable and truncatable like any other byte range, and every
+    /// caller of `readlink(2)` would then be asking whether the bytes they read
+    /// happen to end in a NUL. Keeping it separate also means the path walker
+    /// does not have to allocate a buffer to learn where to go next.
+    ///
+    /// The default is `None`, meaning "not a symbolic link", which is the right
+    /// answer for every node type that has no target.
+    fn symlink_target(&self) -> Option<String> {
+        None
+    }
+    /// Create a child symbolic link called `name` pointing at `target`.
+    ///
+    /// The counterpart to [`Vnode::symlink_target`], kept beside it so that a
+    /// filesystem implementing one and not the other is visibly incomplete. The
+    /// target is stored verbatim, relative or absolute: resolution against the
+    /// link's own directory is the path walker's job, and a filesystem that
+    /// stored it pre-resolved would be wrong the moment the link were moved.
+    fn create_symlink(
+        &self,
+        _name: &str,
+        _target: &str,
+        _uid: u32,
+        _gid: u32,
+        _mode: u32,
+    ) -> Result<VnodeRef, FsError> {
         Err(FsError::NotSupported)
     }
     /// Non-blocking readability probe used by device nodes.

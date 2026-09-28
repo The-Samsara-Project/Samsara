@@ -88,6 +88,26 @@ pub mod errno {
     /// the answer. Used by `ttyname(3)`, where returning a truncated device
     /// path would hand back a path that does not open.
     pub const ERANGE: i64 = -34;
+    /// Too many symbolic links followed (POSIX `ELOOP`).
+    ///
+    /// A *path* problem rather than a request problem, which is why it is not
+    /// `EINVAL`: the caller asked for something legitimate, and it is the chain
+    /// of links in the path that is at fault. A program that distinguishes them
+    /// can report "this path is circular" instead of "bad argument", and a program
+    /// that only distinguishes success from failure behaves the same either way.
+    ///
+    /// The path walker returns this from [`crate::vfs::FsError::TooManyLinks`];
+    /// the value is duplicated here so that the syscall layer never has to convert
+    /// between the two representations.
+    pub const ELOOP: i64 = -40;
+    /// A path component is too long (POSIX `ENAMETOOLONG`).
+    ///
+    /// Separate from `EINVAL` because the remedy is different: the caller shortens
+    /// a *name*, rather than changing a flag or fixing a type. `ENAMETOOLONG` is
+    /// the only error a program can act on to make progress, so folding it into
+    /// `EINVAL` would leave a caller with no way to tell "your name is too long"
+    /// from "your arguments disagree".
+    pub const ENAMETOOLONG: i64 = -36;
 }
 
 /// Stable system call numbers. Never renumber; only append.
@@ -398,6 +418,51 @@ pub mod nr {
     /// swapping the blocked mask atomically with respect to delivery, and a
     /// subtly wrong version is worse than none.
     pub const PSELECT6: u64 = 90;
+    /// Create a symbolic link: `(target, target_len, path, path_len) -> 0`.
+    ///
+    /// `symlink(2)`. The link's own *contents* are `target`, stored verbatim and
+    /// not resolved: a relative target is meaningless without knowing which
+    /// directory the link sits in, so the kernel records what the caller asked
+    /// for and the path walker works it out per lookup. Resolving at creation
+    /// time would produce a link that breaks the moment it is moved, which is the
+    /// whole reason relative links exist.
+    ///
+    /// Both strings are counted, not NUL-terminated, and both may contain no NUL
+    /// at all -- a path with an embedded NUL is `EINVAL`, not a truncation.
+    ///
+    /// Fails with `EEXIST` when the link's own name is taken, *even if the
+    /// target does not exist*. A symlink is allowed to dangle; the question
+    /// `symlink` answers is whether the *name* is free, and making it depend on
+    /// the target would mean a caller that fixed the target and retried could not
+    /// tell which of the two failures it was looking at.
+    pub const SYMLINK: u64 = 91;
+    /// Read a symbolic link's target: `(path, path_len, buf, buflen) -> length`.
+    ///
+    /// `readlink(2)`. Returns the target exactly as stored, relative or absolute,
+    /// with no NUL appended -- which is what makes `readlink -f` in a shell able
+    /// to compose a path without having to strip anything.
+    ///
+    /// Fails with `EINVAL` when the path is not a symbolic link. Following the
+    /// link and reporting what it names would make `readlink` a second `stat`,
+    /// and a caller asking "is this a link, and if so what does it say" would get
+    /// an answer to a question it did not ask.
+    ///
+    /// Fails with `ERANGE` when the buffer is too small, rather than truncating.
+    /// A truncated target is a path that does not exist, and a program that
+    /// `stat`ed it would report a missing file rather than a short buffer.
+    pub const READLINK: u64 = 92;
+    /// `lstat(2)`: `(path, path_len, out) -> 0`, like [`STAT`] but a final
+    /// symbolic link is not followed.
+    ///
+    /// A separate number rather than a flag in `STAT`'s unused fourth argument.
+    /// `STAT` is documented as a frozen five-field shape that cannot grow, and
+    /// the tempting move -- give `a4` a meaning -- would change the behaviour of
+    /// every existing caller that happens to pass something there. A program
+    /// calling a three-argument syscall leaves `r10` holding whatever it had; if
+    /// that value happened to be 1, `stat` would silently become `lstat` and
+    /// report the link instead of the file. Nothing would fail. The appended
+    /// number costs one line in the table and cannot surprise anyone.
+    pub const LSTAT: u64 = 93;
     /// First number reserved for out-of-tree/experimental use.
     pub const EXPERIMENTAL_BASE: u64 = 0x8000_0000_0000_0000;
 }
@@ -706,13 +771,27 @@ pub fn register_defaults() {
     register(nr::SHM_CREATE, sys_shm_create);
     register(nr::SHM_MAP, sys_shm_map);
     register(nr::SHM_DESTROY, sys_shm_destroy);
+    register(nr::SYMLINK, sys_symlink);
+    register(nr::READLINK, sys_readlink);
+    register(nr::LSTAT, sys_lstat);
 
     unsafe {
         enable_syscall_instruction();
     }
+    // Counted from the table rather than written down, because a hand-maintained
+    // number here is wrong the moment a syscall is added and nothing notices: it
+    // is a log line, so it is exactly the kind of fact that can rot in silence.
+    // The count that used to be printed was 68 while 97 were registered, which is
+    // the failure this replaces.
+    let registered = unsafe {
+        SYSCALL_TABLE
+            .iter()
+            .filter(|s| s.is_some())
+            .count()
+    };
     crate::log::kdebug!(
         "abi: {} syscalls registered; `syscall` enabled",
-        68
+        registered
     );
 }
 
@@ -1836,6 +1915,15 @@ fn sys_fstat(fd: u64, out: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
 }
 
 fn sys_stat(path: u64, path_len: u64, out: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    stat_impl(path, path_len, out, true)
+}
+
+/// `lstat(2)`: `stat` that describes the link rather than what it names.
+fn sys_lstat(path: u64, path_len: u64, out: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    stat_impl(path, path_len, out, false)
+}
+
+fn stat_impl(path: u64, path_len: u64, out: u64, follow_final: bool) -> i64 {
     let task = match current_task() {
         Ok(t) => t,
         Err(e) => return e,
@@ -1845,7 +1933,11 @@ fn sys_stat(path: u64, path_len: u64, out: u64, _a4: u64, _a5: u64, _a6: u64) ->
         Err(e) => return e,
     };
     let cred = crate::cred::get(task);
-    let node = match crate::vfs::resolve_checked(&task_abs_path(&path), &cred) {
+    let node = match crate::vfs::resolve_with(
+        &task_abs_path(&path),
+        follow_final,
+        Some(&cred),
+    ) {
         Ok(n) => n,
         Err(e) => return e.into(),
     };
@@ -1865,6 +1957,110 @@ fn sys_stat(path: u64, path_len: u64, out: u64, _a4: u64, _a5: u64, _a6: u64) ->
         core::ptr::copy_nonoverlapping(&st as *const AbiStat as *const u8, out as *mut u8, sz);
     }
     0
+}
+
+/// `symlink(2)`: record `target` as the contents of a new link at `path`.
+///
+/// The link's mode is `0o777`, and that is not a grant. Following a symlink is a
+/// traversal decision made about the target and the directories leading to it, so
+/// a link's own permission bits are ignored on every system that has them. The
+/// value is visible in `ls -l` and is the one users expect to see; `0o666` would
+/// imply write access that is equally meaningless and reads as though the link
+/// were an ordinary file.
+fn sys_symlink(
+    target: u64,
+    target_len: u64,
+    path: u64,
+    path_len: u64,
+    _a5: u64,
+    _a6: u64,
+) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let target_str = match user_str(target, target_len) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let link_path = match user_str(path, path_len) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    // Both arguments are counted, so an embedded NUL is a caller bug rather than
+    // a terminator. Trimming it silently would create a link whose target no
+    // longer matches what the program believes it wrote, and the program would
+    // only find out when it resolved the link.
+    if target_str.contains('\0') || link_path.contains('\0') {
+        return errno::EINVAL;
+    }
+    if target_str.is_empty() {
+        // A link to nowhere is a mistake, and an invisible one: every later
+        // operation on it fails with ENOENT pointing at a path nobody wrote.
+        return errno::EINVAL;
+    }
+    // A path component longer than the kernel can name is ENAMETOOLONG, which is
+    // the one error that tells a caller what to change.
+    const NAME_MAX: usize = 255;
+    if link_path.split('/').any(|c| c.len() > NAME_MAX) {
+        return errno::ENAMETOOLONG;
+    }
+    let cred = crate::cred::get(task);
+    let abs = task_abs_path(&link_path);
+    match crate::vfs::symlink_as(&abs, &target_str, cred.fsuid, cred.fsgid, 0o777, &cred) {
+        Ok(()) => 0,
+        Err(e) => e.into(),
+    }
+}
+
+/// `readlink(2)`: copy a symlink's stored target into the caller's buffer.
+///
+/// The target is returned verbatim -- relative stays relative, no NUL is
+/// appended -- because the caller is entitled to learn what was written rather
+/// than a resolved form of it. A program that wants the resolved path has to
+/// resolve it, and a program that wants the literal text has a way to get it.
+fn sys_readlink(path: u64, path_len: u64, buf: u64, buflen: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let path_str = match user_str(path, path_len) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    if path_str.contains('\0') {
+        return errno::EINVAL;
+    }
+    let cred = crate::cred::get(task);
+    let abs = task_abs_path(&path_str);
+    // No-follow: readlink describes the link. Following it here would make
+    // readlink a second stat, and a caller asking "is this a link, and what does
+    // it say" would get an answer to a question it did not ask.
+    let node = match crate::vfs::resolve_checked_nofollow(&abs, &cred) {
+        Ok(n) => n,
+        Err(e) => return e.into(),
+    };
+    let target = match node.symlink_target() {
+        Some(t) => t,
+        // Not a link. EINVAL, not ENOENT: the file is right there, the request is
+        // what does not apply to it.
+        None => return errno::EINVAL,
+    };
+    // ERANGE rather than a truncated copy. Half a target is a path that does not
+    // exist, so a caller that went on to stat it would report a missing file
+    // instead of a short buffer.
+    if (target.len() as u64) > buflen {
+        return errno::ERANGE;
+    }
+    let dst = match unsafe { user_bytes(buf, target.len() as u64) } {
+        Some(b) => b,
+        None => return errno::EFAULT,
+    };
+    // SAFETY: [buf, buf+target.len()) was validated by `user_bytes` above.
+    unsafe {
+        core::ptr::copy_nonoverlapping(target.as_ptr(), dst.as_mut_ptr(), target.len());
+    }
+    target.len() as i64
 }
 
 fn sys_chmod(path: u64, path_len: u64, mode: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {

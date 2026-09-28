@@ -941,6 +941,168 @@ int main(void) {
 		check(0, "write to root-owned /etc refused");
 	}
 
+	// ---- symbolic links -------------------------------------------------
+	//
+	// These are not a convenience. /bin/ls has to *be* the busybox image for
+	// applet dispatch to work at all, and a program decides whether it is
+	// looking at a link by asking the kernel. So the whole set has to hold:
+	// creation, reading the target back, following it, lstat describing the
+	// link rather than the file, and both loop cases failing rather than
+	// hanging.
+	unlink("/tmp/ln-target");
+	unlink("/tmp/ln-rel");
+	unlink("/tmp/ln-loop");
+	unlink("/tmp/ln-self");
+	unlink("/tmp/ln-dangle");
+
+	int tfd = open("/tmp/ln-target", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	check(tfd >= 0, "symlink: create target file");
+	if (tfd >= 0) {
+		ssize_t w = write(tfd, "payload\n", 8);
+		check(w == 8, "symlink: write target contents");
+		close(tfd);
+	}
+
+	check(symlink("/tmp/ln-target", "/tmp/ln-rel") == 0, "symlink: create");
+
+	// readlink(2) returns the target as stored, relative or absolute, and with
+	// no NUL appended. A trailing NUL would mean every caller had to strip it,
+	// and one that forgot would carry it into the next syscall.
+	char buf[256];
+	memset(buf, 0x7f, sizeof buf);
+	ssize_t rl = readlink("/tmp/ln-rel", buf, sizeof buf);
+	check(rl == (ssize_t)strlen("/tmp/ln-target"), "readlink: length");
+	check(rl > 0 && memcmp(buf, "/tmp/ln-target", strlen("/tmp/ln-target")) == 0,
+	      "readlink: verbatim target");
+	check(rl > 0 && buf[rl] == 0x7f, "readlink: appends no NUL");
+
+	// A relative target must survive being stored unresolved, because that is
+	// the case that breaks if the kernel resolves at creation time: the link
+	// still works from a different directory afterwards.
+	check(symlink("ln-target", "/tmp/ln-rel2") == 0, "symlink: relative");
+	int rfd = open("/tmp/ln-rel2", O_RDONLY);
+	check(rfd >= 0, "relative link follows to target");
+	if (rfd >= 0) {
+		char rbuf[8];
+		check(read(rfd, rbuf, 8) == 8, "relative link read contents");
+		check(memcmp(rbuf, "payload\n", 8) == 0, "relative link contents");
+		close(rfd);
+	}
+
+	// lstat must describe the *link*. If it described the file, `ls -l` would
+	// never draw the `@`, a shell's `-L` test would lie, and nothing would
+	// fail -- every one of those is a wrong answer that looks right.
+	struct stat lst, fst;
+	check(lstat("/tmp/ln-rel", &lst) == 0, "lstat: succeeds");
+	check(stat("/tmp/ln-rel", &fst) == 0, "stat through a link: succeeds");
+	check(S_ISLNK(lst.st_mode), "lstat: reports S_IFLNK");
+	check(S_ISREG(fst.st_mode), "stat: reports the target");
+	check(lst.st_size == (off_t)strlen("/tmp/ln-target"), "lstat: size is target length");
+	check((lst.st_mode & 07777) == 0777, "symlink mode reads as 0777");
+	check(fst.st_size == 8, "stat: size is the file's");
+
+	// open(2) follows a link, so reading through one yields the *target's*
+	// bytes and never the target's path. That is the point: `cat` on /bin/ls
+	// has to print a directory listing, not the string "/bin/busybox". A
+	// link's own contents are reachable only through readlink(2), which is
+	// what the earlier check does.
+	int opfd = open("/tmp/ln-rel", O_RDONLY);
+	check(opfd >= 0, "open(2) on a link follows it");
+	if (opfd >= 0) {
+		char cbuf[8];
+		ssize_t rn = read(opfd, cbuf, 8);
+		check(rn == 8, "read(2) on a link reads the target");
+		check(rn == 8 && memcmp(cbuf, "payload\n", 8) == 0,
+		      "read through a link is the target's data");
+		close(opfd);
+	}
+
+	// readlink on a non-link is EINVAL, not ENOENT: the file is right there,
+	// it is the request that does not apply to it.
+	errno = 0;
+	check(readlink("/tmp/ln-target", buf, sizeof buf) < 0 && errno == EINVAL,
+	      "readlink on a plain file: EINVAL");
+
+	// EEXIST even though the link may dangle. `symlink` answers whether the
+	// *name* is free; making it depend on the target would mean a caller that
+	// fixed the target and retried could not tell the two failures apart.
+	check(symlink("/tmp/nowhere", "/tmp/ln-dangle") == 0, "symlink: may dangle");
+	errno = 0;
+	check(symlink("/tmp/nowhere2", "/tmp/ln-dangle") < 0 && errno == EEXIST,
+	      "symlink: EEXIST on taken name");
+	errno = 0;
+	check(stat("/tmp/ln-dangle", &fst) < 0 && errno == ENOENT,
+	      "dangling link: stat gives ENOENT");
+	struct stat dlst;
+	check(lstat("/tmp/ln-dangle", &dlst) == 0 && S_ISLNK(dlst.st_mode),
+	      "dangling link: lstat still describes it");
+	errno = 0;
+	check(readlink("/tmp/ln-dangle", buf, sizeof buf) == (ssize_t)strlen("/tmp/nowhere"),
+	      "dangling link: readlink still works");
+
+	// An empty target is EINVAL. A link to nowhere is a mistake, and a silent
+	// one: everything done to it later fails with ENOENT at a path nobody
+	// wrote.
+	errno = 0;
+	check(symlink("", "/tmp/ln-empty") < 0 && errno == EINVAL,
+	      "symlink: empty target is EINVAL");
+
+	// A short buffer is ERANGE, never a truncated target. Half a target is a
+	// path that does not exist, so a caller that went on to stat it would
+	// report a missing file rather than a short buffer.
+	errno = 0;
+	check(readlink("/tmp/ln-rel", buf, 4) < 0 && errno == ERANGE,
+	      "readlink: short buffer is ERANGE");
+
+	// Loops must fail. A link to itself is the simple case.
+	check(symlink("/tmp/ln-self", "/tmp/ln-self") == 0, "symlink: self link");
+	errno = 0;
+	check(stat("/tmp/ln-self", &fst) < 0 && errno == ELOOP, "self link: ELOOP");
+	errno = 0;
+	check(open("/tmp/ln-self", O_RDONLY) < 0 && errno == ELOOP, "self link: open ELOOP");
+	// ...and lstat still works on it, because lstat does not follow. A loop
+	// that made the link unstattable would be indistinguishable from a
+	// missing file.
+	check(lstat("/tmp/ln-self", &dlst) == 0 && S_ISLNK(dlst.st_mode),
+	      "self link: lstat works");
+
+	// A two-link cycle. Following either one loops, and the bound that stops
+	// it is what keeps a mistake from becoming a hang.
+	check(symlink("/tmp/ln-cycle-b", "/tmp/ln-cycle-a") == 0, "symlink: cycle a");
+	check(symlink("/tmp/ln-cycle-a", "/tmp/ln-cycle-b") == 0, "symlink: cycle b");
+	errno = 0;
+	check(stat("/tmp/ln-cycle-a", &fst) < 0 && errno == ELOOP, "two-link cycle: ELOOP");
+	unlink("/tmp/ln-cycle-a");
+	unlink("/tmp/ln-cycle-b");
+
+	// A chain long enough to be legitimate must still work: SYMLOOP_MAX is a
+	// bound, not a policy against depth.
+	char deep[256];
+	int deepfd = open("/tmp/ln-deep-0", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (deepfd >= 0)
+		close(deepfd);
+	int deep_ok = 1;
+	for (int i = 1; i <= 6; i++) {
+		snprintf(deep, sizeof deep, "/tmp/ln-deep-%d", i);
+		char target[64];
+		snprintf(target, sizeof target, "/tmp/ln-deep-%d", i - 1);
+		if (symlink(target, deep) != 0)
+			deep_ok = 0;
+	}
+	check(deep_ok, "symlink: 6-deep chain built");
+	int deepstat = stat("/tmp/ln-deep-6", &fst);
+	check(deepstat == 0, "6-deep chain: stat resolves");
+	for (int i = 0; i <= 6; i++) {
+		char p[64];
+		snprintf(p, sizeof p, "/tmp/ln-deep-%d", i);
+		unlink(p);
+	}
+	unlink("/tmp/ln-rel2");
+	unlink("/tmp/ln-empty");
+	unlink("/tmp/ln-self");
+	unlink("/tmp/ln-dangle");
+	unlink("/tmp/ln-target");
+
 	if (failures) {
 		printf("[chello] %d CHECK(S) FAILED\n", failures);
 		return 1;
