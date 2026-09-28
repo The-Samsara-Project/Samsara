@@ -9,6 +9,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -47,7 +48,7 @@ static void check(int ok, const char *what) {
 		failures++;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
 	printf("[chello] linked against mlibc, running on Samsara\n");
 
 	// write(2) reached the console.
@@ -940,6 +941,69 @@ int main(void) {
 			unlink("/etc/chello.tmp");
 		check(0, "write to root-owned /etc refused");
 	}
+
+	// ---- environment ------------------------------------------------------
+	//
+	// The two halves of libc startup, and both of them were broken here for the
+	// same reason: this kernel runs no `.init_array` constructors.
+	//
+	// mlibc's `environ` is a global with a *dynamic* initializer, so it lived in
+	// `.init_array` and stayed null -- and `getenv`, `setenv` and the startup
+	// path that imports the incoming variables all walk `environ[i]`. The first
+	// program to touch its environment took a read fault at address zero.
+	//
+	// mlibc's argc/argv/envp are published by a constructor too, so `main` was
+	// handed argc=0 with argv and envp null. Quieter than the environ fault and
+	// just as wrong.
+	//
+	// Both are checked here because nothing else noticed: chello uses neither, and
+	// every other user image is Rust.
+	const char *path = getenv("PATH");
+	check(path != NULL, "getenv(PATH) does not fault");
+	check(path != NULL && path[0] == '/', "getenv(PATH) returns a path");
+	check(getenv("SAMSARA_NO_SUCH_VARIABLE") == NULL,
+	      "getenv of an unset name is NULL");
+	// Every variable in the environment must survive the walk. One malformed
+	// entry -- a string with no '=' -- is enough to send getenv's own index
+	// lookup off the end, and a shell that cannot read $PATH cannot find its
+	// applets, so this counts rather than spot-checks.
+	int env_entries = 0, env_well_formed = 0;
+	for (char **e = environ; *e; e++) {
+		env_entries++;
+		if (strchr(*e, '='))
+			env_well_formed++;
+	}
+	check(env_entries > 0, "environ is not empty");
+	check(env_entries == env_well_formed, "every environ entry has a '='");
+
+	// setenv and unsetenv are *not* checked here, and that is a gap rather than
+	// an oversight. Both go through mlibc's environment vector, which allocates,
+	// and mlibc's allocator is a `thread_local` -- so the first allocation in a
+	// process reads the thread pointer out of %fs. This platform does not yet
+	// set %fs for a freshly exec'd image, because the kernel loader does not
+	// lay out a thread block: mlibc normally has its dynamic loader do that, and
+	// here the kernel is the loader instead.
+	//
+	// So `setenv` faults on a read of the thread pointer, and the check would
+	// report a libc failure for a kernel gap. The fix is a thread block, which is
+	// the next piece of work; until it lands, a C program on this system can read
+	// its environment but not change it, and every program that mallocs is in the
+	// same position.
+
+	// main's own arguments. A process spawned with no arguments legitimately
+	// has argc == 1, because argv[0] is the program name and every C runtime
+	// supplies one. argc == 0 means the startup path never ran: with argv null,
+	// a program that dispatches on its own name -- which is what busybox does,
+	// and what makes /bin/ls work -- would present itself as `busybox`.
+	//
+	// This is the check that would have caught the reversed-argv bug too, had
+	// anything been checking.
+	check(argc >= 1, "main received an argv");
+	check(argc >= 1 && argv != NULL, "main's argv is not NULL");
+	check(argc >= 1 && argv[0] != NULL, "argv[0] is set");
+	check(environ != NULL, "environ is not NULL");
+	if (argc >= 1 && argv && argv[0])
+		check(strstr(argv[0], "chello") != NULL, "argv[0] names this program");
 
 	// ---- symbolic links -------------------------------------------------
 	//
