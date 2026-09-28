@@ -154,8 +154,27 @@ rm -f "$SHOTS/probe.ppm" "$SHOTS/probe2.ppm"
 
 key esc
 sleep 0.5
+# `q` from a submenu goes to the Finish screen, which then needs its *own*
+# Enter: it is a confirmation ("Enter hands the display to fbterm"), not a
+# screen that acts on arrival. One Enter gets to Finish; the next performs the
+# handoff, which is where the userland is installed and the framebuffer changes
+# hands. Stopping one short leaves a system that boots, passes its tests, and
+# has an empty /bin.
 key q
-sleep 1
+sleep 1.5
+shot 04-finish
+key ret
+sleep 3
+shot 05-after-handoff
+
+# The handoff detaches the console, so anything the installer prints after it
+# is invisible -- on the serial log *and* on the framebuffer, which fbterm now
+# owns. Wait for the last thing that is still observable rather than a fixed
+# delay.
+wait_for "handing the display to fbterm" 60 || true
+wait_for "setup complete" 30 || true
+sleep 2
+
 mon "quit" >/dev/null 2>&1 || true
 sleep 1
 
@@ -164,7 +183,12 @@ text "$SHOTS/03-results.ppm" | grep -vE '^[[:space:]|]*$' || true
 
 echo
 echo "=== serial console ==="
-grep -E "^\[" "$LOG" | grep -vE "^\[inputd\] (scan|fwd)" || true
+# `-a` on both greps, because the console log is full of the kernel's ANSI colour
+# escapes and grep decides the file is binary without it. That is not cosmetic:
+# without `-a` grep prints "binary file matches" and nothing else, so a run whose
+# only interesting output was on the serial console reports nothing at all -- and
+# the self-tests write exactly there.
+grep -aE "^\[" "$LOG" | grep -avE "^\[inputd\] (scan|fwd)" || true
 
 fails=$(text "$SHOTS/03-results.ppm" 2>/dev/null | grep -c "FAIL" || true)
 if [ "$done" -ne 1 ]; then

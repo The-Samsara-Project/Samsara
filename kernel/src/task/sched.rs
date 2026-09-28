@@ -790,6 +790,28 @@ pub fn is_zombie(pid: usize) -> bool {
 /// resumed. Its open file descriptions are released first, so blocked pipe
 /// peers are woken by the resulting `on_close` (EOF / `EPIPE`) while the
 /// scheduler lock is not held.
+/// The CR3 root of task `pid`'s user address space, if it has one.
+///
+/// A separate function because both exit paths need it and neither holds the
+/// scheduler lock at the point it does: `destroy_user_as` walks page tables, and
+/// taking the scheduler lock around that would serialise every process exit
+/// against every schedule decision -- and, worse, would invite a caller to
+/// destroy an address space belonging to a task that had already been removed
+/// from the table.
+fn as_root_of(pid: usize) -> Option<usize> {
+    SCHED
+        .lock()
+        .tasks
+        .get(&TaskId(pid))
+        .and_then(|t| t.as_root)
+}
+
+/// Terminate task `pid` with `status`, from another task.
+///
+/// The counterpart to [`exit_current`], for a process killed rather than exiting
+/// on its own. Refuses when the target is the scheduler or the caller: both of
+/// those have to go through the self-exit path, which runs on the dying task's own
+/// stack and so cannot free that stack.
 pub fn terminate(pid: usize, status: i32) {
     let id = TaskId(pid);
     let cur = CURRENT_ID.load(Ordering::Relaxed);
@@ -800,6 +822,14 @@ pub fn terminate(pid: usize, status: i32) {
     crate::vfs::fdtab::close_all(pid);
     crate::cred::drop_creds(pid);
     crate::sig::drop_state(pid);
+    // The user address space goes back to the allocator here too. Without it a
+    // process killed by another one -- rather than exiting on its own -- leaked
+    // exactly as much as one that exited, which is the same bug on a path that is
+    // easier to reach than it looks: any signal handler that calls `exit`, and
+    // every `kill`.
+    if let Some(root) = as_root_of(pid) {
+        crate::memory::user_map::destroy_user_as(root);
+    }
 
     let mut g = SCHED.lock();
     if !g.tasks.contains_key(&id) {
@@ -921,6 +951,29 @@ pub fn exit_current(status: i32) -> ! {
     crate::vfs::fdtab::close_all(cur);
     crate::cred::drop_creds(cur);
     crate::sig::drop_state(cur);
+
+    // Free the user address space, while this process is still running in it.
+    //
+    // This is a leak fix, and it was a large one: nothing anywhere freed a user
+    // address space on exit. `destroy_user_as` had exactly two callers -- a
+    // failed `clone_user_as`, and the exec path's teardown of the *old* image --
+    // so every program that ever ran and exited took its whole page set with it.
+    // 130 MiB of physical memory, and after a handful of self-tests the frame
+    // allocator reported 32639 of 32639 frames in use and a later `execve` failed
+    // with ENOMEM part-way through mapping a user stack.
+    //
+    // Here, rather than in `terminate`, because ordering matters: the frames have
+    // to go back before the scheduler lock is taken, and because this is the path
+    // nearly every exit takes. `terminate` frees them too, for the `kill` case.
+    //
+    // Safe while running in the space being freed: the frames are returned to the
+    // allocator, but this thread does not touch user memory again -- the kernel
+    // half is shared and untouched, and the user stack it was using is on a
+    // separate kernel mapping. The deferred-free comment below explains why the
+    // *kernel* stack is leaked deliberately; the user half has no such problem.
+    if let Some(root) = as_root_of(cur) {
+        crate::memory::user_map::destroy_user_as(root);
+    }
 
     // Remove the process from every scheduler structure, then pick the next
     // runnable thread (mirrors pick_next but without touching the dead task).
@@ -1217,6 +1270,32 @@ pub fn exec_current(prog: usize, args: Vec<String>) -> Result<(), i64> {
         return exec_finish(cur, cr3, entry, rsp, args, Vec::new());
     }
     let (cr3, entry, rsp) = crate::user::build_image(prog, &args, &env)?;
+    exec_finish(cur, cr3, entry, rsp, args, env)
+}
+
+/// Replace the calling process with the ELF in `image`.
+///
+/// The path-based counterpart to [`exec_current`], and the reason a file in the
+/// filesystem can be run at all. Everything about the swap -- the signal reset,
+/// the address-space teardown, the ring-3 drop -- is [`exec_finish`], so there is
+/// one implementation of "become a different program" rather than two.
+///
+/// `name` is for the log line only. Environment is inherited, as with
+/// [`exec_current`]: an exec'd image gets the caller's envp, which is what makes
+/// the two calls consistent with each other.
+pub fn exec_path(image: Vec<u8>, args: Vec<String>, name: &str) -> Result<(), i64> {
+    let cur = CURRENT_ID.load(Ordering::Relaxed);
+    if cur == SCHEDULER_ID {
+        return Err(crate::abi::errno::EPERM);
+    }
+    let env = task_env(cur);
+    let cwd = current_cwd();
+    let env = if env.is_empty() {
+        crate::user::default_env(&cwd)
+    } else {
+        env
+    };
+    let (cr3, entry, rsp) = crate::user::build_image_bytes(&image, name, &args, &env)?;
     exec_finish(cur, cr3, entry, rsp, args, env)
 }
 

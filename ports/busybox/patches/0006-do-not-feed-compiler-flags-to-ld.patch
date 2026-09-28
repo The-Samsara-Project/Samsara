@@ -1,0 +1,28 @@
+diff --git a/scripts/Makefile.lib b/scripts/Makefile.lib
+index ac1ac97..270137a 100644
+--- a/scripts/Makefile.lib
++++ b/scripts/Makefile.lib
+@@ -122,7 +122,22 @@ cpp_flags      = -Wp,-MD,$(depfile) $(NOSTDINC_FLAGS) $(__cpp_flags)
+ # yet ld_flags is fed to ld.
+ #ld_flags       = $(LDFLAGS) $(EXTRA_LDFLAGS)
+ # Remove the -Wl, prefix from linker options normally passed through gcc
+-ld_flags       = $(filter-out -Wl$(comma)%,$(LDFLAGS) $(EXTRA_LDFLAGS))
++#
++# The upstream filter drops only -Wl, options, and that is not enough. Anything
++# else in LDFLAGS is handed to ld verbatim, including the flags that only a
++# compiler driver understands: -static-pie and -fPIE here, but -pie, -shared,
++# -static and -nostdlib anywhere. ld rejects them by name, so an `ld -r` step
++# fails with 'unknown argument' naming a flag the caller never typed at the
++# `ld` step -- and the error is about a relocatable link that has nothing to do
++# with how the final link is shaped.
++#
++# Dropping them here is right rather than merely convenient. A -r link combines
++# objects into one; it does not produce an executable, so it has no use for an
++# executable's link mode, and passing one is at best ignored. The flags still
++# reach the link that does matter: the final one, driven through $(CC), which
++# is where scripts/trylink hands $LDFLAGS straight to the compiler.
++DRIVER_ONLY_FLAGS = -Wl$(comma)% -static-pie -fPIE -fpie -pie -shared -static -nostdlib -r
++ld_flags       = $(filter-out $(DRIVER_ONLY_FLAGS),$(LDFLAGS) $(EXTRA_LDFLAGS))
+ 
+ 
+ # Finds the multi-part object the current object will be linked into

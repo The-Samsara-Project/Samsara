@@ -44,8 +44,18 @@ pub extern "C" fn _start() -> ! {
         Err(e) => println!("[forkx] waitpid failed: {}", e),
     }
 
-    println!("[forkx] parent exec'ing \"exectst\" image");
-    match syscall::exec(PROG_EXECTST, None) {
+    // Exec *with* arguments, not without. This is the only exec in the tree that
+    // hands a program a non-empty argv, and it is what proves the kernel stages
+    // them in order: `exectst` compares what arrived against what was sent and
+    // exits non-zero on a mismatch. The three values are chosen to be
+    // distinguishable in a log -- one short, one short, one long enough that a
+    // reversal is obvious rather than something to squint at.
+    let argv: [&str; 4] = ["/exectst", "alpha", "beta", "gamma-with-a-long-name"];
+    println!(
+        "[forkx] parent exec'ing \"exectst\" image with {} args",
+        argv.len() - 1
+    );
+    match syscall::exec(PROG_EXECTST, Some(&argv)) {
         Ok(()) => unreachable!("exec returned without error"),
         Err(e) => {
             println!("[forkx] exec failed: {}", e);

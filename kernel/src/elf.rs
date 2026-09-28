@@ -232,7 +232,28 @@ fn map_segment(aspace: &mut vmm::AddressSpace, img: &[u8], s: &Seg) -> Result<()
     let page_end = (s.vaddr + s.mem_sz + PAGE - 1) & !(PAGE - 1);
     let mut page = page_start;
     while page < page_end {
-        let phys = pmm::alloc_frame().ok_or(ENOMEM)?;
+        let phys = match pmm::alloc_frame() {
+            Some(p) => p,
+            None => {
+                // Named rather than a bare `ok_or(ENOMEM)`, because "out of memory"
+                // with no indication of what was being mapped is the least useful
+                // line in a boot log. The segment address and the page count
+                // within it are what tell the two possible causes apart: an
+                // allocator that was already nearly empty fails on the first
+                // page of the first segment, and one that ran out part-way fails
+                // deep into a segment that had been succeeding.
+                let (used, total) = pmm::stats();
+                crate::log::kwarn!(
+                    "elf: no frame at vaddr {:#x} (segment {:#x}+{:#x}, {}/{} pages in), pmm {used}/{total}",
+                    page,
+                    s.vaddr,
+                    s.mem_sz,
+                    (page - page_start) / PAGE,
+                    (page_end - page_start) / PAGE,
+                );
+                return Err(ENOMEM);
+            }
+        };
         // SAFETY: `page` is freshly reserved in this address space; the frame
         // is written through its global kernel alias before user exposure.
         unsafe { aspace.map_page(page, phys, s.perms()) };
@@ -520,14 +541,30 @@ fn write_entry_stack(
             put_word(&mut cur, word, aspace);
         }
     }
-    // envp terminator, then the envp entries.
+    // envp: the NULL terminator sits at the *high* end of the block, above the
+    // entries, which is the only place it can go -- a reader walks up from the
+    // entries and expects the terminator when it runs off the end.
+    //
+    // `put_word` writes at `cur - 8` and then decrements, so each successive call
+    // lands one word *lower*. That means the call order is the reverse of the
+    // memory order: to get entries ascending above a terminator, the terminator
+    // is pushed first and the entries are then pushed back to front.
+    //
+    // Iterating forward instead lays the array out reversed, which is a very quiet
+    // failure. mlibc's `parse_exec_stack` does `sp += argc` and then expects the
+    // NULL there; with a reversed array that word is argv[argc-1]'s pointer
+    // rather than a terminator, so a program receives its arguments back to front
+    // and walks off the end of its own argv. busybox handed `[/bin/busybox
+    // --install -s /bin]` that way, took argv[0] as "/bin", and exited 127
+    // reporting "bin: applet not found" -- a symptom pointing at the applet table
+    // when the cause was the stack layout.
     put_word(&mut cur, 0, aspace);
-    for p in env_ptrs.iter().take(n_env) {
+    for p in env_ptrs.iter().take(n_env).rev() {
         put_word(&mut cur, *p, aspace);
     }
-    // argv terminator, then the argv entries.
+    // argv, same shape.
     put_word(&mut cur, 0, aspace);
-    for p in arg_ptrs.iter().take(n_arg) {
+    for p in arg_ptrs.iter().take(n_arg).rev() {
         put_word(&mut cur, *p, aspace);
     }
     // argc, the word the initial `%rsp` points at.
@@ -542,6 +579,22 @@ fn write_entry_stack(
         cur,
         cur % 16,
     );
+    // The arguments themselves, not just how many there are.
+    //
+    // A count and a base address are enough to say "something was staged" and not
+    // enough to say what, and a program that receives the wrong argv produces a
+    // symptom several steps downstream: busybox given the wrong one treats
+    // "--install" as an applet name and exits 127, which reads as a spawn failure
+    // rather than as bad data. Truncated, because a program with a long argument
+    // vector should not be able to flood the console from a debug line.
+    if !args.is_empty() {
+        let shown: usize = args.len().min(8);
+        crate::log::kdebug!(
+            "elf: argv = [{}]{}",
+            args[..shown].join(" "),
+            if shown < args.len() { " ..." } else { "" }
+        );
+    }
 
     // The libc entry path reads the entry stack and then calls into C, where a
     // misaligned `%rsp` faults on the first aligned SSE move. Cheap to assert,
@@ -634,7 +687,23 @@ pub fn load(
     // User stack: read/write, non-executable.
     let stack_pages = (stack_end - stack_base) / PAGE;
     for i in 0..stack_pages {
-        let phys = pmm::alloc_frame().ok_or(ENOMEM)?;
+        let phys = match pmm::alloc_frame() {
+            Some(p) => p,
+            None => {
+                // The image mapped, then the stack did not. That ordering is
+                // informative: the stack is allocated last, so this is what a
+                // nearly-full allocator looks like rather than an image that is
+                // too big. Both are "out of memory" and neither is fixable by
+                // making the program smaller.
+                let (used, total) = pmm::stats();
+                crate::log::kwarn!(
+                    "elf: no frame for the user stack (page {}/{}), pmm {used}/{total}",
+                    i,
+                    stack_pages
+                );
+                return Err(ENOMEM);
+            }
+        };
         // SAFETY: stack region freshly reserved; frame zeroed via alias.
         unsafe {
             aspace.map_page(
