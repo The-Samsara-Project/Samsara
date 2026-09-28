@@ -1,0 +1,130 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Harsh Nikarsa
+#
+# Merge a kconfig fragment onto a complete .config.
+#
+#     merge-config <fragment> <.config>
+#
+# Why this exists rather than a `make` target: busybox's own kconfig cannot
+# express "start from nothing, then turn on this list". `KCONFIG_ALLCONFIG` is the
+# mechanism the kernel uses for it and busybox inherited the code path, but in
+# busybox's conf.c `allnoconfig` runs conf in set_no mode, and conf_askvalue
+# answers 'n' for every symbol it walks -- including the ones conf_read_simple
+# just filled in from the fragment. The fragment is read and then discarded, so
+# the way this port configures busybox is the sequence busybox's own instructions
+# suggest, made reproducible: run `allnoconfig` to get a config with everything
+# off, merge the fragment onto it, then let `oldconfig` resolve the dependencies.
+#
+# Editing .config by hand, as those instructions suggest, is exactly what cannot
+# be reproduced. A sed one-liner that mentions four options is a statement about
+# four options that quietly stops being true when someone adds a fifth and forgets
+# the sed. Here the fragment is a file, the file is the whole list, and a symbol
+# that fails to apply is an error rather than an absence.
+#
+# Any complete `CONFIG_X=value` line is accepted, whatever the value's type, plus
+# the long spelling of "off". Matching only `=y` and `=n` is the trap this
+# version of the script fell into: a fragment full of correct boolean options
+# merged perfectly while its string and integer options -- a path, a link flag --
+# were dropped in silence, because there was no branch that recognised them.
+# Nothing about kconfig says a merge tool only has to understand booleans, and a
+# tool that quietly ignores half its input is worse than one that fails.
+#
+# A fragment naming the same symbol twice is an error. kconfig would take the
+# second silently, and a config file whose meaning depends on line order is the
+# thing this script exists to prevent.
+#
+# What this deliberately does *not* do is decide whether a symbol is real.
+# `allnoconfig` only emits symbols whose dependencies are currently satisfied, so
+# a symbol the fragment wants whose parent is not yet on is simply absent from the
+# base -- absent, not bogus. Judging validity here would need kconfig's symbol
+# table, which is exactly what the `oldconfig` run in ports/busybox/build.sh
+# consults: it warns by name for a symbol that does not exist and for one assigned
+# twice, and build.sh fails on either. So a typo in the fragment is reported
+# against the real table rather than against this script's guess at it.
+
+set -eu
+
+if [ $# -ne 2 ]; then
+	echo "usage: merge-config <fragment> <.config>" >&2
+	exit 2
+fi
+
+fragment=$1
+config=$2
+
+[ -r "$fragment" ] || { echo "merge-config: cannot read $fragment" >&2; exit 1; }
+[ -r "$config" ]   || { echo "merge-config: cannot read $config" >&2; exit 1; }
+
+tmp=$config.merge.$$
+trap 'rm -f "$tmp"' EXIT INT TERM
+
+# The fragment is read in BEGIN rather than as the first awk input file: the usual
+# "NR == FNR means the first file" idiom silently misreads every line of the
+# second file when the first is empty, and an empty fragment is a mistake worth
+# diagnosing rather than one worth encoding around.
+#
+# The base is rewritten in place, line for line, so kconfig's own comment layout
+# and ordering survive. A requested symbol replaces the line that already states
+# its value; that is the only edit made to a line that exists. Requested symbols
+# the base does not mention are appended, since only `oldconfig` can say whether
+# they are real.
+awk -v fragment="$fragment" '
+BEGIN {
+	while ((getline l < fragment) > 0) {
+		if (l ~ /^CONFIG_[A-Za-z0-9_]+=/) {
+			nm = substr(l, 1, index(l, "=") - 1)
+			val = l
+		} else if (l ~ /^# CONFIG_[A-Za-z0-9_]+ is not set$/) {
+			nm = l
+			sub(/^# /, "", nm)
+			sub(/ is not set$/, "", nm)
+			val = l
+		} else {
+			continue
+		}
+		# Tested before the assignment, not after. A check that runs once
+		# want[nm] holds a value reports the first line as well as the second.
+		if (nm in want) {
+			print "merge-config: " nm " is set twice in the fragment" > "/dev/stderr"
+			bad = 1
+			continue
+		}
+		want[nm] = val
+	}
+	close(fragment)
+	if (bad) exit 1
+}
+{
+	line[++n] = $0
+	if ($0 ~ /^CONFIG_[A-Za-z0-9_]+=/) {
+		base[substr($0, 1, index($0, "=") - 1)] = 1
+	} else if ($0 ~ /^# CONFIG_[A-Za-z0-9_]+ is not set$/) {
+		base[$2] = 1
+	}
+}
+END {
+	for (i = 1; i <= n; i++) {
+		l = line[i]
+		nm = ""
+		if (l ~ /^CONFIG_[A-Za-z0-9_]+=/) {
+			nm = substr(l, 1, index(l, "=") - 1)
+		} else if (l ~ /^# CONFIG_[A-Za-z0-9_]+ is not set$/) {
+			nm = l
+			sub(/^# /, "", nm)
+			sub(/ is not set$/, "", nm)
+		}
+		if (nm != "" && (nm in want)) {
+			print want[nm]
+			delete want[nm]
+		} else {
+			print l
+		}
+	}
+	for (nm in want)
+		print want[nm]
+}
+' "$config" > "$tmp" || exit 1
+
+mv "$tmp" "$config"
+trap - EXIT INT TERM

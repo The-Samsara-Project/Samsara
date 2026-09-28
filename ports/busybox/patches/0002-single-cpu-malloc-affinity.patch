@@ -1,0 +1,44 @@
+diff --git a/libbb/alloc_affinity.c b/libbb/alloc_affinity.c
+index b6d9f64..c776db8 100644
+--- a/libbb/alloc_affinity.c
++++ b/libbb/alloc_affinity.c
+@@ -11,19 +11,26 @@
+ 
+ unsigned long* FAST_FUNC get_malloc_cpu_affinity(int pid, unsigned *sz)
+ {
+-	unsigned long *mask = NULL;
+-	unsigned sz_in_bytes = *sz;
++	/* Samsara: one CPU, so the answer is CPU 0 and a one-word mask.
++	 *
++	 * Upstream asks the kernel with sched_getaffinity(2), growing the buffer
++	 * until the answer fits. That syscall does not exist here, and the retry
++	 * loop is worth reading closely before substituting something: it only
++	 * continues while errno is EINVAL, so a stub returning any other errno
++	 * would fall straight out of the loop and into bb_perror_msg_and_die --
++	 * an abort out of a function that has no caller in this configuration.
++	 *
++	 * Reporting the true answer avoids both the missing syscall and the
++	 * spurious death. `pid` is accepted and ignored, and it does not change
++	 * the result because there is only one CPU to be affinitised to; a mask
++	 * naming a CPU that could not run anything would be the lie worth
++	 * avoiding here, not the hard-coded zero.
++	 */
++	unsigned long *mask;
+ 
+-	for (;;) {
+-		mask = xrealloc(mask, sz_in_bytes);
+-		if (sched_getaffinity(pid, sz_in_bytes, (void*)mask) == 0)
+-			break; /* got it */
+-		sz_in_bytes *= 2;
+-		if (errno == EINVAL && (int)sz_in_bytes > 0)
+-			continue;
+-		bb_perror_msg_and_die("can't %cet pid %d's affinity", 'g', pid);
+-	}
+-	//bb_error_msg("get mask[0]:%lx sz_in_bytes:%d", mask[0], sz_in_bytes);
+-	*sz = sz_in_bytes;
++	(void)pid;
++	*sz = sizeof(unsigned long);
++	mask = xzalloc(*sz);
++	mask[0] = 1UL; /* CPU 0 is the only one there is */
+ 	return mask;
+ }

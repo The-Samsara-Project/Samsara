@@ -1,0 +1,113 @@
+diff --git a/scripts/trylink b/scripts/trylink
+index 2255dee..7e2238a 100755
+--- a/scripts/trylink
++++ b/scripts/trylink
+@@ -129,17 +129,57 @@ fi
+ # Sanitize lib list (dups, extra spaces etc)
+ LDLIBS=`echo "$LDLIBS" | xargs -n1 | sort | uniq | xargs`
+ 
++# Build the -l list, and let a caller pass a plain object file or archive path
++# through untouched.
++#
++# The sed below rewrites every whitespace-delimited word that does not begin with
++# '-' into '-l' + word, on the assumption that the words are library names. That
++# assumption holds for LDLIBS, which is a list of names, but not for
++# CONFIG_EXTRA_LDLIBS, which by convention is also a list of names -- and this
++# port has an object it must place on the final link line, the C runtime startup
++# file, which is not a library and cannot be named by a -l flag. A word starting
++# with '/' is a path by any reasonable reading, so it is routed by the other
++# function.
++#
++# This matters beyond tidiness. There is no other place to put a plain object on
++# the final link line: CONFIG_EXTRA_LDFLAGS would work for the real link, but
++# scripts/Makefile.build also feeds LDFLAGS to the intermediate `ld -r` links
++# that assemble each directory's built-in.o, and a crt1.o there gets its _start
++# copied into every one of them -- which then collide with the real _start at
++# link time. So the startup file arrives here instead, where it reaches the final
++# link and nothing else.
++#
++# Split the extras two ways, and the split is not cosmetic. Words that look like
++# a path are object files, and they go *inside* the group that holds the
++# archives, not merely on the command line after it. An object placed after a
++# closed group cannot cause an archive member to be pulled in: a linker extracts
++# an archive entry only to satisfy a reference that already exists. crt1.o
++# references `main`, and `main` lives in an archive member, so crt1.o outside the
++# group leaves the program with an entry point whose only symbol is undefined --
++# reported as "undefined reference to `main'" from crt1.o, which reads like a
++# missing program function rather than a misplaced startup file.
++l_objs_of() {
++	echo " $1 $CONFIG_EXTRA_LDLIBS " | tr ' ' '\n' | grep '^/'
++}
++
++l_expand() {
++	echo " $1 $CONFIG_EXTRA_LDLIBS " | tr ' ' '\n' |
++		grep -v '^/' |
++		sed -e '/^$/d' -e 's:^\([^-]\([^ ]*\)\)$:-l\1:' |
++		tr '\n' ' ' | sed -e 's/^ *//' -e 's/ *$//'
++}
++
+ # First link with all libs. If it fails, bail out
+ echo "Trying libraries: $LDLIBS"
+-# "lib1 lib2 lib3" -> "-llib1 -llib2 -llib3"
+-l_list=`echo " $LDLIBS $CONFIG_EXTRA_LDLIBS " | sed -e 's: \([^- ][^ ]*\): -l\1:g' -e 's/^ *//'`
++l_objs=`l_objs_of "$LDLIBS"`
++l_list=`l_expand "$LDLIBS"`
+ test x"$l_list" != x"" && l_list="$START_GROUP $l_list $END_GROUP"
+ try $CC $CFLAGS $LDFLAGS \
+ 	-o $EXE \
+ 	$SORT_COMMON \
+ 	$SORT_SECTION \
+ 	$GC_SECTIONS \
+-	$START_GROUP $O_FILES $A_FILES $END_GROUP \
++	$START_GROUP $l_objs $O_FILES $A_FILES $END_GROUP \
+ 	$l_list \
+ || {
+     echo "Failed: $l_list"
+@@ -157,8 +197,8 @@ while test "$LDLIBS"; do
+     first_lib=true
+     for one in $LDLIBS; do
+ 	without_one=`echo " $LDLIBS " | sed "s/ $one / /g" | xargs`
+-	# "lib1 lib2 lib3" -> "-llib1 -llib2 -llib3"
+-	l_list=`echo " $without_one $CONFIG_EXTRA_LDLIBS " | sed -e 's: \([^- ][^ ]*\): -l\1:g' -e 's/^ *//'`
++		l_objs=`l_objs_of "$without_one"`
++	l_list=`l_expand "$without_one"`
+ 	test x"$l_list" != x"" && l_list="$START_GROUP $l_list $END_GROUP"
+ 	$debug && echo "Trying -l options: '$l_list'"
+ 	try $CC $CFLAGS $LDFLAGS \
+@@ -166,7 +206,7 @@ while test "$LDLIBS"; do
+ 		$SORT_COMMON \
+ 		$SORT_SECTION \
+ 		$GC_SECTIONS \
+-		$START_GROUP $O_FILES $A_FILES $END_GROUP \
++		$START_GROUP $l_objs $O_FILES $A_FILES $END_GROUP \
+ 		$l_list
+ 	if test $? = 0; then
+ 	    echo " Library $one is not needed, excluding it"
+@@ -186,7 +226,8 @@ done
+ 
+ # Make the binary with final, minimal list of libs
+ echo "Final link with: ${LDLIBS:-<none>}"
+-l_list=`echo " $LDLIBS $CONFIG_EXTRA_LDLIBS " | sed -e 's: \([^- ][^ ]*\): -l\1:g' -e 's/^ *//'`
++l_objs=`l_objs_of "$LDLIBS"`
++l_list=`l_expand "$LDLIBS"`
+ test x"$l_list" != x"" && l_list="$START_GROUP $l_list $END_GROUP"
+ # --verbose gives us gobs of info to stdout (e.g. linker script used)
+ if ! test -f busybox_ldscript; then
+@@ -195,7 +236,7 @@ if ! test -f busybox_ldscript; then
+ 	    $SORT_COMMON \
+ 	    $SORT_SECTION \
+ 	    $GC_SECTIONS \
+-	    $START_GROUP $O_FILES $A_FILES $END_GROUP \
++	    $START_GROUP $l_objs $O_FILES $A_FILES $END_GROUP \
+ 	    $l_list \
+ 	    `INFO_OPTS` \
+     || {
+@@ -226,7 +267,7 @@ else
+ 	    $SORT_SECTION \
+ 	    $GC_SECTIONS \
+ 	    -Wl,-T,busybox_ldscript \
+-	    $START_GROUP $O_FILES $A_FILES $END_GROUP \
++	    $START_GROUP $l_objs $O_FILES $A_FILES $END_GROUP \
+ 	    $l_list \
+ 	    `INFO_OPTS` \
+     || {

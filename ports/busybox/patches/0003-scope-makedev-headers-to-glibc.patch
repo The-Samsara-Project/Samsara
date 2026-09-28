@@ -1,0 +1,40 @@
+diff --git a/libbb/makedev.c b/libbb/makedev.c
+index 06c4039..f95cfcf 100644
+--- a/libbb/makedev.c
++++ b/libbb/makedev.c
+@@ -9,16 +9,27 @@
+ /* We do not include libbb.h - #define makedev() is there! */
+ #include "platform.h"
+ 
++/* Everything below exists only to hand glibc a non-inline makedev, so the headers
++ * are scoped to that case too. The <features.h> in the non-BSD arm is a glibc
++ * header that no other libc has -- its presence here is the reason this file
++ * fails to compile on a libc that otherwise has everything it needs, while the
++ * file itself would be empty anyway.
++ *
++ * That emptiness is not incidental. libbb.h guards both the bb_makedev
++ * prototype and the `#define makedev(a,b) bb_makedev(a,b)` redirection with the
++ * same `#ifdef __GLIBC__`, so off glibc busybox uses the libc's own makedev
++ * unchanged. Pairing the guards keeps the two files agreeing: no wrapper is
++ * declared, and none is needed. */
++#ifdef __GLIBC__
+ /* Different Unixes want different headers for makedev */
+-#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) \
+- || defined(__APPLE__)
+-# include <sys/types.h>
+-#else
+-# include <features.h>
+-# include <sys/sysmacros.h>
+-#endif
++# if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) \
++  || defined(__APPLE__)
++#  include <sys/types.h>
++# else
++#  include <features.h>
++#  include <sys/sysmacros.h>
++# endif
+ 
+-#ifdef __GLIBC__
+ /* At least glibc has horrendously large inline for this, so wrap it. */
+ /* uclibc people please check - do we need "&& !__UCLIBC__" above? */
+ 

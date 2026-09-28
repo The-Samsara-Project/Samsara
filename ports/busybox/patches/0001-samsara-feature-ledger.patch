@@ -1,0 +1,107 @@
+diff --git a/include/platform.h b/include/platform.h
+index ea0512f..767044e 100644
+--- a/include/platform.h
++++ b/include/platform.h
+@@ -471,6 +471,102 @@ typedef unsigned smalluint;
+ # undef HAVE_UNLOCKED_LINE_OPS
+ #endif
+ 
++/* ------------------------------------------------------------------ Samsara
++ *
++ * Ported to the Samsara kernel against the mlibc port in ports/mlibc. The block
++ * above is a Linux-generic "assume yes" list, so most of it is wrong here and
++ * the wrongness is silent: busybox does not fail to build when a feature it
++ * assumed is missing, it compiles a call to a function that is not there, and
++ * the link -- or worse, the run -- is what notices.
++ *
++ * So each entry below states what this libc actually provides, and the list was
++ * derived by checking every HAVE_ the block above claims against the symbols
++ * mlibc really exports rather than by discovering them one build failure at a
++ * time. The distinction matters for the `#define`s as much as the `#undef`s:
++ * claiming a feature that is absent produces a binary that links and then
++ * misbehaves in a way that looks like a busybox bug, and refusing one that is
++ * present silently disables the code that uses it.
++ *
++ * Not a general "this is a bare platform" list. `__SAMSARA__` is defined by this
++ * port's build, so an unrelated build of busybox is unaffected by the patch.
++ */
++#if defined(__SAMSARA__)
++
++/* Requested by the port's own <paths.h>, which supplies the few well-known file
++ * names this libc does not carry. */
++#define HAVE_PATHS_H 1
++
++/* mlibc provides the POSIX type under its standard name, so busybox's own
++ * declaration stays out of the way. */
++#define HAVE_SIGHANDLER_T 1
++
++/* -- present in mlibc, claimed above, kept as-is -------------------------- */
++#define HAVE_CLEARENV 1
++#define HAVE_FDPRINTF 1
++#define HAVE_MEMRCHR 1
++#define HAVE_STRCHRNUL 1
++#define HAVE_STRSEP 1
++#define HAVE_USLEEP 1
++#define HAVE_GETLINE 1
++#define HAVE_STRERROR_R 1
++#define HAVE_STRERROR_L 1
++#define HAVE_MEMMEM 1
++#define HAVE_CLOSES_RANGE 1
++#define HAVE_CLOCK_GETTIME_NSEC_NP 1
++#define HAVE_CLOCK_GETRES_NSEC_NP 1
++#define HAVE_XTABS 1
++
++/* -- absent from mlibc ---------------------------------------------------- */
++
++/* strverscmp is a GNU extension living behind mlibc's glibc-compatibility
++ * option, which this port cannot enable: it would also require strcasecmp_l
++ * and friends, none of which exist here. `sort` falls back to its own compare
++ * and loses version ordering, which is a visible reduction and a correct one. */
++#undef HAVE_STRVERSCMP
++
++/* A BSD extension. `stat` reports st_mtim, not the BSD timespec fields. */
++#undef HAVE_MEMPCPY
++#undef HAVE_PTSNAME_R
++
++/* The mtab file format. There is no mount table to parse: the kernel has no
++ * user-visible list of mounts, and the applets that would read one are not in
++ * this port's applet set. */
++#undef HAVE_MNTENT_H
++
++/* statfs. The VFS has no per-filesystem statistics to report, so `df` has
++ * nothing to learn from this and a fake figure would be worse than none. */
++#undef HAVE_SYS_STATFS_H
++
++/* A <sys/socket.h> that carries the Ethernet address macros. No sockets yet. */
++#undef HAVE_NET_ETHERNET_H
++
++/* `%m` in printf: strerror(errno) inline. mlibc's printf does not accept it,
++ * and busybox uses it in a handful of diagnostics where a plain "%s" with an
++ * explicit strerror call is equivalent. */
++#undef HAVE_PRINTF_PERCENTM
++
++/* /dev/fd. Linux's fd aliases have no equivalent here; the applets that would
++ * use them are not enabled. */
++#undef HAVE_DEV_FD
++
++/* glibc-specific interfaces for its unlocked stdio and its bit-twiddling
++ * helpers. mlibc's stdio takes plain locks, which is correct and merely
++ * slightly slower, and the bit helpers are one-line expressions busybox
++ * carries fallbacks for. */
++#undef HAVE_UNLOCKED_STDIO
++#undef HAVE_UNLOCKED_LINE_OPS
++#undef HAVE_SETBIT
++
++/* XTABS is defined by mlibc's <termios.h>, so claim it and let busybox use that
++ * definition rather than defining its own. Undefining it makes libbb.h fall back
++ * to `#define XTABS TAB3`, which is the same bit under a different name -- but
++ * that is a macro redefinition against a header that already set it, and the
++ * resulting warning is noise that hides real ones. The two spellings are
++ * numerically identical, so a program that sets XTABS is setting TAB3, and the
++ * line discipline does honour TAB3. */
++
++#endif /* __SAMSARA__ */
++
+ /* These BSD-derived OSes share many similarities */
+ #if (defined __digital__ && defined __unix__) \
+  || defined __APPLE__ \

@@ -1,0 +1,60 @@
+diff --git a/Makefile.flags b/Makefile.flags
+index 97cb4dc..04fc1e5 100644
+--- a/Makefile.flags
++++ b/Makefile.flags
+@@ -152,15 +152,46 @@ LDLIBS += m
+ # gcc-4.2.1 fails if we try to feed C source on stdin:
+ #  echo 'int main(void){return 0;}' | $(CC) $(CFLAGS) -lcrypt -o /dev/null -xc -
+ # fall back to using a temp file:
+-CRYPT_AVAILABLE := $(shell echo 'int main(void){return 0;}' >bb_libtest.c; $(CC) $(CFLAGS) $(CFLAGS_busybox) -lcrypt -o /dev/null bb_libtest.c >/dev/null 2>&1 && echo "y"; rm bb_libtest.c)
+-RT_AVAILABLE    := $(shell echo 'int main(void){return 0;}' >bb_libtest.c; $(CC) $(CFLAGS) $(CFLAGS_busybox) -lrt    -o /dev/null bb_libtest.c >/dev/null 2>&1 && echo "y"; rm bb_libtest.c)
+-ifeq ($(CRYPT_AVAILABLE),y)
+-LDLIBS += crypt
+-endif
+-# librt may be needed for clock_gettime()
+-ifeq ($(RT_AVAILABLE),y)
+-LDLIBS += rt
+-endif
++#
++# Samsara: these two probes are skipped, and the library list is stated outright
++# instead. The probe compiles a stub and links it, and in a cross build that is a
++# question about the wrong machine: nothing in the probe carries the target's
++# link flags, so the compiler is free to fall back on the build host's defaults.
++# Here that fallback is not theoretical -- the probe links -nostdinc'd sources
++# with no -nostdlib and no -static, so clang simply uses the host's crt files and
++# searches the host's library paths, and it *succeeds* against the host's
++# libcrypt.so.2 and libc.so.6. Both probes therefore report "available" for a
++# system that has neither, and carrying -lcrypt forward to the real link is not
++# a harmless false positive: a host that does have a static libcrypt.a in a
++# default search path would have it linked into a Samsara binary, silently, and
++# the result would fail at run time in a way that names neither this file nor
++# the host.
++#
++# A probe that cannot be trusted to test the target should not be run. The list
++# below is what the port's libc actually ships, and a library that is absent
++# here would fail loudly at the link instead of quietly at the run.
++LDLIBS :=
++LDLIBS += m
++
++# Objects that must be on the final link line but are not libraries, so cannot
++# be named with -l. scripts/trylink passes a path through verbatim for exactly
++# this, and inside the group with the archives, which is what lets an archive
++# member satisfy a reference from one of them. CONFIG_SAMSARA_LINK_OBJS is set
++# by ports/busybox/build.sh.
++#
++#   crt1.o   -- holds _start, the ELF entry point, which nothing references and
++#               so which no linker would pull out of an archive.
++#   dso.o    -- defines __dso_handle. The value has to be zero and not merely
++#               present; see ports/busybox/support/dso.c.
++#   mntent.o -- the mount table, which is permanently empty. See
++#               ports/busybox/support/mntent.c.
++CONFIG_EXTRA_LDLIBS := $(CONFIG_EXTRA_LDLIBS) $(CONFIG_SAMSARA_LINK_OBJS)
++
++# The C library itself, found via the -L this port's build puts in
++# CONFIG_EXTRA_LDFLAGS. libm is a separate archive here and is named above;
++# librt and libdl exist in the sysroot but nothing in this configuration wants
++# them, so they are not named.
++CONFIG_EXTRA_LDLIBS := $(CONFIG_EXTRA_LDLIBS) c
+ 
+ # libpam may use libpthread, libdl and/or libaudit.
+ # On some platforms that requires an explicit -lpthread, -ldl, -laudit.

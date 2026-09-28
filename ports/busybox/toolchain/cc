@@ -1,0 +1,37 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Harsh Nikarsa
+#
+# C compiler wrapper for the Samsara busybox port.
+#
+# busybox drives its own build system, which invokes $(CC) for both compiling and
+# for the final link, and $(LD) for the intermediate relocatable links. Those are
+# three different invocations with three different flag sets, and the build
+# system reassembles the flags itself. Trying to inject a target triple and a
+# sysroot through its variables means guessing which of the two link paths each
+# one lands in, and getting it wrong is an ld.lld error naming a flag the user
+# never typed.
+#
+# A wrapper is how a cross toolchain is shaped anyway -- a cross-gcc is a driver
+# that knows its target and adds it -- so this is the mechanism the build system
+# was written to accept. Paths come from the environment rather than being baked
+# in, so the wrapper is identical on every host and nothing has to be regenerated
+# when the tree moves.
+
+set -e
+
+: "${SAMSARA_SYSROOT:?SAMSARA_SYSROOT must be set by ports/busybox/build.sh}"
+: "${SAMSARA_FREESTND:?SAMSARA_FREESTND must be set by ports/busybox/build.sh}"
+: "${SAMSARA_PORT_INCLUDE:?SAMSARA_PORT_INCLUDE must be set by ports/busybox/build.sh}"
+
+exec clang \
+	--target=x86_64-pc-samsara \
+	-ffreestanding \
+	-nostdinc \
+	-fno-builtin \
+	-D_GNU_SOURCE \
+	-D__SAMSARA__=1 \
+	-isystem "$SAMSARA_SYSROOT/usr/include" \
+	-isystem "$SAMSARA_FREESTND" \
+	-isystem "$SAMSARA_PORT_INCLUDE" \
+	"$@"
