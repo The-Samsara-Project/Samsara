@@ -234,6 +234,26 @@ pub fn default_env(cwd: &str) -> Vec<String> {
 /// image -- would need a syscall to read a program's bytes, which is a way for a
 /// process to reach kernel memory layout. The kernel already has the image; a
 /// process has no business asking for it.
+/// The name embedded program `index` is registered under.
+///
+/// Used as a substitute `argv[0]` for a program spawned without arguments, since
+/// a process cannot have `argc == 0` and every C runtime expects at least
+/// `argv[0]`.
+pub fn program_name(index: usize) -> Option<&'static str> {
+    PROGRAMS.get(index).map(|p| p.name)
+}
+
+/// The raw image bytes of embedded program `index`.
+///
+/// Exists for the one caller that needs the program *as a file* rather than as
+/// something to run: the boot-time userland seeding, which writes `/bin/busybox`
+/// into the filesystem. A spawned program gets its image from the ELF loader and
+/// never reads this.
+///
+/// The alternative -- spawning busybox and having it ask the kernel for its own
+/// image -- would need a syscall to read a program's bytes, which is a way for a
+/// process to reach kernel memory layout. The kernel already has the image; a
+/// process has no business asking for it.
 pub fn image(index: usize) -> Option<&'static [u8]> {
     PROGRAMS.get(index).map(|p| &p.image[..])
 }
@@ -319,6 +339,18 @@ pub fn spawn_program_args(
     } else if let Some(pwd) = env.iter_mut().find(|e| e.starts_with("PWD=")) {
         *pwd = String::from("PWD=") + &cwd;
     }
+    // A process cannot have argc == 0; see `sched::with_program_name`. Substituted
+    // here as well as in `exec_current` because this is the path the boot servers
+    // and the self-tests take, and they are C-free only by accident of what they
+    // happen to use.
+    let args = if args.is_empty() {
+        match program_name(index) {
+            Some(n) => vec![String::from(n)],
+            None => args,
+        }
+    } else {
+        args
+    };
     let (cr3, entry, rsp) = build_image(index, &args, &env).map_err(|e| e as i32)?;
     let p = &PROGRAMS[index];
     // Whether there is a parent decides the descriptor table, and it has to be

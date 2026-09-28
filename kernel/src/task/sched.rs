@@ -37,7 +37,10 @@ const AGING_TICKS: u64 = 100;
 
 /// Sentinel value of [`CURRENT_ID`] meaning "the scheduler/boot context",
 /// which has no [`Task`] entry of its own.
-const SCHEDULER_ID: usize = 0;
+/// Task id of the scheduler's own context. Not a process: it has no address
+/// space, and anything that attributes a fault to it is looking at the wrong
+/// thing.
+pub const SCHEDULER_ID: usize = 0;
 
 struct Scheduler {
     tasks: BTreeMap<TaskId, Task>,
@@ -1252,15 +1255,53 @@ pub fn waitpid(cpid: usize) -> WaitResult {
     WaitResult::Wait
 }
 
+/// Substitute a program name for an empty argument vector.
+///
+/// A process cannot have `argc == 0`. Every C runtime expects at least `argv[0]`,
+/// and a great deal turns on it: `getopt` reports the program name in its
+/// diagnostics, a program decides what it is by what it was called, and a
+/// multi-call binary dispatches on it -- busybox selecting `ls` from `/bin/ls` is
+/// *entirely* `argv[0]`. With no `argv[0]` there is nothing for any of that to
+/// read.
+///
+/// Only an empty vector is filled in. A caller that passes arguments has already
+/// said what the program is called, and second-guessing it would be wrong --
+/// `busybox --list` must still see an empty argv after `busybox`, or it would
+/// look for an applet called `--list`.
+///
+/// The name comes from wherever the program was reached by: a path for `execve`,
+/// the program's registered name for a table entry. Inventing a path for the
+/// latter would put a name in `argv[0]` that does not resolve.
+fn with_program_name(name: &str, args: Vec<String>) -> Vec<String> {
+    if args.is_empty() {
+        alloc::vec![String::from(name)]
+    } else {
+        args
+    }
+}
+
+/// The name embedded program `prog` is registered under, or `"?"` if the index is
+/// out of range. `exec_current` has already validated the index, so the fallback
+/// is unreachable; it exists because this returns a `&str` rather than an
+/// `Option` and a panic on a validated input would be worse than a wrong name.
+fn registered_name(prog: usize) -> &'static str {
+    crate::user::program_name(prog).unwrap_or("?")
+}
+
 /// Replace the current process image in place: swap in a freshly built address
 /// space for embedded program `prog`, restage this task as a first-run user
 /// process, and drop to ring 3. The syscall frame and the old address space
 /// are abandoned. Never returns on success.
+///
+/// The index-based exec: the program is one the kernel already carries, named by
+/// its slot in the program table. For a program named by *path* see
+/// [`exec_path`], which is the one a shell needs.
 pub fn exec_current(prog: usize, args: Vec<String>) -> Result<(), i64> {
     let cur = CURRENT_ID.load(Ordering::Relaxed);
     if cur == SCHEDULER_ID {
         return Err(crate::abi::errno::EPERM);
     }
+    let args = with_program_name(registered_name(prog), args);
     // `EXEC` names a program but carries no new environment, so the exec'd
     // image inherits the caller's envp the way it inherits its credentials.
     let env = task_env(cur);
@@ -1288,6 +1329,7 @@ pub fn exec_path(image: Vec<u8>, args: Vec<String>, name: &str) -> Result<(), i6
     if cur == SCHEDULER_ID {
         return Err(crate::abi::errno::EPERM);
     }
+    let args = with_program_name(name, args);
     let env = task_env(cur);
     let cwd = current_cwd();
     let env = if env.is_empty() {
