@@ -1,0 +1,328 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Harsh Nikarsa
+#
+# Remove the console keymap patch and the raw-key decoder. Both exist because on Linux the kernel translates scancodes into keycodes and a program wanting different mappings edits that keymap. On Samsara the PS/2 driver already delivers UTF-8 characters to a pty, so there is no keycode layer for a shortcut to live in. setupSysKey() now reports the degradation through the existing keymapFailure path, and setRawMode() deliberately never sets mRawMode: upstream sets it before checking whether the ioctl succeeded, which here would route input into a decoder with no keymap and silently swallow every keystroke.
+#
+# Generated with `git diff` against the pinned fbterm commit
+# 419c6be55413a7069fbcc66883d58caa94ba3933. Regenerate with
+# ports/fbterm/build.sh; never edit by hand.
+
+diff --git a/src/input.cpp b/src/input.cpp
+index f6ab87b..3336c52 100644
+--- a/src/input.cpp
++++ b/src/input.cpp
+@@ -97,83 +97,64 @@ void TtyInput::switchVc(bool enter)
+ 	tcsetattr(STDIN_FILENO, TCSAFLUSH, &tm);
+ }
+ 
++/*
++ * Samsara: the console keymap patch is gone.
++ *
++ * Upstream installs fbterm's keyboard shortcuts (Shift+PageUp, Ctrl+Alt+1, and
++ * the rest) by *editing the kernel's console keymap* through the KDGKBENT and
++ * KDSKBENT ioctls -- reading each entry's old value, writing a new one, and
++ * putting the old values back on exit. That is a system-wide change: it affects
++ * every console on the machine, not just fbterm, and it needs privilege to
++ * undo.
++ *
++ * None of that has any referent here, and the reason is structural rather than
++ * a missing syscall. The console keymap exists because on Linux the *kernel*
++ * translates a scancode into a keycode, and a program that wants a different
++ * mapping has to change the translator. On Samsara the PS/2 driver already
++ * delivers UTF-8 characters to the input server, which forwards them to a pty,
++ * and a pty is a byte stream. There is no keycode layer for a shortcut to live
++ * in, so there is nothing to patch and no way to express one: a shortcut on
++ * Samsara has to be recognised from the character stream, not installed
++ * somewhere upstream of it.
++ *
++ * So the shortcuts are unavailable, and this function reports that rather than
++ * pretending. `keymapFailure` is the same flag upstream sets when the ioctl
++ * fails, and showInfo() below already turns it into the user-facing message
++ * "keyboard shortcuts will NOT work", so the degradation is visible rather than
++ * silent -- which is the property that matters. Declaring struct kbentry and the
++ * two request numbers just to have calls that always fail would have produced
++ * the same result with more code and a false impression that the mechanism is
++ * present.
++ */
+ void TtyInput::setupSysKey(bool restore)
+ {
+-	#define T_SHIFT (1 << KG_SHIFT)
+-	#define T_CTRL (1 << KG_CTRL)
+-	#define T_CTRL_ALT ((1 << KG_CTRL) + (1 << KG_ALT))
+-
+-	static bool syskey_saved = false;
+-	static struct KeyEntry {
+-		u8 table;
+-		u8 keycode;
+-		u16 new_val;
+-		u16 old_val;
+-	} sysKeyTable[] = {
+-		{T_SHIFT,    KEY_PAGEUP,   SHIFT_PAGEUP},
+-		{T_SHIFT,    KEY_PAGEDOWN, SHIFT_PAGEDOWN},
+-		{T_SHIFT,    KEY_LEFT,	   SHIFT_LEFT},
+-		{T_SHIFT,    KEY_RIGHT,    SHIFT_RIGHT},
+-		{T_CTRL,     KEY_SPACE,    CTRL_SPACE},
+-		{T_CTRL_ALT, KEY_1,        CTRL_ALT_1},
+-		{T_CTRL_ALT, KEY_2,        CTRL_ALT_2},
+-		{T_CTRL_ALT, KEY_3,        CTRL_ALT_3},
+-		{T_CTRL_ALT, KEY_4,        CTRL_ALT_4},
+-		{T_CTRL_ALT, KEY_5,        CTRL_ALT_5},
+-		{T_CTRL_ALT, KEY_6,        CTRL_ALT_6},
+-		{T_CTRL_ALT, KEY_7,        CTRL_ALT_7},
+-		{T_CTRL_ALT, KEY_8,	       CTRL_ALT_8},
+-		{T_CTRL_ALT, KEY_9,        CTRL_ALT_9},
+-		{T_CTRL_ALT, KEY_0,        CTRL_ALT_0},
+-		{T_CTRL_ALT, KEY_C,        CTRL_ALT_C},
+-		{T_CTRL_ALT, KEY_D,        CTRL_ALT_D},
+-		{T_CTRL_ALT, KEY_E,        CTRL_ALT_E},
+-		{T_CTRL_ALT, KEY_F1,       CTRL_ALT_F1},
+-		{T_CTRL_ALT, KEY_F2,       CTRL_ALT_F2},
+-		{T_CTRL_ALT, KEY_F3,       CTRL_ALT_F3},
+-		{T_CTRL_ALT, KEY_F4,       CTRL_ALT_F4},
+-		{T_CTRL_ALT, KEY_F5,       CTRL_ALT_F5},
+-		{T_CTRL_ALT, KEY_F6,       CTRL_ALT_F6},
+-		{T_CTRL_ALT, KEY_K,       CTRL_ALT_K},
+-	};
+-
+-	if (!syskey_saved && restore) return;
+-
+-	seteuid(0);
++	(void)restore;
+ 
+-	s8 imapp[128];
+-	Config::instance()->getOption("input-method", imapp, sizeof(imapp));
+-
+-	for (u32 i = 0; i < sizeof(sysKeyTable) / sizeof(KeyEntry); i++) {
+-		if (!imapp[0]
+-				&& (sysKeyTable[i].new_val == CTRL_SPACE
+-					|| sysKeyTable[i].new_val == CTRL_ALT_K)) continue;
+-
+-		kbentry entry;
+-		entry.kb_table = sysKeyTable[i].table;
+-		entry.kb_index = sysKeyTable[i].keycode;
+-
+-		if (!syskey_saved) {
+-			ioctl(STDIN_FILENO, KDGKBENT, &entry);
+-			sysKeyTable[i].old_val = entry.kb_value;
+-		}
+-
+-		entry.kb_value = (restore ? sysKeyTable[i].old_val : sysKeyTable[i].new_val);
+-		s32 ret = ioctl(STDIN_FILENO, KDSKBENT, &entry); //should have perm CAP_SYS_TTY_CONFIG
+-		if (!keymapFailure && ret == -1) keymapFailure = true;
++	// Reported once, not on every call: this runs on every mode switch, and a
++	// message repeated on each one would be noise rather than information.
++	if (!keymapFailure) {
++		keymapFailure = true;
+ 	}
+ 
+-	if (!syskey_saved && !restore) syskey_saved = true;
+-
+-	seteuid(getuid());
++	// The `seteuid(0)`/`seteuid(getuid())` pair is also gone. It existed to
++	// gain the privilege CAP_SYS_TTY_CONFIG requires to edit a system-wide
++	// keymap. With no keymap there is nothing to be privileged for, and
++	// briefly running as uid 0 to do nothing is not a thing worth doing.
+ }
+ 
+ void TtyInput::readyRead(s8 *buf, u32 len)
+ {
+-	if (mRawMode) {
+-		processRawKeys(buf, len);
+-		return;
+-	}
++	/*
++	 * No raw-mode branch here. Upstream diverts to processRawKeys() when
++	 * mRawMode is set; that decoder is gone on this port (see the note above
++	 * setRawMode) and setRawMode() never sets mRawMode, so the branch could
++	 * only ever be false.
++	 *
++	 * It is removed rather than left as a dead `if` because a surviving branch
++	 * that called a removed function would have to keep the function's
++	 * declaration alive, and a reader would have no way to tell that the path
++	 * was unreachable -- they would have to re-derive it from setRawMode.
++	 */
+ 
+ 	FbShell *shell = FbShellManager::instance()->activeShell();
+ 
+@@ -196,117 +177,51 @@ void TtyInput::readyRead(s8 *buf, u32 len)
+ 	if (shell && len > start) shell->keyInput(buf + start, len - start);
+ }
+ 
+-static u16 down_num;
+-static bool key_down[NR_KEYS];
+-static u8 shift_down[NR_SHIFT];
+-static u16 shift_state;
++/*
++ * Samsara: the raw-key decoder and the console keymap state are gone.
++ *
++ * Everything from here to the end of the file existed to serve raw mode. Raw
++ * mode is entered on Linux by setting the console's keyboard mode to
++ * K_MEDIUMRAW, which makes the console deliver keycodes instead of characters;
++ * processRawKeys() then decoded those keycodes by consulting the kernel
++ * keymap -- shift tables, modifier tracking, and the fbterm shortcut range
++ * AC_START..AC_END -- to work out both ordinary text and fbterm's own
++ * shortcuts.
++ *
++ * None of it applies here, for the same reason setupSysKey() is gone: a Samsara
++ * pty delivers UTF-8 characters and there is no keycode layer above it. There
++ * is no keymap to consult, so the decoder would have nothing to decode with.
++ *
++ * The decisive point is that raw mode is never entered on this port even
++ * upstream's control flow: the sole caller is switchVc(), and it passes
++ * `false`. mRawMode is therefore always false, readyRead()'s raw branch is
++ * unreachable, and this whole block is dead code that would only compile if the
++ * console keymap interface were declared for a keymap that does not exist.
++ *
++ * Deleting it is therefore honest rather than a shortcut, and setRawMode() below
++ * says so where a reader will look.
++ */
+ 
+ void TtyInput::setRawMode(bool raw, bool force)
+ {
+-	if (!force && raw == mRawMode) return;
+-
+-	mRawMode = raw;
+-	ioctl(STDIN_FILENO, KDSKBMODE, mRawMode ? K_MEDIUMRAW : K_UNICODE);
+-
+-	if (mRawMode) {
+-		down_num = 0;
+-		shift_state = 0;
+-		memset(key_down, 0, sizeof(bool) * NR_KEYS);
+-		memset(shift_down, 0, sizeof(char) * NR_SHIFT);
+-	} else {
+-		if (!down_num) return;
+-
+-		FbShell *shell = FbShellManager::instance()->activeShell();
+-		if (!shell) return;
+-
+-		u32 num = down_num;
+-		for (u32 i = 0; i < NR_KEYS; i++) {
+-			if (!key_down[i]) continue;
+-
+-			s8 code = i | 0x80;
+-			shell->keyInput(&code, 1);
+-
+-			if (!--num) break;
+-		}
+-	}
+-}
+-
+-void TtyInput::processRawKeys(s8 *buf, u32 len)
+-{
+-	FbShell *shell = FbShellManager::instance()->activeShell();
+-	u32 start = 0;
+-
+-	for (u32 i = 0; i < len; i++) {
+-		bool down = !(buf[i] & 0x80);
+-		u16 code = buf[i] & 0x7f;
+-		u32 orig = i;
+-
+-		if (!code) {
+-			if (i + 2 >= len) break;
+-
+-			code = (buf[++i] & 0x7f) << 7;
+-			code |= buf[++i] & 0x7f;
+-			if (!(buf[i] & 0x80) || !(buf[i - 1] & 0x80)) continue;
+-		}
+-
+-		if (code >= NR_KEYS) continue;
+-
+-		if (down ^ key_down[code]) {
+-			if (down) down_num++;
+-			else down_num--;
+-		} else if (!down) {
+-			if (shell && orig > start) shell->keyInput(buf + start, orig - start);
+-			start = i + 1;
+-		}
+-
+-		bool rep = (down && key_down[code]);
+-		key_down[code] = down;
+-
+-		struct kbentry ke;
+-		ke.kb_table = shift_state;
+-		ke.kb_index = code;
+-
+-		if (ioctl(STDIN_FILENO, KDGKBENT, &ke) == -1) continue;
+-
+-		u16 value = KVAL(ke.kb_value);
+-		u16 syskey = 0, switchvc = 0;
+-
+-		switch (KTYP(ke.kb_value)) {
+-		case KT_LATIN:
+-			if (value >= AC_START && value <= AC_END) syskey = value;
+-			break;
+-
+-		case KT_CONS:
+-			switchvc = value + 1;
+-			break;
+-
+-		case KT_SHIFT:
+-			if (rep || value >= NR_SHIFT) break;
+-			if (value == KVAL(K_CAPSSHIFT)) value = KVAL(K_SHIFT);
+-
+-			if (down) shift_down[value]++;
+-			else if (shift_down[value]) shift_down[value]--;
+-
+-			if (shift_down[value]) shift_state |= (1 << value);
+-			else shift_state &= ~(1 << value);
+-
+-			break;
+-
+-		default:
+-			break;
+-		}
+-
+-		if (down && (syskey || switchvc)) {
+-			if (shell && i >= start) shell->keyInput(buf + start, i - start + 1);
+-			start = i + 1;
+-
+-			if (syskey) {
+-				FbTerm::instance()->processSysKey(syskey);
+-			} else {
+-				ioctl(STDIN_FILENO, VT_ACTIVATE, switchvc);
+-			}
+-		}
+-	}
+-
+-	if (shell && len > start) shell->keyInput(buf + start, len - start);
++	(void)raw;
++	(void)force;
++
++	/*
++	 * A no-op, and mRawMode is deliberately left false.
++	 *
++	 * This is the one place worth being careful about. Upstream sets
++	 * mRawMode and *then* issues KDSKBMODE, ignoring whether the ioctl
++	 * succeeded. On Samsara the ioctl always fails -- there is no console
++	 * keyboard to set a mode on -- but mRawMode would still become true, and
++	 * readyRead() would then start routing input through a decoder that needs
++	 * a keymap. The result would be keystrokes silently consumed and never
++	 * delivered: a terminal that accepts typing and shows nothing, with no
++	 * error anywhere. That is the failure this port is avoiding, so raw mode
++	 * is never entered regardless of what the caller asks for.
++	 *
++	 * The mode change itself is not attempted. There is nothing on the other
++	 * end, and a failed ioctl whose result is ignored is worse than not
++	 * making the call.
++	 */
+ }
+diff --git a/src/input.h b/src/input.h
+index de47ea6..7a2b415 100644
+--- a/src/input.h
++++ b/src/input.h
+@@ -34,8 +34,14 @@ public:
+ private:
+ 	virtual void readyRead(s8 *buf, u32 len);
+ 	void setupSysKey(bool restore);
+-	void processRawKeys(s8* buf, u32 len);
+ 
++	/*
++	 * Always false on this port. See setRawMode(): raw mode is never entered,
++	 * because there is no console keyboard whose mode could be set and the
++	 * decoder that raw mode feeds has been removed. The member is kept so that
++	 * readyRead()'s comment refers to something concrete, and so a future
++	 * implementation has the obvious place to put it.
++	 */
+ 	bool mRawMode;
+ };
+ 

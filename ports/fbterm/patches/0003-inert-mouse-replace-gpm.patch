@@ -1,0 +1,262 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Harsh Nikarsa
+#
+# Replace the gpm(1) mouse client with an inert stub. fbterm's only mouse path is a Unix domain socket to the General Purpose Mouse daemon, and Samsara has no sockets. The interface is preserved and the descriptor stays -1. The kernel's PS/2 mouse and /dev/input/event0 are unaffected and still work; they are simply not wired to fbterm yet.
+#
+# Generated with `git diff` against the pinned fbterm commit
+# 419c6be55413a7069fbcc66883d58caa94ba3933. Regenerate with
+# ports/fbterm/build.sh; never edit by hand.
+
+diff --git a/src/mouse.cpp b/src/mouse.cpp
+index f173137..bdb8378 100644
+--- a/src/mouse.cpp
++++ b/src/mouse.cpp
+@@ -1,5 +1,5 @@
+ /*
+- *   Copyright © 2008-2010 dragchan <zgchan317@gmail.com>
++ *   Copyright (c) 2008-2010 dragchan <zgchan317@gmail.com>
+  *   This file is part of FbTerm.
+  *
+  *   This program is free software; you can redistribute it and/or
+@@ -18,159 +18,35 @@
+  *
+  */
+ 
+-#include "mouse.h"
+-DEFINE_INSTANCE(Mouse)
+-
+-#include "config.h"
+-#ifdef ENABLE_GPM
+-
+-#include <stddef.h>
+-#include <unistd.h>
+-#include <stdlib.h>
+-#include <string.h>
+-#include <gpm.h>
+-#include <sys/ioctl.h>
+-#include <sys/types.h>
+-#include <sys/socket.h>
+-#include <sys/un.h>
+-#include <linux/keyboard.h>
+-#include "fbshellman.h"
+-#include "fbshell.h"
+-#include "screen.h"
+-
+-static s32 open_gpm(Gpm_Connect *conn)
+-{
+-	s8 buf[64];
+-	s32 ret = ttyname_r(STDIN_FILENO, buf, sizeof(buf));
+-
+-	u32 index = strlen(buf) - 1;
+-	while (buf[index] >= '0' && buf[index] <= '9') index--;
+-
+-	s8 *tail;
+-	conn->vc = strtol(buf + index + 1, &tail, 10);
+-	if (*tail) return -1;
+-
+-	conn->pid = getpid();
+-
+-	s32 gpm_fd = socket(PF_UNIX, SOCK_STREAM, 0);
+-	if (gpm_fd == -1) return -1;
+-
+-	struct sockaddr_un addr;
+-	memset((s8 *)&addr, 0, sizeof(addr));
+-	addr.sun_family = AF_UNIX;
+-	strncpy(addr.sun_path, GPM_NODE_CTL, sizeof(addr.sun_path) - 1);
+-
+-	#define OFFSET(TYPE, MEMBER) ((size_t)(&(((TYPE *)0)->MEMBER)))
+-	u32 len = OFFSET(sockaddr_un, sun_path) + sizeof(GPM_NODE_CTL) - 1;
+-	if (len > sizeof(addr)) len = sizeof(addr);
+-
+-	if(connect(gpm_fd, (struct sockaddr *)(&addr), len) < 0 ||
+-	   write(gpm_fd, conn, sizeof(*conn)) != sizeof(*conn)) {
+-		close(gpm_fd);
+-		return -1;
+-	}
+-
+-	return gpm_fd;
+-}
+-
+-Mouse *Mouse::createInstance()
+-{
+-	Gpm_Connect conn;
+-	conn.eventMask = ~0;
+-	conn.defaultMask = ~GPM_HARD;
+-	conn.maxMod = ~0;
+-	conn.minMod = 0;
+-
+-	s32 fd = open_gpm(&conn);
+-	if (fd == -1) return 0;
++/*
++ * Samsara port: inert mouse implementation. See mouse.h for why.
++ *
++ * The single thing that must be right is the descriptor: Mouse is an IoPipe,
++ * and the io dispatcher selects() on the descriptor of every registered pipe. A
++ * mouse holding a descriptor that never becomes readable would keep the
++ * dispatcher blocked forever, with the shell already running and nothing ever
++ * typed. setFd(-1) keeps this object out of the dispatcher, so the terminal
++ * behaves exactly as it would with no mouse support compiled in.
++ */
+ 
+-	Mouse *mouse = new Mouse();
+-	mouse->setFd(fd);
++#include "mouse.h"
+ 
+-	return mouse;
+-}
++DEFINE_INSTANCE(Mouse)
+ 
+ Mouse::Mouse()
+ {
+-	x = y = 0;
++	// No descriptor. See the note above.
++	setFd(-1);
++	x = 0;
++	y = 0;
+ }
+ 
+ Mouse::~Mouse()
+ {
++	// Nothing to tear down: no socket, no process, no queued reports.
+ }
+ 
+-void Mouse::readyRead(s8 *buf, u32 len)
+-{
+-	if (len % sizeof(Gpm_Event)) return;
+-
+-	FbShell *shell = FbShellManager::instance()->activeShell();
+-	if (!shell) return;
+-
+-	u16 maxx = Screen::instance()->cols(), maxy = Screen::instance()->rows();
+-
+-	len /= sizeof(Gpm_Event);
+-	Gpm_Event *ev = (Gpm_Event *)buf;
+-
+-	for (; len--; ev++) {
+-		s32 type = -1, buttons = 0;
+-
+-		if (ev->wdy) type = Wheel;
+-		else if ((ev->type & GPM_MOVE) || (ev->type & GPM_DRAG)) type = Move;
+-		else if (ev->type & GPM_DOWN) type = (ev->type & GPM_DOUBLE) ? DblClick : Press;
+-		else if (ev->type & GPM_UP) type = Release;
+-		if (type == -1) continue;
+-
+-		if (ev->buttons & GPM_B_LEFT) buttons |= LeftButton;
+-		if (ev->buttons & GPM_B_MIDDLE) buttons |= MidButton;
+-		if (ev->buttons & GPM_B_RIGHT) buttons |= RightButton;
+-		if (type == Wheel) buttons |= ((ev->wdy < 0) ? WheelDown : WheelUp);
+-
+-		if (ev->modifiers & (1 << KG_SHIFT)) buttons |= ShiftButton;
+-		if (ev->modifiers & (1 << KG_CTRL)) buttons |= ControlButton;
+-		if (ev->modifiers & ((1 << KG_ALT) | (1 << KG_ALTGR))) buttons |= AltButton;
+-
+-		s16 newx = (s16)x + ev->dx, newy =(s16)y + ev->dy;
+-		if (newx < 0) newx = 0;
+-		if (newy < 0) newy = 0;
+-		if (newx >= maxx) newx = maxx - 1;
+-		if (newy >= maxy) newy = maxy - 1;
+-		if (newx == x && newy == y && !(buttons & MouseButtonMask)) continue;
+-
+-		shell->mouseInput(newx, newy, type, buttons);
+-		x = newx;
+-		y = newy;
+-	}
+-}
+-
+-void Mouse::switchVc(bool enter)
+-{
+-}
+-
+-#else
+-
+-#include <unistd.h>
+-#include <sys/ioctl.h>
+-#include <linux/kd.h>
+-
+ Mouse *Mouse::createInstance()
+ {
+ 	return new Mouse();
+ }
+-
+-Mouse::Mouse()
+-{
+-}
+-
+-Mouse::~Mouse()
+-{
+-}
+-
+-void Mouse::switchVc(bool enter)
+-{
+-	ioctl(STDIN_FILENO, KDSETMODE, enter ? KD_GRAPHICS : KD_TEXT);
+-}
+-
+-void Mouse::readyRead(s8 *buf, u32 len)
+-{
+-}
+-#endif
+diff --git a/src/mouse.h b/src/mouse.h
+index 7cd805b..ea47002 100644
+--- a/src/mouse.h
++++ b/src/mouse.h
+@@ -1,5 +1,5 @@
+ /*
+- *   Copyright © 2008-2010 dragchan <zgchan317@gmail.com>
++ *   Copyright (c) 2008-2010 dragchan <zgchan317@gmail.com>
+  *   This file is part of FbTerm.
+  *
+  *   This program is free software; you can redistribute it and/or
+@@ -18,20 +18,47 @@
+  *
+  */
+ 
++/*
++ * Samsara port: an inert mouse, replacing the gpm(1) client.
++ *
++ * Upstream's mouse support is a client for the General Purpose Mouse daemon: it
++ * connects to gpm's Unix domain socket and decodes the motion and button
++ * reports gpm sends. fbterm has no evdev mouse path of its own, so there is no
++ * alternative in the upstream code to fall back to -- it either talks to gpm or
++ * it has no mouse.
++ *
++ * Samsara has no sockets, so this is inert. The interface is preserved so
++ * fbterm.cpp's three call sites compile and behave correctly without edits: the
++ * instance exists, so `Mouse::instance()` never returns null and fbterm's
++ * `if (Mouse::instance())` test passes, and switchVc() does nothing.
++ *
++ * The absence of a descriptor is the load-bearing part, exactly as in the
++ * input-method proxy stub. Mouse is an IoPipe, and the io dispatcher selects on
++ * every registered pipe's descriptor; a descriptor here that never becomes
++ * readable would sit in select() forever. setFd(-1) keeps the mouse out of the
++ * dispatcher entirely.
++ *
++ * What this costs, stated plainly: no mouse reporting in fbterm. The kernel's
++ * PS/2 mouse driver and /dev/input/event0 both work and both report motion and
++ * buttons -- they are simply not connected to fbterm yet. Wiring fbterm's
++ * mouse handling to evdev instead of gpm is real future work, not a config
++ * change, and it is the right way to spend it: it removes the gpm dependency
++ * rather than stubbing around it.
++ */
++
+ #ifndef MOUSE_H
+ #define MOUSE_H
+-
+ #include "io.h"
+ #include "instance.h"
+-
+ class Mouse : public IoPipe {
+ 	DECLARE_INSTANCE(Mouse)
+ public:
+-	void switchVc(bool enter);
++	// No console to switch to and nothing to report, so this does nothing.
++	void switchVc(bool enter) { (void)enter; }
+ private:
+-	virtual void readyRead(s8 *buf, u32 len);
+-
++	// Never called: there is no descriptor, so the io dispatcher never
++	// selects on this object.
++	virtual void readyRead(s8 *buf, u32 len) { (void)buf; (void)len; }
+ 	u16 x, y;
+ };
+-
+ #endif

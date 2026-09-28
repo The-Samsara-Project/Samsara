@@ -114,6 +114,14 @@ extern "C" {
 /* Argument for signal() */
 typedef void (*__sighandler) (int);
 
+/* `sighandler_t` is the name POSIX gives this type, and every program that
+ * stores a handler in a variable expects to be able to spell it. Without the
+ * standard typedef a program has to reach for the implementation's
+ * `__sighandler`, which is a private name that may be renamed or removed in any
+ * mlibc release -- so a program written that way builds against this port and
+ * then fails to build against the next one. */
+typedef __sighandler sighandler_t;
+
 #define SIG_ERR ((__sighandler)(void *)(-1))
 #define SIG_DFL ((__sighandler)(void *)(0))
 #define SIG_IGN ((__sighandler)(void *)(1))

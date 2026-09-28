@@ -1,0 +1,579 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Harsh Nikarsa
+#
+# Replace fontconfig + freetype2 with a compiled-in 8x8 bitmap font. Porting freetype2 to draw ASCII would have been a far larger change than the terminal it serves. The glyph data is the font Samsara's own user-space console already uses, so every Samsara program renders text identically. A codepoint with no glyph returns NULL, which is fbterm's own placeholder-box path, so unsupported text is visibly wrong rather than silently blank.
+#
+# Generated with `git diff` against the pinned fbterm commit
+# 419c6be55413a7069fbcc66883d58caa94ba3933. Regenerate with
+# ports/fbterm/build.sh; never edit by hand.
+
+diff --git a/src/font.cpp b/src/font.cpp
+index 9c994f4..8a3388b 100644
+--- a/src/font.cpp
++++ b/src/font.cpp
+@@ -1,5 +1,5 @@
+ /*
+- *   Copyright © 2008-2010 dragchan <zgchan317@gmail.com>
++ *   Copyright (c) 2008-2010 dragchan <zgchan317@gmail.com>
+  *   This file is part of FbTerm.
+  *
+  *   This program is free software; you can redistribute it and/or
+@@ -18,330 +18,260 @@
+  *
+  */
+ 
+-#include <fontconfig/fontconfig.h>
+-#include <ft2build.h>
+-#include FT_GLYPH_H
++/*
++ * Samsara port: a built-in bitmap font, replacing fontconfig + freetype2.
++ *
++ * Upstream selects a font through fontconfig and rasterises it with freetype2.
++ * Neither library exists on Samsara, and porting either is a project in itself:
++ * fontconfig scans a font directory and parses configuration files, and
++ * freetype2 is a full TrueType rasteriser with its own build, its own memory
++ * management and its own file I/O. Doing that in order to draw ASCII would
++ * have been a far larger change than the terminal it was meant to serve, so
++ * this port replaces the whole mechanism with the one thing it needs: a bitmap
++ * font compiled in.
++ *
++ * The glyph data is the 8x8 printable-ASCII font already used by Samsara's own
++ * user-space console (user/nutcracker-rt/src/fb.rs, `FONT`). Reusing it is
++ * deliberate -- the kernel console, the installer wizard and fbterm then all
++ * render text the same way, so a screen does not change appearance depending on
++ * which program drew it.
++ *
++ * What this costs, stated plainly:
++ *
++ *   - No scalable fonts, and no font selection at all. The --font-names,
++ *     --font-size and --font-width/height/baseline options are accepted and
++ *     ignored, because accepting an option and warning about it is better than
++ *     refusing to start; see fbconfig.
++ *   - Printable ASCII only. A codepoint with no glyph returns NULL, which is
++ *     fbterm's own "draw the placeholder box" path, so unsupported text is
++ *     visibly wrong rather than silently blank.
++ *
++ * The cell is 8x16 with the 8-row glyph placed 4 rows down, so lines are
++ * spaced out and a descender has somewhere to go. An 8x8 cell would fit more
++ * rows on screen but reads as cramped.
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ #include "font.h"
+ #include "screen.h"
+ #include "fbconfig.h"
+ 
+-#define OFFSET(TYPE, MEMBER) ((size_t)(&(((TYPE *)0)->MEMBER)))
+-#define SUBS(a, b) ((a) > (b) ? (a) - (b) : (b) - (a))
+-#define MIN(a, b) ((a) < (b) ? (a) : (b))
+-
+-static FcCharSet *unicodeMap;
+-static FcFontSet *fontList;
+- 
+-static FT_Library ftlib;
+-static FT_Face *fontFaces;
+-static u32 *fontFlags;
++/* One glyph: 8 columns by 8 rows, one bit per pixel, MSB leftmost. */
++#define GLYPH_W 8
++#define GLYPH_H 8
+ 
+-static Font::Glyph **glyphCache;
+-static bool *glyphCacheInited;
++/* The character cell on screen: wider than the glyph in height, so lines are
++ * spaced and descenders do not collide with the row below. */
++static const u32 CELL_W = 8;
++static const u32 CELL_H = 16;
+ 
+-static void openFont(u32 index);
+-
+-DEFINE_INSTANCE(Font)
++/* Rows of blank space above the glyph within the cell. */
++static const s32 CELL_TOP = 4;
+ 
+-Font *Font::createInstance()
++/*
++ * The 8x8 bitmap for U+0020..U+007E.
++ *
++ * One byte per row, one bit per pixel, most significant bit leftmost. Copied
++ * from Samsara's user-space console font (user/nutcracker-rt/src/fb.rs) so that
++ * every Samsara program draws text identically.
++ */
++static const u8 ascii8x8[95][GLYPH_H] = {
++	{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, /*   */
++	{ 0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00 }, /* ! */
++	{ 0x36, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, /* \" */
++	{ 0x36, 0x36, 0x7F, 0x36, 0x7F, 0x36, 0x36, 0x00 }, /* # */
++	{ 0x0C, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x0C, 0x00 }, /* $ */
++	{ 0x00, 0x63, 0x33, 0x18, 0x0C, 0x66, 0x63, 0x00 }, /* % */
++	{ 0x1C, 0x36, 0x1C, 0x6E, 0x3B, 0x33, 0x6E, 0x00 }, /* & */
++	{ 0x06, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00 }, /* \' */
++	{ 0x18, 0x0C, 0x06, 0x06, 0x06, 0x0C, 0x18, 0x00 }, /* ( */
++	{ 0x06, 0x0C, 0x18, 0x18, 0x18, 0x0C, 0x06, 0x00 }, /* ) */
++	{ 0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00 }, /* * */
++	{ 0x00, 0x0C, 0x0C, 0x3F, 0x0C, 0x0C, 0x00, 0x00 }, /* + */
++	{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x06 }, /* , */
++	{ 0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00 }, /* - */
++	{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00 }, /* . */
++	{ 0x60, 0x30, 0x18, 0x0C, 0x06, 0x03, 0x01, 0x00 }, /* / */
++	{ 0x3E, 0x63, 0x73, 0x7B, 0x6F, 0x67, 0x3E, 0x00 }, /* 0 */
++	{ 0x0C, 0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x3F, 0x00 }, /* 1 */
++	{ 0x1E, 0x33, 0x30, 0x1C, 0x06, 0x33, 0x3F, 0x00 }, /* 2 */
++	{ 0x1E, 0x33, 0x30, 0x1C, 0x30, 0x33, 0x1E, 0x00 }, /* 3 */
++	{ 0x38, 0x3C, 0x36, 0x33, 0x7F, 0x30, 0x78, 0x00 }, /* 4 */
++	{ 0x3F, 0x03, 0x1F, 0x30, 0x30, 0x33, 0x1E, 0x00 }, /* 5 */
++	{ 0x1C, 0x06, 0x03, 0x1F, 0x33, 0x33, 0x1E, 0x00 }, /* 6 */
++	{ 0x3F, 0x33, 0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x00 }, /* 7 */
++	{ 0x1E, 0x33, 0x33, 0x1E, 0x33, 0x33, 0x1E, 0x00 }, /* 8 */
++	{ 0x1E, 0x33, 0x33, 0x3E, 0x30, 0x18, 0x0E, 0x00 }, /* 9 */
++	{ 0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00, 0x00 }, /* : */
++	{ 0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x06, 0x00 }, /* ; */
++	{ 0x18, 0x0C, 0x06, 0x03, 0x06, 0x0C, 0x18, 0x00 }, /* < */
++	{ 0x00, 0x00, 0x3F, 0x00, 0x3F, 0x00, 0x00, 0x00 }, /* = */
++	{ 0x06, 0x0C, 0x18, 0x30, 0x18, 0x0C, 0x06, 0x00 }, /* > */
++	{ 0x1E, 0x33, 0x30, 0x18, 0x0C, 0x00, 0x0C, 0x00 }, /* ? */
++	{ 0x3E, 0x63, 0x7B, 0x7B, 0x7B, 0x03, 0x1E, 0x00 }, /* @ */
++	{ 0x0C, 0x1E, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x00 }, /* A */
++	{ 0x3F, 0x66, 0x66, 0x3E, 0x66, 0x66, 0x3F, 0x00 }, /* B */
++	{ 0x3C, 0x66, 0x03, 0x03, 0x03, 0x66, 0x3C, 0x00 }, /* C */
++	{ 0x1F, 0x36, 0x66, 0x66, 0x66, 0x36, 0x1F, 0x00 }, /* D */
++	{ 0x7F, 0x46, 0x16, 0x1E, 0x16, 0x46, 0x7F, 0x00 }, /* E */
++	{ 0x7F, 0x46, 0x16, 0x1E, 0x16, 0x06, 0x0F, 0x00 }, /* F */
++	{ 0x3C, 0x66, 0x03, 0x03, 0x73, 0x66, 0x7C, 0x00 }, /* G */
++	{ 0x33, 0x33, 0x33, 0x3F, 0x33, 0x33, 0x33, 0x00 }, /* H */
++	{ 0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00 }, /* I */
++	{ 0x78, 0x30, 0x30, 0x30, 0x33, 0x33, 0x1E, 0x00 }, /* J */
++	{ 0x67, 0x66, 0x36, 0x1E, 0x36, 0x66, 0x67, 0x00 }, /* K */
++	{ 0x0F, 0x06, 0x06, 0x06, 0x46, 0x66, 0x7F, 0x00 }, /* L */
++	{ 0x63, 0x77, 0x7F, 0x7F, 0x6B, 0x63, 0x63, 0x00 }, /* M */
++	{ 0x63, 0x67, 0x6F, 0x7B, 0x73, 0x63, 0x63, 0x00 }, /* N */
++	{ 0x1C, 0x36, 0x63, 0x63, 0x63, 0x36, 0x1C, 0x00 }, /* O */
++	{ 0x3F, 0x66, 0x66, 0x3E, 0x06, 0x06, 0x0F, 0x00 }, /* P */
++	{ 0x1E, 0x33, 0x33, 0x33, 0x3B, 0x1E, 0x38, 0x00 }, /* Q */
++	{ 0x3F, 0x66, 0x66, 0x3E, 0x36, 0x66, 0x67, 0x00 }, /* R */
++	{ 0x1E, 0x33, 0x07, 0x0E, 0x38, 0x33, 0x1E, 0x00 }, /* S */
++	{ 0x3F, 0x2D, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00 }, /* T */
++	{ 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x3F, 0x00 }, /* U */
++	{ 0x33, 0x33, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00 }, /* V */
++	{ 0x63, 0x63, 0x63, 0x6B, 0x7F, 0x77, 0x63, 0x00 }, /* W */
++	{ 0x63, 0x63, 0x36, 0x1C, 0x1C, 0x36, 0x63, 0x00 }, /* X */
++	{ 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x0C, 0x1E, 0x00 }, /* Y */
++	{ 0x7F, 0x63, 0x31, 0x18, 0x4C, 0x66, 0x7F, 0x00 }, /* Z */
++	{ 0x1E, 0x06, 0x06, 0x06, 0x06, 0x06, 0x1E, 0x00 }, /* [ */
++	{ 0x03, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x40, 0x00 }, /* \\ */
++	{ 0x1E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x1E, 0x00 }, /* ] */
++	{ 0x08, 0x1C, 0x36, 0x63, 0x00, 0x00, 0x00, 0x00 }, /* ^ */
++	{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF }, /* _ */
++	{ 0x0C, 0x0C, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00 }, /* ` */
++	{ 0x00, 0x00, 0x1E, 0x30, 0x3E, 0x33, 0x6E, 0x00 }, /* a */
++	{ 0x07, 0x06, 0x06, 0x3E, 0x66, 0x66, 0x3B, 0x00 }, /* b */
++	{ 0x00, 0x00, 0x1E, 0x33, 0x03, 0x33, 0x1E, 0x00 }, /* c */
++	{ 0x38, 0x30, 0x30, 0x3E, 0x33, 0x33, 0x6E, 0x00 }, /* d */
++	{ 0x00, 0x00, 0x1E, 0x33, 0x3F, 0x03, 0x1E, 0x00 }, /* e */
++	{ 0x1C, 0x36, 0x06, 0x0F, 0x06, 0x06, 0x0F, 0x00 }, /* f */
++	{ 0x00, 0x00, 0x6E, 0x33, 0x33, 0x3E, 0x30, 0x1F }, /* g */
++	{ 0x07, 0x06, 0x36, 0x6E, 0x66, 0x66, 0x67, 0x00 }, /* h */
++	{ 0x0C, 0x00, 0x0E, 0x0C, 0x0C, 0x0C, 0x1E, 0x00 }, /* i */
++	{ 0x30, 0x00, 0x30, 0x30, 0x30, 0x33, 0x1E, 0x00 }, /* j */
++	{ 0x07, 0x06, 0x66, 0x36, 0x1E, 0x36, 0x67, 0x00 }, /* k */
++	{ 0x0E, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x1E, 0x00 }, /* l */
++	{ 0x00, 0x00, 0x33, 0x7F, 0x7F, 0x6B, 0x63, 0x00 }, /* m */
++	{ 0x00, 0x00, 0x1F, 0x33, 0x33, 0x33, 0x33, 0x00 }, /* n */
++	{ 0x00, 0x00, 0x1E, 0x33, 0x33, 0x33, 0x1E, 0x00 }, /* o */
++	{ 0x00, 0x00, 0x3B, 0x66, 0x66, 0x3E, 0x06, 0x0F }, /* p */
++	{ 0x00, 0x00, 0x6E, 0x33, 0x33, 0x3E, 0x30, 0x78 }, /* q */
++	{ 0x00, 0x00, 0x3B, 0x6E, 0x66, 0x06, 0x0F, 0x00 }, /* r */
++	{ 0x00, 0x00, 0x3E, 0x03, 0x1E, 0x30, 0x1F, 0x00 }, /* s */
++	{ 0x08, 0x0C, 0x3E, 0x0C, 0x0C, 0x2C, 0x18, 0x00 }, /* t */
++	{ 0x00, 0x00, 0x33, 0x33, 0x33, 0x33, 0x6E, 0x00 }, /* u */
++	{ 0x00, 0x00, 0x33, 0x33, 0x33, 0x1E, 0x0C, 0x00 }, /* v */
++	{ 0x00, 0x00, 0x63, 0x63, 0x6B, 0x7F, 0x36, 0x00 }, /* w */
++	{ 0x00, 0x00, 0x63, 0x36, 0x1C, 0x36, 0x63, 0x00 }, /* x */
++	{ 0x00, 0x00, 0x33, 0x33, 0x33, 0x3E, 0x30, 0x1F }, /* y */
++	{ 0x00, 0x00, 0x3F, 0x19, 0x0C, 0x26, 0x3F, 0x00 }, /* z */
++	{ 0x38, 0x0C, 0x0C, 0x07, 0x0C, 0x0C, 0x38, 0x00 }, /* { */
++	{ 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00 }, /* | */
++	{ 0x07, 0x0C, 0x0C, 0x38, 0x0C, 0x0C, 0x07, 0x00 }, /* } */
++	{ 0x00, 0x00, 0x6E, 0x3B, 0x00, 0x00, 0x00, 0x00 }, /* ~ */
++};
++
++/* Cached glyphs, one slot per codepoint in the font's range. A terminal redraws
++ * the same handful of characters constantly -- fbterm calls getGlyph once per
++ * character per frame -- so each glyph is built once and kept. This is what
++ * upstream's glyph cache did as well; what is gone is the freetype-rendered
++ * bitmap it was caching. */
++static Font::Glyph *glyphCache[128];
++
++/* Build one glyph. Glyph ends in a flexible array member, so the pixmap lives
++ * immediately after the header -- which is the entire reason it is one. */
++static Font::Glyph *makeGlyph(u32 unicode)
+ {
+-	FcInit();
+-
+-	s8 buf[64];
+-	Config::instance()->getOption("font-names", buf, sizeof(buf));
+-
+-	FcPattern *pat = FcNameParse((FcChar8 *)(*buf ? buf : "mono"));
+-
+-	u32 pixel_size = 12;
+-	Config::instance()->getOption("font-size", pixel_size);
+-	FcPatternAddDouble(pat, FC_PIXEL_SIZE, (double)pixel_size);
+-
+-	FcPatternAddString(pat, FC_LANG, (FcChar8 *)"en");
+-
+-	FcConfigSubstitute(NULL, pat, FcMatchPattern);
+-	FcDefaultSubstitute(pat);
+-
+-	FcResult result;
+-	FcFontSet *fs = FcFontSort(NULL, pat, FcTrue, &unicodeMap, &result);
+-
+-	if (fs) {
+-		fontList = FcFontSetCreate();
+-
+-		FcObjectSet *family = FcObjectSetCreate();
+-		FcObjectSetAdd(family, FC_FAMILY);
+-
+-		for (u32 i = 0; i < fs->nfont; i++) {
+-			FcPattern *font = FcFontRenderPrepare(NULL, pat, fs->fonts[i]);
+-			if (!font) continue;
+-
+-			bool same = false;
+-			for (u32 j = 0; j < fontList->nfont; j++) {
+-				if (FcPatternEqualSubset(fontList->fonts[j], font, family)) {
+-					same = true;
+-					break;
+-				}
+-			}
+-
+-			if (same) {
+-				FcPatternDestroy(font);
+-			} else {
+-				FcFontSetAdd(fontList, font);
+-			}
+-		}
+-
+-		FcObjectSetDestroy(family);
+-	}
+-
+-	FcPatternDestroy(pat);
+-	if (fs) FcFontSetDestroy(fs);
+-
+-	if (fontList && fontList->nfont) return new Font();
+-
+-	if (unicodeMap) FcCharSetDestroy(unicodeMap);
+-	if (fontList) FcFontSetDestroy(fontList);
+-	FcFini();
+-	return 0;
++	Font::Glyph *g = (Font::Glyph *)malloc(sizeof(Font::Glyph) + GLYPH_W * GLYPH_H);
++	if (!g) return 0;
++
++	g->pitch = 1;
++	g->width = GLYPH_W;
++	g->height = GLYPH_H;
++	/* A fixed-width bitmap font has no left side bearing and sits at a fixed
++	 * height within the cell. Both are what make the cell a constant size,
++	 * which is what lets fbterm compute a character position arithmetically
++	 * instead of measuring. */
++	g->left = 0;
++	g->top = CELL_TOP;
++
++	memcpy(g->pixmap, ascii8x8[unicode - 0x20], GLYPH_W * GLYPH_H);
++	return g;
+ }
+ 
++DEFINE_INSTANCE(Font)
++
++/*
++ * Cell geometry is fixed, so it is established here in the constructor rather
++ * than by loading a font and measuring it. Upstream also has a constructor, and
++ * also computed these values elsewhere -- from freetype's face metrics, once a
++ * font had been opened. There is no font to open, so the constructor is the only
++ * place the values can come from, and createInstance() is reduced to what the
++ * instance macro requires of it.
++ */
+ Font::Font()
+ {
+-	mHeight = mWidth = 0;
+-
+-	fontFaces = new FT_Face[fontList->nfont];
+-	fontFlags = new u32[fontList->nfont];
+-	memset(fontFaces, 0, sizeof(FT_Face) * fontList->nfont);
+-
+-	glyphCache = new Glyph *[256 * 256];
+-	glyphCacheInited = new bool[256];
+-	memset(glyphCacheInited, 0, sizeof(bool) * 256);
+-
+-	FT_Init_FreeType(&ftlib);
+-	openFont(0);
+-
+-	FT_Face face = fontFaces[0];
+-	if (face == (FT_Face)-1) return;
+-
+-	if (face->face_flags & FT_FACE_FLAG_SCALABLE) {
+-		mHeight = face->size->metrics.height >> 6;
+-		mWidth = face->size->metrics.max_advance >> 6;
+-	} else if (face->num_fixed_sizes) {
+-		double dsize;
+-		FcPatternGetDouble(fontList->fonts[0], FC_PIXEL_SIZE, 0, &dsize);
+-
+-		FT_Bitmap_Size *sizes = face->available_sizes;
+-		u32 index = 0, diffmin = (u32)-1;
+-		for (u32 i = 0; i < face->num_fixed_sizes; i++) {
+-			u32 diff = SUBS(sizes[i].size >> 6, (u32)dsize);
+-			if (diff < diffmin ) {
+-				index = i;
+-				diffmin = diff;
+-			}
+-		}
+-
+-		mHeight = sizes[index].height;
+-		mWidth = sizes[index].width;
+-	}
+-	mBaseline = face->size->metrics.ascender >> 6;
+-
+-	if (!(face->face_flags & FT_FACE_FLAG_FIXED_WIDTH)) mWidth = MIN(mWidth, (mHeight + 1) / 2);
+-
+-	u32 width = 0;
+-	Config::instance()->getOption("font-width", width);
+-
+-	if (width) {
+-		s8 buf[64];
+-		Config::instance()->getOption("font-width", buf, sizeof(buf));
+-
+-		if (buf[0] == '+' || buf[0] == '-') mWidth += (s32)width;
+-		else mWidth = width;
+-	}
+-
+-	u32 height = 0;
+-	Config::instance()->getOption("font-height", height);
+-
+-	if (height) {
+-		s8 buf[64];
+-		Config::instance()->getOption("font-height", buf, sizeof(buf));
+-
+-		if (buf[0] == '+' || buf[0] == '-') mHeight += (s32)height;
+-		else mHeight = height;
+-	}
+-
+-	u32 baseline = 0;
+-	Config::instance()->getOption("font-baseline", baseline);
+-
+-	if (baseline) {
+-		s8 buf[64];
+-		Config::instance()->getOption("font-baseline", buf, sizeof(buf));
+-
+-		if (buf[0] == '+' || buf[0] == '-') mBaseline += (s32)baseline;
+-		else mBaseline = baseline;
+-	}
++	mWidth = CELL_W;
++	mHeight = CELL_H;
++	/* The baseline sits just below the glyph's last row: 4 rows of leading
++	 * plus 8 rows of glyph. This is what places the cursor. */
++	mBaseline = CELL_TOP + GLYPH_H;
+ }
+ 
++/*
++ * Defined out of line on purpose.
++ *
++ * DECLARE_INSTANCE declares a virtual destructor, which makes the class
++ * polymorphic, which means the compiler needs a vtable. It emits the vtable in
++ * whichever translation unit defines the class's *key function* -- the first
++ * non-inline, non-pure virtual member function. With no destructor definition
++ * anywhere, there is no key function, no vtable is emitted, and the link fails
++ * with "undefined reference to vtable for Font" -- an error that names neither
++ * the missing destructor nor the header that declared it.
++ *
++ * So the destructor is defined here, where the rest of the class lives. There
++ * is nothing to release: the glyph cache is a static array of pointers that
++ * lives for the life of the process and is deliberately not torn down, because
++ * uninstance() runs at exit and freeing it would only risk a use-after-free in
++ * a destructor that runs during shutdown.
++ */
+ Font::~Font()
+ {
+-	for (u32 i = 0; i < 256; i++) {
+-		if (!glyphCacheInited[i]) continue;
+-
+-		for (u32 j = 0; j < 256; j++) {
+-			if (glyphCache[i * 256 + j]) {
+-				delete[] (u8 *)glyphCache[i * 256 + j];
+-			}
+-		}
+-	}
+-
+-	delete[] glyphCache;
+-	delete[] glyphCacheInited;
+-
+-	for (u32 i = 0; i < fontList->nfont; i++) {
+-		if (fontFaces[i] && fontFaces[i] != (FT_Face)-1) {
+-			FT_Done_Face(fontFaces[i]);
+-		}
+-	}
+-
+-	delete[] fontFaces;
+-	delete[] fontFlags;
+-
+-	FT_Done_FreeType(ftlib);
+-	FcCharSetDestroy(unicodeMap);
+-	FcFontSetDestroy(fontList);
+-	FcFini();
+ }
+ 
+-void Font::showInfo(bool verbose)
++Font *Font::createInstance()
+ {
+-	if (!verbose) return;
+-
+-	printf("[font] width: %dpx, height: %dpx, ordered list: ", mWidth, mHeight);
+-
+-	u32 index;
+-	FcChar8 *family;
+-	for (index = 0; index < fontList->nfont - 1; index++) {
+-		FcPatternGetString(fontList->fonts[index], FC_FAMILY, 0, &family);
+-		printf("%s, ", family);
+-	}
+-
+-	FcPatternGetString(fontList->fonts[index], FC_FAMILY, 0, &family);
+-	printf("%s\n", family);
++	return new Font();
+ }
+ 
+-static void openFont(u32 index)
+-{
+-	if (index >= fontList->nfont) return;
+-
+-	FcPattern *pattern = fontList->fonts[index];
+-
+-	FcChar8 *name = (FcChar8 *)"";
+-	FcPatternGetString(pattern, FC_FILE, 0, &name);
+-
+-	int id = 0;
+-	FcPatternGetInteger (pattern, FC_INDEX, 0, &id);
+-
+-	FT_Face face;
+-	if (FT_New_Face(ftlib, (const char *)name, id, &face)) {
+-		fontFaces[index] = (FT_Face)-1;
+-		return;
+-	}
+-
+-	double ysize;
+-	FcPatternGetDouble(pattern, FC_PIXEL_SIZE, 0, &ysize);
+-	FT_Set_Pixel_Sizes(face, 0, (FT_UInt)ysize);
+-
+-	int load_flags = FT_LOAD_DEFAULT;
+-
+-	FcBool scalable, antialias;
+-	FcPatternGetBool(pattern, FC_SCALABLE, 0, &scalable);
+-	FcPatternGetBool(pattern, FC_ANTIALIAS, 0, &antialias);
+-
+-	if (scalable && antialias) load_flags |= FT_LOAD_NO_BITMAP;
+-
+-	if (antialias) {
+-		FcBool hinting;
+-		int hint_style;
+-		FcPatternGetBool(pattern, FC_HINTING, 0, &hinting);
+-		FcPatternGetInteger(pattern, FC_HINT_STYLE, 0, &hint_style);
+-
+-		if (!hinting || hint_style == FC_HINT_NONE) {
+-			load_flags |= FT_LOAD_NO_HINTING;
+-		} else {
+-			load_flags |= FT_LOAD_TARGET_LIGHT;
+-		}
+-	} else {
+-		load_flags |= FT_LOAD_TARGET_MONO;
+-	}
+-
+-	fontFaces[index] = face;
+-	fontFlags[index] = load_flags;
+-}
+-
+-static int fontIndex(u32 unicode)
++void Font::showInfo(bool verbose)
+ {
+-	if (!FcCharSetHasChar(unicodeMap, unicode)) return -1;
+-
+-	FcCharSet *charset;
+-	for (u32 i = 0; i < fontList->nfont; i++) {
+-		FcPatternGetCharSet(fontList->fonts[i], FC_CHARSET, 0, &charset);
+-		if (FcCharSetHasChar(charset, unicode)) return i;
+-	}
++	if (!verbose) return;
+ 
+-	return -1;
++	/* Report what is actually in use rather than echoing a font request this
++	 * port cannot honour. Printing the requested family while drawing
++	 * something else would be lying in the one place a user looks to find
++	 * out what is happening. */
++	printf("[font] built-in 8x8 bitmap, %ux%u cell, ASCII 0x20-0x7e\n",
++			mWidth, mHeight);
+ }
+ 
+ Font::Glyph *Font::getGlyph(u32 unicode)
+ {
+-	if (unicode >= 256 * 256) return 0;
+-
+-	if (!glyphCacheInited[unicode >> 8]) {
+-		glyphCacheInited[unicode >> 8] = true;
+-		memset(&glyphCache[unicode & 0xff00], 0, sizeof(Glyph *) * 256);
++	/* Outside the font, and genuinely so. NULL sends the caller to its
++	 * placeholder-box path, which is a visible and correct rendering of "this
++	 * font has no glyph for that". A blank glyph would instead make the text
++	 * invisible, and the user could not tell a missing glyph from a space or
++	 * a cursor -- a far worse failure. */
++	if (unicode < 0x20 || unicode > 0x7E) return 0;
++
++	u32 slot = unicode - 0x20;
++	if (!glyphCache[slot]) {
++		glyphCache[slot] = makeGlyph(unicode);
+ 	}
+-
+-	if (glyphCache[unicode]) return glyphCache[unicode];
+-
+-	int i = fontIndex(unicode);
+-	if (i == -1) return 0;
+-
+-	if (!fontFaces[i]) openFont(i);
+-	if (fontFaces[i] == (FT_Face)-1) return 0;
+-
+-	FT_Face face = fontFaces[i];
+-	FT_UInt index = FT_Get_Char_Index(face, (FT_ULong)unicode);
+-	if (!index) return 0;
+-
+-	FT_Load_Glyph(face, index, FT_LOAD_RENDER | fontFlags[i]);
+-	FT_Bitmap &bitmap = face->glyph->bitmap;
+-
+-	u32 x, y, w, h, nx, ny, nw, nh;
+-	x = y = 0;
+-	w = nw = bitmap.width;
+-	h = nh = bitmap.rows;
+-	u8 *buf = bitmap.buffer;
+-	s32 top = (s32)mBaseline - face->glyph->bitmap_top;
+-	if (top < 0) {
+-		buf -= top * bitmap.pitch;
+-		h = nh += top;
+-		top = 0;
+-	}
+-	Screen::instance()->rotateRect(x, y, nw, nh);
+-
+-	Glyph *glyph = (Glyph *)new u8[OFFSET(Glyph, pixmap) + nw * nh];
+-	glyph->left = face->glyph->bitmap_left;
+-	glyph->top = top;
+-	glyph->width = w;
+-	glyph->height = h;
+-	glyph->pitch = nw;
+-
+-	for (y = 0; y < h; y++, buf += bitmap.pitch) {
+-		for (x = 0; x < w; x++) {
+-			nx = x, ny = y;
+-			Screen::instance()->rotatePoint(w, h, nx, ny);
+-
+-			glyph->pixmap[ny * nw + nx] =
+-				(bitmap.pixel_mode == FT_PIXEL_MODE_MONO) ? ((buf[(x >> 3)] & (0x80 >> (x & 7))) ? 0xff : 0) : buf[x];
+-		}
+-	}
+-
+-	glyphCache[unicode] = glyph;
+-	return glyph;
++	return glyphCache[slot];
+ }

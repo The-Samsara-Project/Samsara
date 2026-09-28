@@ -34,7 +34,7 @@ USER_SERVERS   := consoled inputd
 USER_UTILS     := samutils
 USER_EXAMPLES  := hello forkx exectst pipetest credtst signaltst polltest termiostst sh term installer
 
-.PHONY: all kernel iso run debug clean user-bins mlibc
+.PHONY: all kernel iso run debug clean user-bins mlibc fbterm
 
 all: iso
 
@@ -42,6 +42,13 @@ all: iso
 # wrapper around ports/mlibc/build.sh.
 mlibc:
 	./ports/mlibc/build.sh
+
+# Build fbterm (the ported Linux terminal emulator) into build/fbterm-build.
+# Separate from `all` on purpose: it needs a built mlibc sysroot, so folding it
+# into the default target would make a clean tree require the libc port before
+# anything else could be built. Run `make mlibc fbterm` for a terminal binary.
+fbterm:
+	./ports/fbterm/build.sh
 
 # Build the Nutcracker user images (example programs and servers) as static-PIE
 # ELFs for the kernel loader. `chello` is built here too even though it is the
@@ -56,6 +63,14 @@ user-bins:
 	@for b in $(USER_UTILS); do cp \
 	    target/user/x86_64-unknown-none/release/$$b target/user-$$b.elf; done
 	@sh user/build-chhello.sh
+	@# fbterm is a ported C++ program built by its own script against the mlibc
+	@# sysroot, not a cargo target. Copied in only when it has been built, so a
+	@# tree without a sysroot still produces a working ISO; `make fbterm` builds
+	@# it. Not in the kernel's program table yet -- see ports/fbterm/README.md for
+	@# the outstanding ttyname check that keeps it from running yet.
+	@if [ -f build/fbterm-build/fbterm.elf ]; then \
+	    cp build/fbterm-build/fbterm.elf target/user-fbterm.elf; \
+	fi
 	@ls -l target/user-*.elf
 
 kernel: user-bins

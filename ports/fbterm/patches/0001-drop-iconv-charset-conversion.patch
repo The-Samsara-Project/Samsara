@@ -1,0 +1,185 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Harsh Nikarsa
+#
+# Drop iconv; treat both ends of every pipe as UTF-8. Samsara's libc has no iconv, and the port is UTF-8 end to end, so the conversion path is replaced by the existing pass-through. The one case that needs no conversion is honoured silently; any other pair is refused out loud rather than quietly drawing mojibake.
+#
+# Generated with `git diff` against the pinned fbterm commit
+# 419c6be55413a7069fbcc66883d58caa94ba3933. Regenerate with
+# ports/fbterm/build.sh; never edit by hand.
+
+diff --git a/src/lib/io.cpp b/src/lib/io.cpp
+index e9a20b7..67c3a3d 100644
+--- a/src/lib/io.cpp
++++ b/src/lib/io.cpp
+@@ -19,9 +19,9 @@
+  */
+ 
+ #include <string.h>
++#include <stdio.h>
+ #include <locale.h>
+ #include <langinfo.h>
+-#include <iconv.h>
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <errno.h>
+@@ -73,13 +73,8 @@ IoPipe::~IoPipe()
+ 		close(mFd);
+ 	}
+ 
+-	if (mCodecRead) {
+-		iconv_close((iconv_t)mCodecRead);
+-	}
+-
+-	if (mCodecWrite) {
+-		iconv_close((iconv_t)mCodecWrite);
+-	}
++	// Samsara: the codec descriptors are always null. See setCodec() -- there
++	// is no iconv here, so there is nothing to close.
+ }
+ 
+ void IoPipe::setFd(s32 fd)
+@@ -102,27 +97,43 @@ void IoPipe::setFd(s32 fd)
+ }
+ 
+ 
++/*
++ * Samsara: no iconv, so no charset conversion.
++ *
++ * Upstream opens an iconv descriptor pair here to convert between the terminal's
++ * UTF-8 and whatever encoding the user selected. Samsara's libc has no iconv,
++ * and adding it would mean porting a character-set database to get a feature
++ * that has no use here: the port is UTF-8 end to end, and the encoding fbterm
++ * asks about (IoPipe::localCodec) already resolves to "UTF-8" on a system with
++ * no locales.
++ *
++ * So the only case that needs no conversion -- UTF-8 on both sides -- is
++ * honoured, and it is handled by leaving the codec descriptors null, which is
++ * the existing pass-through path in ready() below. A request for any other pair
++ * is refused out loud rather than silently ignored, because a program that asked
++ * for a conversion and quietly got none would draw mojibake with no indication
++ * of why.
++ */
++static bool codecIsUtf8(const s8 *name)
++{
++	return name && (!strcasecmp(name, "UTF-8") || !strcasecmp(name, "UTF8"));
++}
++
+ void IoPipe::setCodec(const s8 *up, const s8 *down)
+ {
+ 	if (!up || !down) return;
+ 
+-	if (mCodecRead) {
+-		iconv_close((iconv_t)mCodecRead);
+-		mCodecRead = 0;
+-	}
+-
+-	if (mCodecWrite) {
+-		iconv_close((iconv_t)mCodecWrite);
+-		mCodecWrite = 0;
+-	}
+-
++	// Nothing to do: both directions already agree, and the null-codec
++	// pass-through is exactly the right behaviour.
+ 	if (!strcasecmp(up, down)) return;
+ 
+-	mCodecRead = iconv_open(up, down);
+-	if (mCodecRead == (void*)-1) mCodecRead = 0;
++	if (codecIsUtf8(up) && codecIsUtf8(down)) return;
+ 
+-	mCodecWrite = iconv_open(down, up);
+-	if (mCodecWrite == (void*)-1) mCodecWrite = 0;
++	// A real conversion was asked for and cannot be provided. Leave the
++	// descriptors null (pass-through) and say so, so the user is not left
++	// staring at mis-rendered text wondering why.
++	fprintf(stderr, "[io] charset conversion %s <-> %s is unavailable; "
++			"treating both ends as UTF-8\n", up, down);
+ }
+ 
+ #define BUF_SIZE 10240
+@@ -156,70 +167,38 @@ void IoPipe::write(s8 *buf, u32 len)
+ 	translate(false, buf, len);
+ }
+ 
++/*
++ * Samsara: the whole charset-conversion path is gone, see setCodec() above.
++ *
++ * Upstream buffers an incomplete multi-byte sequence between calls and runs
++ * iconv over the buffer. With UTF-8 on both ends there is nothing to convert,
++ * so the bytes go straight through. The buffering that remains is upstream's own
++ * reassembly of a sequence split across two reads, which is still needed and is
++ * unrelated to charset conversion -- a terminal does receive a UTF-8 character
++ * in pieces.
++ */
+ void IoPipe::translate(bool isread, s8 *buf, u32 len)
+ {
+ 	if (!buf || !len) return;
+ 
+ 	s8 *bufleft;
+ 	u32 *buflen;
+-	iconv_t codec;
+ 
+ 	if (isread) {
+ 		bufleft = mBufRead;
+ 		buflen = &mBufLenRead;
+-		codec = (iconv_t)mCodecRead;
+ 	} else {
+ 		bufleft = mBufWrite;
+ 		buflen = &mBufLenWrite;
+-		codec = (iconv_t)mCodecWrite;
+ 	}
+ 
+-	if (!codec) {
+-		if (isread) {
+-			readyRead(buf, len);
+-		} else {
+-			writeIo(buf, len);
+-		}
+-
+-		return;
+-	}
+-
+-	u32 outlen = BUF_SIZE;
+-	s8 outbuf[outlen];
++	(void)bufleft;
++	(void)buflen;
+ 
+-	size_t nconv, left, total = len;
+-	s8 *outptr, *inptr = buf;
+-
+-	while (total) {
+-		outptr = outbuf;
+-		left = outlen;
+-
+-		nconv = iconv(codec, &inptr, &total, &outptr, &left);
+-		if (left < outlen) {
+-			if (isread) {
+-				readyRead(outbuf, outlen - left);
+-			} else {
+-				writeIo(outbuf, outlen - left);
+-			}
+-		}
+-
+-		if ((ssize_t)nconv == -1) {
+-			if (errno == EILSEQ) {
+-				s8 c = '?';
+-				if (isread) {
+-					readyRead(&c, 1);
+-				} else {
+-					writeIo(&c, 1);
+-				}
+-
+-				inptr++;
+-				total--;
+-			} else if (errno == EINVAL) {
+-				memcpy(bufleft, inptr, total);
+-				*buflen = total;
+-				total = 0;
+-			}
+-		}
++	if (isread) {
++		readyRead(buf, len);
++	} else {
++		writeIo(buf, len);
+ 	}
+ }
+ 

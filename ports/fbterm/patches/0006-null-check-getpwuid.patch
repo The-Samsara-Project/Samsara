@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Harsh Nikarsa
+#
+# Check getpwuid() for NULL. Samsara has no passwd database, so the call reports failure; upstream dereferences the result unconditionally, which kills the child before exec, leaves the parent waiting on a pid that never runs, and shows an empty terminal with no reason why.
+#
+# Generated with `git diff` against the pinned fbterm commit
+# 419c6be55413a7069fbcc66883d58caa94ba3933. Regenerate with
+# ports/fbterm/build.sh; never edit by hand.
+
+diff --git a/src/lib/shell.cpp b/src/lib/shell.cpp
+index 3578bdb..3cd400a 100644
+--- a/src/lib/shell.cpp
++++ b/src/lib/shell.cpp
+@@ -88,8 +88,22 @@ void Shell::createShellProcess(s8 **command)
+ 			s8 *shell = getenv("SHELL");
+ 			if (shell) execlp(shell, shell, NULL);
+ 
++			/*
++			 * Samsara: no passwd database, so getpwuid() reports failure
++			 * rather than inventing a user. Upstream dereferences the result
++			 * unconditionally, which on a system with no /etc/passwd is a
++			 * null dereference in the child -- the child dies before exec,
++			 * the parent waits on a pid that will never run, and the
++			 * terminal shows an empty screen with no reason why.
++			 *
++			 * So the result is checked, and the /bin/sh fallback below is
++			 * reached as the author intended. SHELL is tried first anyway,
++			 * so a system that sets it never gets here.
++			 */
+ 			struct passwd *userpd = getpwuid(getuid());
+-			execlp(userpd->pw_shell, userpd->pw_shell, NULL);
++			if (userpd && userpd->pw_shell) {
++				execlp(userpd->pw_shell, userpd->pw_shell, NULL);
++			}
+ 
+ 			execlp("/bin/sh", "/bin/sh", NULL);
+ 		}
