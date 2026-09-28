@@ -1,0 +1,12 @@
+[package]
+name = "samutils"
+version = "0.1.0"
+edition = "2021"
+description = "Nutcracker user utilities: a busybox-style multi-call binary for the native shell"
+
+[[bin]]
+name = "samutils"
+path = "src/main.rs"
+
+[dependencies]
+nutcracker-rt = { path = "../nutcracker-rt" }

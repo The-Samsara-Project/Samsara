@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Harsh Nikarsa
+#
+# Adds a `samsara` branch to the sysdeps dispatch in the mlibc root
+# meson.build. Generated with `git diff` against the pinned mlibc commit
+# 3bf6b90851b4390ebccf068a316459aa7702d95e.
+Index: meson.build
+===================================================================
+diff --git a/meson.build b/meson.build
+index 186e446f..5d664ecd 100644
+--- a/meson.build
++++ b/meson.build
+@@ -323,6 +323,13 @@ elif host_machine.system() == 'ethereal'
+ # ANCHOR: demo-sysdeps
+ elif host_machine.system() == 'demo'
+ 	subdir('sysdeps/demo')
++elif host_machine.system() == 'samsara'
++	# The Samsara kernel maps every PT_LOAD segment of the main executable at
++	# its final address and leaves it in place; the rtdl should neither remap
++	# it nor allocate fresh address space for it.
++	internal_conf.set10('MLIBC_MAP_DSO_SEGMENTS', false)
++	internal_conf.set10('MLIBC_MMAP_ALLOCATE_DSO', false)
++	subdir('sysdeps/samsara')
+ # ANCHOR_END: demo-sysdeps
+ else
+ 	error('No sysdeps defined for OS: ' + host_machine.system())

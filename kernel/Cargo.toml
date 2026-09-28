@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Harsh Nikarsa
+
+[package]
+name = "samsara"
+version = "0.1.0"
+edition = "2021"
+authors = ["Harsh Nikarsa"]
+license = "GPL-3.0-or-later"
+description = "Samsara - a blazingly fast, fully independent 64-bit Rust micro-kernel"
+repository = "https://example.invalid/samsara"
+keywords = ["os", "kernel", "microkernel", "no-std"]
+categories = ["no-std"]
+
+[lib]
+name = "samsara"
+crate-type = ["staticlib"]
+test = false
+bench = false
+
+[dependencies]
+nvme = { path = "../drivers/nvme" }
+pty = { path = "../drivers/pty" }
+storage = { path = "../drivers/storage" }
+ext2 = { path = "../drivers/ext2" }
+driver-common = { path = "../drivers/driver-common" }
+
+[features]
+default = []

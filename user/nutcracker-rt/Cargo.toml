@@ -1,0 +1,9 @@
+[package]
+name = "nutcracker-rt"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nutcracker_rt"
+crate-type = ["rlib"]
+description = "Nutcracker ring-3 runtime: syscalls, IPC frames, allocator, console"

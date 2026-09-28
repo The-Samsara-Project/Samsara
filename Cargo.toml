@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Harsh Nikarsa
+
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "drivers/driver-common",
+    "drivers/nvme",
+    "drivers/pty",
+    "drivers/storage",
+    "drivers/ext2",
+]
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+panic = "abort"
+codegen-units = 1
+overflow-checks = false
+
+[profile.dev]
+panic = "abort"

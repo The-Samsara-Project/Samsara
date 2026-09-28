@@ -1,0 +1,2852 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Harsh Nikarsa
+
+//! The Samsara system call ABI.
+//!
+//! Samsara defines its own ABI; it is deliberately *not* Linux-compatible.
+//!
+//! ## Calling convention
+//!
+//! | Element      | Register / rule                              |
+//! |--------------|----------------------------------------------|
+//! | syscall nr   | `rax`                                        |
+//! | arguments    | `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`       |
+//! | return value | `rax` (>= 0 success, < 0 `-errno`)           |
+//! | clobbered    | `rcx` (return rip), `r11` (caller rflags)    |
+//! | preserved    | all other registers, per SysV callee-saved   |
+//!
+//! See `docs/ABI.md` for the full contract and the stable number table.
+
+use crate::sig::samsara_post_syscall;
+use alloc::boxed::Box;
+use alloc::string::String;
+use core::arch::asm;
+
+unsafe extern "C" {
+    fn syscall_entry();
+}
+
+/// Error convention: results are negated errno-style values.
+pub mod errno {
+    /// Operation not permitted.
+    pub const EPERM: i64 = -1;
+    /// No such process/resource.
+    pub const ENOENT: i64 = -2;
+    /// No such process (POSIX `ESRCH`).
+    pub const ESRCH: i64 = -3;
+    /// No children to wait for (POSIX `ECHILD`).
+    pub const ECHILD: i64 = -10;
+    /// Blocking system call interrupted by a signal (POSIX `EINTR`).
+    pub const EINTR: i64 = -4;
+    /// Invalid argument.
+    pub const EINVAL: i64 = -22;
+    /// Inappropriate ioctl for device.
+    pub const ENOTTY: i64 = -25;
+    /// Not enough memory.
+    pub const ENOMEM: i64 = -12;
+    /// Exec format error (bad/unsupported ELF).
+    pub const ENOEXEC: i64 = -8;
+    /// Permission denied for an access mode (POSIX `EACCES`).
+    pub const EACCES: i64 = -13;
+    /// File exists (POSIX `EEXIST`).
+    pub const EEXIST: i64 = -17;
+    /// A path component was not a directory (POSIX `ENOTDIR`).
+    pub const ENOTDIR: i64 = -20;
+    /// Is a directory where a file was required (POSIX `EISDIR`).
+    pub const EISDIR: i64 = -21;
+    /// Broken pipe: a write with no reader end open.
+    pub const EPIPE: i64 = -32;
+    /// Function not implemented.
+    pub const ENOSYS: i64 = -38;
+    /// Input/output error.
+    pub const EIO: i64 = -5;
+    /// Resource temporarily unavailable; a non-blocking operation would block
+    /// (POSIX `EAGAIN`/`EWOULDBLOCK`).
+    pub const EAGAIN: i64 = -11;
+    /// Bad file descriptor (POSIX `EBADF`).
+    ///
+    /// Distinct from `EACCES`: the descriptor is not merely forbidden, it does
+    /// not name anything. `read(2)` on a closed fd must report this, or a
+    /// program cannot tell "you may not do that" from "that is not there".
+    pub const EBADF: i64 = -9;
+    /// Bad address (POSIX `EFAULT`).
+    ///
+    /// A user pointer that is not mapped, or does not span `len` readable
+    /// bytes. Kept distinct from `EINVAL` because the argument was well-formed:
+    /// the program made a mistake about memory, not about the API.
+    pub const EFAULT: i64 = -14;
+    /// No such device (POSIX `ENODEV`).
+    ///
+    /// "The object exists but the operation does not apply to it." Used when a
+    /// mapping is requested for a node that has no mappable physical range --
+    /// a request that is well-formed and simply cannot be served.
+    pub const ENODEV: i64 = -19;
+}
+
+/// Stable system call numbers. Never renumber; only append.
+pub mod nr {
+    /// Write a debug buffer to the kernel console.
+    pub const DEBUG_WRITE: u64 = 0;
+    /// Yield the CPU until the next interrupt.
+    pub const YIELD: u64 = 1;
+    /// Read kernel uptime in milliseconds.
+    pub const CLOCK_UPTIME_MS: u64 = 2;
+    /// Query kernel identity/version string into a user buffer.
+    pub const KERNEL_VERSION: u64 = 3;
+    /// Terminate the calling context cleanly.
+    pub const EXIT: u64 = 4;
+    /// Open a path: `(path: ptr<u8>, path_len, flags)` -> fd.
+    pub const OPEN: u64 = 5;
+    /// Close a descriptor.
+    pub const CLOSE: u64 = 6;
+    /// Read from a descriptor: `(fd, buf, len)` -> bytes read.
+    pub const READ: u64 = 7;
+    /// Write to a descriptor: `(fd, buf, len)` -> bytes written.
+    pub const WRITE: u64 = 8;
+    /// Send an asynchronous notification message to an endpoint.
+    pub const IPC_SEND: u64 = 9;
+    /// Block until a message arrives for this process's endpoint.
+    pub const IPC_RECV: u64 = 10;
+    /// Reply to a previously received `Call` message.
+    pub const IPC_REPLY: u64 = 11;
+    /// Synchronous request/response: send a `Call` and block for the reply.
+    pub const IPC_CALL: u64 = 12;
+    /// Spawn a user process from the embedded program table.
+    pub const PROC_SPAWN: u64 = 13;
+    /// Terminate the calling process.
+    pub const PROC_EXIT: u64 = 14;
+    /// Return this process's IPC endpoint id (`0x8000...` on failure).
+    pub const GET_EPID: u64 = 15;
+    /// Grant the calling process access to I/O ports `lo..=hi`.
+    pub const PORT_ALLOW: u64 = 16;
+    /// Bind an IRQ line as IPC messages to the calling process's endpoint.
+    pub const IRQ_BIND: u64 = 17;
+    /// Release a previously bound IRQ line.
+    pub const IRQ_UNBIND: u64 = 18;
+    /// Map `frames` freshly-allocated (zeroed) frames into this process.
+    pub const MAP_ANON: u64 = 19;
+    /// Map a physical device-memory range into this process (MMIO for drivers).
+    pub const MAP_PHYS: u64 = 20;
+    /// Allocate physically-contiguous DMA memory mapped into this process.
+    pub const DMA_ALLOC: u64 = 21;
+    /// Release a DMA allocation and unmap it.
+    pub const DMA_FREE: u64 = 22;
+    /// Duplicate the calling process: `()` -> child pid, `0` in the child.
+    pub const FORK: u64 = 23;
+    /// Replace the calling process's image with embedded program `prog`.
+    pub const EXEC: u64 = 24;
+    /// Block until process `pid` exits: `(pid, status_ptr)` -> 0.
+    pub const WAITPID: u64 = 25;
+    /// Create a pipe: `(pair: ptr to two u32)` -> 0; stores read then write fd.
+    pub const PIPE: u64 = 26;
+    /// Stat a path: `(path, path_len, stat: ptr)` -> 0.
+    pub const STAT: u64 = 27;
+    /// Change file mode: `(path, path_len, mode)` -> 0.
+    pub const CHMOD: u64 = 28;
+    /// Change file ownership: `(path, path_len, uid, gid)` -> 0 (`u32::MAX` = keep).
+    pub const CHOWN: u64 = 29;
+    /// Signal a process: `(pid, sig)` -> 0 (sig 0 = existence check).
+    pub const KILL: u64 = 30;
+    /// Real user id.
+    pub const GETUID: u64 = 31;
+    /// Real group id.
+    pub const GETGID: u64 = 32;
+    /// Effective user id.
+    pub const GETEUID: u64 = 33;
+    /// Effective group id.
+    pub const GETEGID: u64 = 34;
+    /// Real/effective/saved user ids: `(ptr to three u32)` -> 0.
+    pub const GETRESUID: u64 = 35;
+    /// Real/effective/saved group ids: `(ptr to three u32)` -> 0.
+    pub const GETRESGID: u64 = 36;
+    /// List supplementary groups: `(count, ptr)` -> number of groups.
+    pub const GETGROUPS: u64 = 37;
+    /// Set supplementary groups: `(count, ptr)` -> 0.
+    pub const SETGROUPS: u64 = 38;
+    /// Set user id (all four ids as root).
+    pub const SETUID: u64 = 39;
+    /// Set group id (all four ids as root).
+    pub const SETGID: u64 = 40;
+    /// Set effective user id.
+    pub const SETEUID: u64 = 41;
+    /// Set effective group id.
+    pub const SETEGID: u64 = 42;
+    /// Set real+effective user ids: `(ruid, euid)`.
+    pub const SETREUID: u64 = 43;
+    /// Set real+effective group ids: `(rgid, egid)`.
+    pub const SETREGID: u64 = 44;
+    /// Set real/effective/saved user ids: `(ruid, euid, suid)`.
+    pub const SETRESUID: u64 = 45;
+    /// Set real/effective/saved group ids: `(rgid, egid, sgid)`.
+    pub const SETRESGID: u64 = 46;
+    /// Set filesystem user id; returns the previous fsuid.
+    pub const SETFSUID: u64 = 47;
+    /// Set filesystem group id; returns the previous fsgid.
+    pub const SETFSGID: u64 = 48;
+    /// Set the process umask; returns the previous value.
+    pub const UMASK: u64 = 49;
+    /// Sleep at least `ms` milliseconds; interrupted by a signal with `EINTR`.
+    pub const NANOSLEEP: u64 = 50;
+    /// Install a signal handler: `(sig, act: *const SigAction, oldact: *mut SigAction)`.
+    pub const SIGACTION: u64 = 51;
+    /// Change the blocked-signal mask: `(how, set: *const u64, oldset: *mut u64)`.
+    pub const SIGPROCMASK: u64 = 52;
+    /// Suspend execution until a catchable/terminating signal arrives.
+    pub const SIGSUSPEND: u64 = 53;
+    /// Install or query the alternate signal stack.
+    pub const SIGALTSTACK: u64 = 54;
+    /// Return from a signal handler (trampoline-only).
+    pub const SIGRETURN: u64 = 55;
+    /// Query the set of pending signals: `(set: *mut u64)`.
+    pub const SIGPENDING: u64 = 56;
+    /// Return this process's scheduler task id (the pid used by `FORK`,
+    /// `WAITPID` and `KILL`). Distinct from `GET_EPID`.
+    pub const GET_PID: u64 = 57;
+    /// Poll descriptors for readiness:
+    /// `(fds: ptr<PollFd>, nfds, timeout_ms)` -> number ready.
+    /// `timeout_ms` is signed: `-1` blocks forever, `0` polls now, `>0` waits
+    /// up to that many milliseconds.
+    pub const POLL: u64 = 58;
+    /// Terminal/device control: `(fd, request, arg: ptr<u8>) -> 0`.
+    pub const IOCTL: u64 = 59;
+    /// Query the active framebuffer geometry: `(info: ptr<FbInfo>) -> 0`.
+    pub const FB_INFO: u64 = 60;
+    /// Hand the framebuffer to user space: stop the kernel text console from
+    /// painting over it. `() -> 0`.
+    pub const CONSOLE_DETACH: u64 = 61;
+    /// Give the display back to the kernel text console after a ring-3
+    /// application finished owning the framebuffer (the inverse of
+    /// `CONSOLE_DETACH`). Rebuilds the console and clears the screen. `() -> 0`.
+    pub const CONSOLE_ATTACH: u64 = 62;
+    /// Copy the calling process's argument vector into `(buf, cap)`: an
+    /// `argc` word (u64 LE) followed by the NUL-terminated strings. A null
+    /// `buf` or zero `cap` returns the required size. `(buf, cap) -> bytes`.
+    pub const GET_ARGS: u64 = 63;
+    /// Change the calling process's working directory: `(path, path_len) -> 0`.
+    pub const CHDIR: u64 = 64;
+    /// Copy the calling process's working directory into `(buf, cap)`; a null
+    /// `buf` or zero `cap` returns the required size (excluding the NUL).
+    /// `(buf, cap) -> bytes`.
+    pub const GETCWD: u64 = 65;
+    /// List a directory's children: `(path, path_len, buf, cap)-> bytes`.
+    /// `buf` receives the entry names as NUL-terminated strings; a null `buf`
+    /// or zero `cap` returns the required size.
+    pub const READDIR: u64 = 66;
+    /// Create a directory: `(path, path_len, mode) -> 0`.
+    pub const MKDIR: u64 = 67;
+    /// Create a shared-memory region of `frames` pages mapped into the caller:
+    /// `(frames) -> shared handle`. The handle can be passed to another process
+    /// so both map the identical physical frames.
+    pub const SHM_CREATE: u64 = 68;
+    /// Map an existing shared-memory region into the caller by handle:
+    /// `(handle) -> virtual base`.
+    pub const SHM_MAP: u64 = 69;
+    /// Drop the caller's mapping of a shared-memory region; the underlying
+    /// frames are freed when the last mapping goes away: `(handle) -> 0`.
+    pub const SHM_DESTROY: u64 = 70;
+    /// Copy the calling process's environment into `(buf, cap)`, in exactly the
+    /// same encoding as [`GET_ARGS`]: a count word (u64 LE) followed by the
+    /// NUL-terminated `NAME=value` strings. A null `buf` or zero `cap` returns
+    /// the required size. `(buf, cap) -> bytes`.
+    ///
+    /// The environment is *also* staged as `envp` on the initial stack, so a
+    /// libc-based program never needs this. It exists for callers that have no
+    /// stack to walk — a runtime that fetches its arguments over a syscall, or
+    /// a process inspecting a child it did not spawn.
+    pub const GET_ENV: u64 = 71;
+    /// Put `pid` into process group `pgid`: `(pid, pgid) -> 0`.
+    ///
+    /// A process may move only itself or one of its children, and only into a
+    /// group belonging to the same session. This is what lets a shell put a
+    /// pipeline in the background and a terminal aim `^C` at the foreground job
+    /// alone.
+    pub const SETPGID: u64 = 72;
+    /// The calling process's process group id: `() -> pgid`.
+    pub const GETPGRP: u64 = 73;
+    /// The process group of `pid`: `(pid) -> pgid`.
+    pub const GETPGID: u64 = 74;
+    /// Create a new session led by the calling process: `() -> sid`.
+    pub const SETSID: u64 = 75;
+    /// The session of `pid`: `(pid) -> sid`.
+    pub const GETSID: u64 = 76;
+    /// Install `base` as the calling process's FS base, which is where a libc
+    /// keeps its thread-control block pointer. `(base) -> 0`.
+    ///
+    /// This exists because there is no other way for ring-3 code to reach the
+    /// per-CPU MSR: `IA32_FS_BASE` is not a privileged instruction from ring 3,
+    /// and the `wrfsbase` alternative needs `CR4.FSGSBASE`, which is not
+    /// enabled (writing CR4 hangs this kernel under QEMU, so it stays off).
+    ///
+    /// Single-threaded by construction -- there is no SMP to make the MSR
+    /// per-CPU in any meaningful sense yet, so the value is global.
+    pub const SET_FS_BASE: u64 = 77;
+    /// Remove a name from a directory. `(dirfd, path, path_len) -> 0`.
+    ///
+    /// Added for `unlink(2)`. Removing a directory entry is not optional for a
+    /// POSIX libc -- `mkstemp`, `rm`, and every build that cleans up after
+    /// itself need it -- and the name-to-vnode mapping here is a flat
+    /// parent/child table, so removal is a single map delete.
+    pub const UNLINK: u64 = 78;
+    /// Move a descriptor's cursor. `(fd, offset: i64, whence) -> new offset`.
+    ///
+    /// Added for `lseek(2)`. Returns `ESPIPE` for a descriptor with no
+    /// meaningful cursor (a pipe, a terminal, the console), which is not an
+    /// error so much as an answer: stdio probes with it to decide whether a
+    /// stream can be repositioned and picks buffering accordingly.
+    pub const LSEEK: u64 = 79;
+    /// Wall-clock time in milliseconds since the Unix epoch. `() -> ms`.
+    ///
+    /// Added so `CLOCK_REALTIME` can be a real date. The uptime counter
+    /// (`CLOCK_UPTIME_MS`, 2) answers "how long since boot", which no
+    /// user-visible timestamp can be built from -- `ls -l` and `date` both came
+    /// out as 1970. This reads the MC146818, so the answer survives a reboot.
+    pub const CLOCK_REALTIME_MS: u64 = 80;
+    /// Set the wall clock. `(secs: i64 since the Unix epoch) -> 0`.
+    ///
+    /// Paired with the above because a machine whose RTC battery is flat has no
+    /// correct date to report, and the kernel cannot invent one. This is how
+    /// `stime(2)` / `clock_settime(2)` hand it one.
+    pub const SET_TIME: u64 = 81;
+    /// Describe an open descriptor. `(fd, buf: ptr<AbiStatEx>) -> 0`.
+    ///
+    /// Separate from `STAT` (57) because the two answer different questions
+    /// and a program needs the difference: `fstat` is how stdio asks what a
+    /// terminal or a pipe is, and it must report the *device*, not the file
+    /// that happens to sit at the same path. `STAT` predates this and keeps its
+    /// original five-field shape; `FSTAT` carries the full set a POSIX `struct
+    /// stat` needs, so a path `stat` can be completed from a descriptor's
+    /// answer.
+    pub const FSTAT: u64 = 82;
+    /// Fill a buffer with entropy. `(buf: ptr<u8>, len) -> 0`.
+    ///
+    /// `ENOSYS` when the machine has no entropy source at all, which is the
+    /// honest answer: a caller that gets random bytes it can predict has a
+    /// silent security bug, and one that is told "no" can fall back to
+    /// something it knows is weak on purpose.
+    pub const GETRANDOM: u64 = 83;
+    /// Remove an anonymous mapping. `(va, size) -> 0`.
+    ///
+    /// Added for `munmap(2)`. Without it every mapping leaks for the life of the
+    /// process, and `mmap` returning `MAP_FAILED` can never be honoured, so a
+    /// program that maps defensively has no way to back out.
+    pub const MUNMAP: u64 = 84;
+    /// Change a mapping's protection. `(va, size, prot) -> 0`.
+    ///
+    /// Added for `mprotect(2)`. A mapping is created read/write/no-execute and
+    /// stays that way, so a page that a program means to make read-only (or
+    /// executable, for a JIT) silently is not.
+    pub const MPROTECT: u64 = 85;
+    /// Map a device node's physical range. `(fd, offset, len, prot) -> va`.
+    ///
+    /// The file-backed half of `mmap(2)`. A terminal reaches a linear
+    /// framebuffer by mapping it, not by writing pixels one at a time, and
+    /// without this the only way to reach `/dev/fb0` is a `write(2)` per pixel --
+    /// which is far too slow to redraw a screen.
+    ///
+    /// `offset` and `len` are in bytes from the start of the device's range, so
+    /// a program mmaps the same region at the same offsets it would on Linux.
+    /// Only ranges a device actually declares are mappable, which is what stops
+    /// a process turning this into "map any physical address I like".
+    pub const DEVICE_MMAP: u64 = 86;
+    /// First number reserved for out-of-tree/experimental use.
+    pub const EXPERIMENTAL_BASE: u64 = 0x8000_0000_0000_0000;
+}
+
+/// Maximum stable syscall number reserved by the ABI.
+pub const NR_MAX: usize = 4096;
+
+/// User-visible IPC message frame. The kernel copies this structure verbatim
+/// across address spaces; `data_len` bounds the trailing byte blob.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MsgFrame {
+    /// Application-defined tag.
+    pub tag: u32,
+    /// Source endpoint id; meaningful on frames returned by `IPC_RECV`.
+    pub from: u32,
+    /// Call correlation id (kernel-issued for `Call`s, echoed in `Reply`).
+    pub call_id: u64,
+    /// Twelve argument words; protocol-defined meaning.
+    pub args: [u64; 12],
+    /// Number of valid bytes in `data`.
+    pub data_len: u32,
+    /// Message kind on frames returned by `IPC_RECV` ([`crate::ipc::MsgKind`]).
+    pub kind: u32,
+    /// Payload bytes (see [`crate::ipc::MAX_MSG_DATA`]).
+    pub data: [u8; crate::ipc::MAX_MSG_DATA],
+}
+
+impl MsgFrame {
+    /// Build an empty frame.
+    pub const fn new() -> Self {
+        MsgFrame {
+            tag: 0,
+            from: 0,
+            call_id: 0,
+            args: [0; 12],
+            data_len: 0,
+            kind: 0,
+            data: [0; crate::ipc::MAX_MSG_DATA],
+        }
+    }
+
+    /// Extract the trailing payload as a slice.
+    pub fn payload(&self) -> &[u8] {
+        &self.data[..self.data_len.min(crate::ipc::MAX_MSG_DATA as u32) as usize]
+    }
+}
+
+/// User-visible framebuffer geometry, filled in by `FB_INFO`.
+///
+/// The mapping window starts at `phys` (page-aligned); the first visible pixel
+/// is `offset` bytes into it. `size` is the total byte length to map. Channels
+/// are described so a compositor can pack colors for any direct-RGB mode.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FbInfo {
+    /// Page-aligned physical base of the framebuffer range.
+    pub phys: u64,
+    /// Total mapped length in bytes.
+    pub size: u64,
+    /// Byte offset of the first visible pixel from `phys`.
+    pub offset: u32,
+    /// Visible width in pixels.
+    pub width: u32,
+    /// Visible height in pixels.
+    pub height: u32,
+    /// Distance in bytes between scanlines.
+    pub pitch: u32,
+    /// Bits per pixel.
+    pub bpp: u32,
+    /// Bit position of the red channel.
+    pub red_pos: u32,
+    /// Width of the red channel in bits.
+    pub red_size: u32,
+    /// Bit position of the green channel.
+    pub green_pos: u32,
+    /// Width of the green channel in bits.
+    pub green_size: u32,
+    /// Bit position of the blue channel.
+    pub blue_pos: u32,
+    /// Width of the blue channel in bits.
+    pub blue_size: u32,
+}
+
+type SyscallFn = fn(u64, u64, u64, u64, u64, u64) -> i64;
+
+static mut SYSCALL_TABLE: [Option<SyscallFn>; NR_MAX] = [None; NR_MAX];
+
+/// Register a handler under a stable syscall number.
+///
+/// Later registration of the same number is ignored (the first registrant
+/// wins); this will become an explicit error once the syscall registry
+/// moves to a formal capability model.
+pub fn register(number: u64, handler: SyscallFn) {
+    if number >= NR_MAX as u64 {
+        crate::log::kwarn!("abi: refusing experimental syscall {:#x}", number);
+        return;
+    }
+    unsafe {
+        let slot = &mut SYSCALL_TABLE[number as usize];
+        if slot.is_none() {
+            *slot = Some(handler);
+        }
+    }
+}
+
+/// Core dispatcher invoked from the assembly entry stub.
+///
+/// # Safety
+/// Called only from `syscall_entry` with an established kernel stack and
+/// saved user register frame.
+#[no_mangle]
+unsafe extern "C" fn samsara_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 {
+    if nr >= NR_MAX as u64 {
+        return errno::ENOSYS;
+    }
+    match unsafe { SYSCALL_TABLE[nr as usize] } {
+        Some(f) => f(a1, a2, a3, a4, a5, a6),
+        None => errno::ENOSYS,
+    }
+}
+
+/// Kernel identity string returned by `KERNEL_VERSION`.
+pub const KERNEL_VERSION_STRING: &[u8] =
+    b"Samsara/Nutcracker 0.1.0; (C) 2026 Harsh Nikarsa; GPLv3+\n";
+
+// ---------------------------------------------------------------------------
+// Default syscall implementations
+// ---------------------------------------------------------------------------
+
+/// Number of leading bytes in `[ptr, ptr+len)` that live in mapped pages of
+/// the current address space. Used as a safety net when a syscall touches a
+/// user-supplied buffer: every page boundary in the range is checked, and
+/// access is constrained to the contiguous mapped prefix.
+///
+/// The check runs against the page tables active in CR3 *now* — the calling
+/// process's own. The kernel's static `ACTIVE_SPACE` is the *kernel* address
+/// space and contains no user mappings, so translating through it would flag
+/// every user buffer as unmapped.
+fn validate_range(ptr: usize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let first = ptr & !0xFFF;
+    let last = (ptr + len - 1) & !0xFFF;
+    for page in (first..=last).step_by(0x1000) {
+        if crate::memory::vmm::translate_current(page).is_none() {
+            return page.saturating_sub(ptr).min(len);
+        }
+    }
+    len
+}
+
+fn sys_debug_write(buf: u64, len: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let len = len.min(4096) as usize;
+    let safe = validate_range(buf as usize, len);
+    if safe == 0 {
+        return 0;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, safe) };
+    crate::io::uart::write(bytes);
+    crate::console::write(bytes);
+    safe as i64
+}
+
+fn sys_yield(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    crate::task::sched::yield_now();
+    0
+}
+
+fn sys_clock_uptime_ms(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    crate::time::millis() as i64
+}
+
+fn sys_kernel_version(buf: u64, len: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let want = (len as usize).min(KERNEL_VERSION_STRING.len());
+    let safe = validate_range(buf as usize, want);
+    if safe == 0 {
+        return 0;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(KERNEL_VERSION_STRING.as_ptr(), buf as *mut u8, safe);
+    }
+    safe as i64
+}
+
+fn sys_exit(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> ! {
+    crate::log::kwarn!("abi: EXIT called; halting machine");
+    loop {
+        unsafe { asm!("cli; hlt", options(nomem, nostack)) };
+    }
+}
+
+/// Install the default syscall surface.
+pub fn register_defaults() {
+    register(nr::DEBUG_WRITE, sys_debug_write);
+    register(nr::YIELD, |_, _, _, _, _, _| sys_yield(0, 0, 0, 0, 0, 0));
+    register(nr::CLOCK_UPTIME_MS, |_, _, _, _, _, _| {
+        sys_clock_uptime_ms(0, 0, 0, 0, 0, 0)
+    });
+    register(nr::KERNEL_VERSION, sys_kernel_version);
+    register(nr::EXIT, |_, _, _, _, _, _| sys_exit(0, 0, 0, 0, 0, 0));
+    register(nr::OPEN, sys_open);
+    register(nr::CLOSE, sys_close);
+    register(nr::READ, sys_read);
+    register(nr::WRITE, sys_write);
+    register(nr::PIPE, sys_pipe);
+
+    // File metadata + credentials / permissions surface.
+    register(nr::STAT, sys_stat);
+    register(nr::CHMOD, sys_chmod);
+    register(nr::CHOWN, sys_chown);
+    register(nr::KILL, sys_kill);
+    register(nr::GETUID, sys_getuid);
+    register(nr::GETGID, sys_getgid);
+    register(nr::GETEUID, sys_geteuid);
+    register(nr::GETEGID, sys_getegid);
+    register(nr::GETRESUID, sys_getresuid);
+    register(nr::GETRESGID, sys_getresgid);
+    register(nr::GETGROUPS, sys_getgroups);
+    register(nr::SETGROUPS, sys_setgroups);
+    register(nr::SETUID, sys_setuid);
+    register(nr::SETGID, sys_setgid);
+    register(nr::SETEUID, sys_seteuid);
+    register(nr::SETEGID, sys_setegid);
+    register(nr::SETREUID, sys_setreuid);
+    register(nr::SETREGID, sys_setregid);
+    register(nr::SETRESUID, sys_setresuid);
+    register(nr::SETRESGID, sys_setresgid);
+    register(nr::SETFSUID, sys_setfsuid);
+    register(nr::SETFSGID, sys_setfsgid);
+    register(nr::UMASK, sys_umask);
+
+    // Signal surface.
+    register(nr::NANOSLEEP, sys_nanosleep);
+    register(nr::SIGACTION, sys_sigaction);
+    register(nr::SIGPROCMASK, sys_sigprocmask);
+    register(nr::SIGSUSPEND, sys_sigsuspend);
+    register(nr::SIGALTSTACK, sys_sigaltstack);
+    register(nr::SIGRETURN, sys_sigreturn);
+    register(nr::SIGPENDING, sys_sigpending);
+    register(nr::GET_PID, sys_get_pid);
+
+    // Microkernel surface: IPC, processes, interrupts and memory grants.
+    register(nr::IPC_SEND, sys_ipc_send);
+    register(nr::IPC_RECV, sys_ipc_recv);
+    register(nr::IPC_REPLY, sys_ipc_reply);
+    register(nr::IPC_CALL, sys_ipc_call);
+    register(nr::PROC_SPAWN, sys_proc_spawn);
+    register(nr::PROC_EXIT, sys_proc_exit);
+    register(nr::GET_EPID, sys_get_epid);
+    register(nr::PORT_ALLOW, sys_port_allow);
+    register(nr::IRQ_BIND, sys_irq_bind);
+    register(nr::IRQ_UNBIND, sys_irq_unbind);
+    register(nr::MAP_ANON, sys_map_anon);
+    register(nr::MAP_PHYS, sys_map_phys);
+    register(nr::DMA_ALLOC, sys_dma_alloc);
+    register(nr::DMA_FREE, sys_dma_free);
+    register(nr::FORK, sys_fork);
+    register(nr::EXEC, sys_exec);
+    register(nr::WAITPID, sys_waitpid);
+    register(nr::POLL, sys_poll);
+    register(nr::IOCTL, sys_ioctl);
+    register(nr::FB_INFO, sys_fb_info);
+    register(nr::CONSOLE_DETACH, sys_console_detach);
+    register(nr::CONSOLE_ATTACH, sys_console_attach);
+    register(nr::GET_ARGS, sys_get_args);
+    register(nr::GET_ENV, sys_get_env);
+    register(nr::SETPGID, sys_setpgid);
+    register(nr::GETPGRP, sys_getpgrp);
+    register(nr::GETPGID, sys_getpgid);
+    register(nr::SETSID, sys_setsid);
+    register(nr::GETSID, sys_getsid);
+    register(nr::SET_FS_BASE, sys_set_fs_base);
+    register(nr::CHDIR, sys_chdir);
+    register(nr::GETCWD, sys_getcwd);
+    register(nr::READDIR, sys_readdir);
+    register(nr::UNLINK, sys_unlink);
+    register(nr::LSEEK, sys_lseek);
+    register(nr::CLOCK_REALTIME_MS, sys_clock_realtime_ms);
+    register(nr::SET_TIME, sys_set_time);
+    register(nr::FSTAT, sys_fstat);
+    register(nr::GETRANDOM, sys_getrandom);
+    register(nr::MUNMAP, sys_munmap);
+    register(nr::MPROTECT, sys_mprotect);
+    register(nr::DEVICE_MMAP, sys_device_mmap);
+    register(nr::MKDIR, sys_mkdir);
+    register(nr::SHM_CREATE, sys_shm_create);
+    register(nr::SHM_MAP, sys_shm_map);
+    register(nr::SHM_DESTROY, sys_shm_destroy);
+
+    unsafe {
+        enable_syscall_instruction();
+    }
+    crate::log::kdebug!(
+        "abi: {} syscalls registered; `syscall` enabled",
+        68
+    );
+}
+
+// ---------------------------------------------------------------------------
+// File descriptor syscall implementations
+// ---------------------------------------------------------------------------
+
+/// # Safety
+/// The buffer must reference mapped memory in the calling process's address
+/// space (validated per page against the CR3 currently in use).
+unsafe fn user_bytes(buf: u64, len: u64) -> Option<&'static mut [u8]> {
+    let len = len.min(1 << 20) as usize;
+    let ptr = buf as usize;
+    // Validate every page in range through the current address space.
+    if len > 0 {
+        let first = ptr & !0xFFF;
+        let last = (ptr + len - 1) & !0xFFF;
+        for page in (first..=last).step_by(0x1000) {
+            crate::memory::vmm::translate_current(page)?;
+        }
+    }
+    Some(core::slice::from_raw_parts_mut(buf as *mut u8, len))
+}
+
+fn current_task() -> Result<usize, i64> {
+    crate::task::sched::current_task_id()
+        .map(|t| t.0)
+        .ok_or(crate::abi::errno::EPERM)
+}
+
+/// Copy a NUL-tolerating path string out of user memory.
+fn user_str(ptr: u64, len: u64) -> Result<alloc::string::String, i64> {
+    let bytes = unsafe { user_bytes(ptr, len) }.ok_or(errno::EINVAL)?;
+    let s = core::str::from_utf8(bytes)
+        .map_err(|_| errno::EINVAL)?
+        .trim_end_matches('\0');
+    Ok(alloc::string::String::from(s))
+}
+
+/// Make a path absolute: as-is when it already starts with `/`, otherwise
+/// prefixed with the calling process's working directory. The VFS normalizes
+/// the joined result (collapsing `.`/`..` and repeated slashes).
+fn task_abs_path(path: &str) -> alloc::string::String {
+    if path.starts_with('/') || path.is_empty() {
+        alloc::string::String::from(path)
+    } else {
+        alloc::format!("{}/{}", crate::task::sched::current_cwd(), path)
+    }
+}
+
+/// Copy a NUL-terminated string out of user memory, bounded to 4 KiB.
+///
+/// # Safety
+/// `ptr` must lie in the calling process's address space; each byte is
+/// validated against the current CR3 before it is read.
+unsafe fn read_user_strz(ptr: u64) -> Option<alloc::string::String> {
+    let mut v = alloc::vec::Vec::new();
+    for i in 0..4096u64 {
+        let slice = user_bytes(ptr + i, 1)?;
+        let b = slice[0];
+        if b == 0 {
+            return Some(alloc::string::String::from_utf8_lossy(&v).into_owned());
+        }
+        v.push(b);
+    }
+    None
+}
+
+/// Read a classic `char *argv[]` (a NUL-terminated array of NUL-terminated
+/// string pointers) out of the calling process's memory. A null `arr` pointer
+/// yields an empty vector (the legacy no-argument form).
+///
+/// # Safety
+/// Every cell and string byte is validated against the current CR3 before
+/// dereference; malformed layouts stop the walk early instead of faulting.
+unsafe fn read_argv(arr: u64) -> alloc::vec::Vec<alloc::string::String> {
+    let mut out = alloc::vec::Vec::new();
+    if arr == 0 {
+        return out;
+    }
+    for i in 0..128u64 {
+        let cell = match user_bytes(arr + i * 8, 8) {
+            Some(b) => b,
+            None => break,
+        };
+        let ptr = u64::from_le_bytes(cell[..8].try_into().unwrap());
+        if ptr == 0 {
+            break;
+        }
+        match unsafe { read_user_strz(ptr) } {
+            Some(s) => out.push(s),
+            None => break,
+        }
+    }
+    out
+}
+
+/// Serialize a string vector the way `GET_ARGS` and `GET_ENV` hand it out: a
+/// count word (u64 LE) followed by the NUL-terminated strings. Returns the
+/// number of bytes written, or the required size when `buf` is null / `cap` is
+/// zero.
+fn copy_strvec_out(items: &[String], buf: u64, cap: u64) -> Result<i64, i64> {
+    let need = 8 + items.iter().map(|a| a.len() + 1).sum::<usize>();
+    if buf == 0 || cap == 0 {
+        return Ok(need as i64);
+    }
+    let cap = cap.min(need as u64) as usize;
+    if cap < 8 {
+        return Ok(need as i64);
+    }
+    let bytes = unsafe { user_bytes(buf, cap as u64) }.ok_or(errno::EINVAL)?;
+    bytes[..8].copy_from_slice(&(items.len() as u64).to_le_bytes());
+    let mut off = 8usize;
+    for a in items {
+        if off >= cap {
+            break;
+        }
+        let room = cap - off;
+        let want = a.len() + 1;
+        let take = want.min(room);
+        let sbytes = take.saturating_sub(1).min(a.len());
+        bytes[off..off + sbytes].copy_from_slice(&a.as_bytes()[..sbytes]);
+        if take == want {
+            bytes[off + a.len()] = 0;
+        }
+        off += take;
+    }
+    Ok(off as i64)
+}
+
+/// Copy the serialized argument vector for task `task` into user memory at
+/// `buf` (capacity `cap`), in the `GET_ARGS` encoding.
+fn copy_args_out(task: usize, buf: u64, cap: u64) -> Result<i64, i64> {
+    let args = crate::task::sched::task_args(task);
+    copy_strvec_out(&args, buf, cap)
+}
+
+/// Credentials of the calling process.
+fn current_cred() -> Result<crate::cred::Credentials, i64> {
+    Ok(crate::cred::get(current_task()?))
+}
+
+fn sys_open(path: u64, path_len: u64, flags: u64, mode: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let flags = flags as u32;
+    let accmode = flags & crate::vfs::O_ACCMODE;
+    let bytes = match unsafe { user_bytes(path, path_len) } {
+        Some(b) => b,
+        None => return crate::abi::errno::EINVAL,
+    };
+    let path_str = match core::str::from_utf8(bytes) {
+        Ok(s) => s.trim_end_matches('\0'),
+        Err(_) => return crate::abi::errno::EINVAL,
+    };
+    let cred = crate::cred::get(task);
+
+    // Resolve (the final component is *not* access-checked by the resolver).
+    // Relative paths resolve against the calling process's working directory.
+    let abs = task_abs_path(path_str);
+
+    // The pty multiplexer allocates on open, so it is intercepted before the
+    // ordinary path walk: there is no node to resolve to a terminal.
+    if abs == "/dev/ptmx" {
+        return match open_ptmx(task, accmode, flags & crate::vfs::F_SETFL_MASK) {
+            Some(fd) => fd,
+            None => errno::ENOMEM,
+        };
+    }
+
+    let node = match crate::vfs::resolve_checked(&abs, &cred) {
+        Ok(n) => n,
+        Err(crate::vfs::FsError::NotFound) if flags & crate::vfs::O_CREAT != 0 => {
+            let want = ((mode as u32) & driver_common::S_PERM_MASK) & !crate::cred::umask_of(task);
+            match crate::vfs::create_checked(
+                &abs,
+                crate::vfs::NodeKind::File,
+                cred.fsuid,
+                cred.fsgid,
+                want,
+                &cred,
+            ) {
+                Ok(n) => n,
+                Err(e) => return e.into(),
+            }
+        }
+        Err(e) => return e.into(),
+    };
+
+    // O_CREAT|O_EXCL: the file must not already exist.
+    if flags & (crate::vfs::O_CREAT | crate::vfs::O_EXCL) == crate::vfs::O_CREAT | crate::vfs::O_EXCL
+    {
+        return crate::abi::errno::EEXIST;
+    }
+
+    // Check the requested access modes against the resolved file.
+    let can_r = accmode != crate::vfs::O_WRONLY
+        && crate::cred::may_access(&cred, node.uid(), node.gid(), node.mode(), crate::cred::Access::Read);
+    let can_w = accmode != crate::vfs::O_RDONLY
+        && crate::cred::may_access(&cred, node.uid(), node.gid(), node.mode(), crate::cred::Access::Write);
+    if (accmode == crate::vfs::O_RDONLY && !can_r)
+        || (accmode == crate::vfs::O_WRONLY && !can_w)
+        || (accmode == crate::vfs::O_RDWR && !(can_r && can_w))
+    {
+        return crate::abi::errno::EACCES;
+    }
+
+    if flags & crate::vfs::O_TRUNC != 0 {
+        if node.kind() == crate::vfs::NodeKind::File {
+            if let Err(e) = node.truncate() {
+                return e.into();
+            }
+        }
+    }
+
+    acquire_controlling_tty(task, &node);
+
+    crate::vfs::fdtab::install_full(
+        task,
+        node,
+        accmode,
+        flags & crate::vfs::F_SETFL_MASK,
+    ) as i64
+}
+
+/// Claim `node` as the calling session's controlling terminal, if it is a
+/// terminal and nothing owns it yet.
+///
+/// This is the POSIX controlling-terminal rule, and it is what makes
+/// `TIOCGSID` meaningful and terminal-generated signals reach the session
+/// rather than a stray process.
+fn acquire_controlling_tty(task: usize, node: &crate::vfs::VnodeRef) {
+    if !node.is_terminal() {
+        return;
+    }
+    let sid = crate::task::sched::task_groups(task).1;
+    node.acquire_session(sid);
+}
+
+/// Open the pty multiplexer at `abs`.
+///
+/// `/dev/ptmx` is not a terminal: opening it allocates a *new* master/slave
+/// pair, publishes the slave as `/dev/pts<N>`, and installs the master as the
+/// descriptor's node. The caller finds `N` with `TIOCGPTN`, or derives it from
+/// the slave name it opens next.
+///
+/// A fixed `/dev/ptmx` bound to one pair would make every program that opened
+/// it share a single terminal, and whichever reader won the race would consume
+/// the other's keystrokes.
+fn open_ptmx(task: usize, accmode: u32, status: u32) -> Option<i64> {
+    let (master, index) = crate::drivers::pty::open_ptmx()?;
+    let name = alloc::format!("pts{}", index);
+    let slave = crate::drivers::pty::slave_of(&master);
+    if crate::vfs::devfs::register(&name, alloc::sync::Arc::new(
+        crate::drivers::pty::PtySlaveDevice::new(slave),
+    ))
+    .is_err()
+    {
+        return Some(errno::EIO);
+    }
+    let node = crate::vfs::devfs::anonymous(alloc::sync::Arc::new(
+        crate::drivers::pty::PtyMasterDevice::new(master),
+    ));
+    Some(crate::vfs::fdtab::install_full(task, node, accmode, status) as i64)
+}
+
+fn sys_close(fd: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match crate::vfs::fdtab::close(task, fd as usize) {
+        Ok(_) => 0,
+        Err(e) => e.into(),
+    }
+}
+
+fn sys_read(fd: u64, buf: u64, len: u64, _a3: u64, _a4: u64, _a5: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let mem = match unsafe { user_bytes(buf, len) } {
+        Some(m) => m,
+        None => return crate::abi::errno::EINVAL,
+    };
+    loop {
+        match crate::vfs::fdtab::read(task, fd as usize, mem) {
+            Ok(n) => return n as i64,
+            Err(e) if e.is_interrupted() => {
+                // `EINTR`: retry transparently when every deliverable signal
+                // requested `SA_RESTART`, otherwise surface it.
+                if crate::sig::should_restart() {
+                    crate::sig::defer_pending();
+                    continue;
+                }
+                return crate::abi::errno::EINTR;
+            }
+            Err(e) => return e.into(),
+        }
+    }
+}
+
+fn sys_write(fd: u64, buf: u64, len: u64, _a3: u64, _a4: u64, _a5: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let mem = match unsafe { user_bytes(buf, len) } {
+        Some(m) => m,
+        None => return crate::abi::errno::EINVAL,
+    };
+    loop {
+        match crate::vfs::fdtab::write(task, fd as usize, mem) {
+            Ok(n) => return n as i64,
+            Err(e) if e.is_interrupted() => {
+                if crate::sig::should_restart() {
+                    crate::sig::defer_pending();
+                    continue;
+                }
+                return crate::abi::errno::EINTR;
+            }
+            Err(e) => return e.into(),
+        }
+    }
+}
+
+/// Linux-compatible terminal ioctl request numbers supported by PTY slaves.
+/// The syscall itself is Samsara ABI; these request values make existing
+/// termios-oriented userspace straightforward to port.
+mod terminal_ioctl {
+    pub const TCGETS: u32 = 0x5401;
+    pub const TCSETS: u32 = 0x5402;
+    pub const TCSETSW: u32 = 0x5403;
+    pub const TCSETSF: u32 = 0x5404;
+    pub const TIOCGPGRP: u32 = 0x540F;
+    pub const TIOCSPGRP: u32 = 0x5410;
+    pub const TIOCGWINSZ: u32 = 0x5413;
+    pub const TIOCSWINSZ: u32 = 0x5414;
+    pub const FIONREAD: u32 = 0x541B;
+    pub const TIOCGSID: u32 = 0x5429;
+    pub const TCGETA: u32 = 0x5405;
+    pub const TCSETA: u32 = 0x5406;
+    pub const TCSETAW: u32 = 0x5407;
+    pub const TCSETAF: u32 = 0x5408;
+    pub const TCSBRK: u32 = 0x5409;
+    pub const TCXONC: u32 = 0x540A;
+    pub const TCFLSH: u32 = 0x540B;
+    pub const TIOCGPTN: u32 = 0x80045430;
+}
+
+/// Return the ABI argument size for a terminal ioctl request.
+///
+/// An unrecognized request returns `None`, which the caller turns into
+/// `ENOTTY`. That is what makes `isatty` work the portable way: a program
+/// calls `TCGETS` and a non-terminal answers `ENOTTY` because only terminals
+/// implement it.
+fn ioctl_arg_len(cmd: u32) -> Option<usize> {
+    use terminal_ioctl::*;
+    let termios = core::mem::size_of::<crate::drivers::pty::Termios>();
+    match cmd {
+        TCGETS | TCGETA | TCSETS | TCSETSW | TCSETSF | TCSETA | TCSETAW | TCSETAF => {
+            Some(termios)
+        }
+        TIOCGWINSZ | TIOCSWINSZ => Some(core::mem::size_of::<crate::drivers::pty::Winsize>()),
+        // These all take or return a single `int`/`pid_t`.
+        TIOCGPGRP | TIOCSPGRP | TIOCGSID | FIONREAD | TCXONC | TCFLSH | TIOCGPTN => Some(4),
+        TCSBRK => Some(4),
+        _ => None,
+    }
+}
+
+/// Dispatch a terminal/device control request through the descriptor's vnode.
+fn sys_ioctl(fd: u64, request: u64, arg: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(task) => task,
+        Err(e) => return e,
+    };
+    let cmd = request as u32;
+    if request != cmd as u64 {
+        return errno::EINVAL;
+    }
+    let len = match ioctl_arg_len(cmd) {
+        Some(len) => len,
+        None => return errno::ENOTTY,
+    };
+    let user = match unsafe { user_bytes(arg, len as u64) } {
+        Some(user) => user,
+        None => return errno::EINVAL,
+    };
+    // Drivers operate only on a bounded kernel-side copy; this prevents a
+    // driver from retaining or racing a userspace pointer.
+    let mut data = alloc::vec::Vec::from(&*user);
+    let node = match crate::vfs::fdtab::get(task, fd as usize) {
+        Ok(node) => node,
+        Err(e) => return e.into(),
+    };
+    match node.ioctl(cmd, &mut data) {
+        Ok(()) => {
+            user.copy_from_slice(&data);
+            0
+        }
+        Err(crate::vfs::FsError::NotSupported) => errno::ENOTTY,
+        Err(e) => e.into(),
+    }
+}
+
+fn sys_pipe(pair: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let mem = match unsafe { user_bytes(pair, 8) } {
+        Some(m) => m,
+        None => return crate::abi::errno::EINVAL,
+    };
+    let (read, write) = crate::pipe::create();
+    let fd_r = crate::vfs::fdtab::install(task, read);
+    let fd_w = crate::vfs::fdtab::install(task, write);
+    mem[..4].copy_from_slice(&(fd_r as u32).to_le_bytes());
+    mem[4..8].copy_from_slice(&(fd_w as u32).to_le_bytes());
+    0
+}
+
+/// One `poll` descriptor, shared verbatim with user space.
+#[repr(C)]
+struct PollFd {
+    /// Descriptor to poll; negative entries are skipped.
+    fd: i32,
+    /// Requested `POLL_*` event bits.
+    events: u16,
+    /// Result flags; the kernel fills this in before returning.
+    revents: u16,
+}
+
+/// Maximum number of descriptors accepted in one `POLL` call (bounds the
+/// kernel-side snapshot).
+const MAX_POLLFDS: usize = 128;
+
+/// Milliseconds per scheduler tick (the 100 Hz timer drive our timeout).
+fn ms_to_ticks(ms: u64) -> u64 {
+    ms.saturating_add(9) / 10
+}
+
+/// `poll(fds, nfds, timeout_ms)`: report which descriptors are ready, waiting
+/// (event-driven or timer-paced) for the first readiness among them.
+///
+/// Blocking policy follows the rest of the kernel: the readiness probe and the
+/// poller registration happen under each vnode's lock ([`Vnode::poll_park`]),
+/// so a concurrent state change can never be missed; the task parks with
+/// [`crate::task::sched::block_until`] and wakes on the first event or the
+/// timeout deadline.
+fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    // `timeout_ms` is interpreted as signed: -1 = wait indefinitely.
+    let tmo = timeout_ms as i64;
+    let n = nfds as usize;
+    if n > MAX_POLLFDS {
+        return crate::abi::errno::EINVAL;
+    }
+
+    // No descriptors: never ready; honor the timeout as a plain sleep.
+    if n == 0 {
+        if tmo < 0 {
+            loop {
+                crate::task::sched::block_until(None);
+                if crate::sig::deliverable_now() {
+                    return if crate::sig::should_restart() {
+                        crate::sig::defer_pending();
+                        0
+                    } else {
+                        crate::abi::errno::EINTR
+                    };
+                }
+            }
+        }
+        if tmo > 0 && crate::task::sched::sleep_ticks_interruptible(ms_to_ticks(tmo as u64)) {
+            return crate::abi::errno::EINTR;
+        }
+        return 0;
+    }
+
+    let sz = n * core::mem::size_of::<PollFd>();
+    let mem = match unsafe { user_bytes(fds, sz as u64) } {
+        Some(m) => m,
+        None => return crate::abi::errno::EINVAL,
+    };
+
+    // Kernel-side snapshot; `revents` starts zeroed so nothing stale is ever
+    // reported back to the caller.
+    let mut polls: alloc::vec::Vec<PollFd> = alloc::vec::Vec::with_capacity(n);
+    let pfsize = core::mem::size_of::<PollFd>();
+    for i in 0..n {
+        let off = i * pfsize;
+        polls.push(PollFd {
+            fd: i32::from_ne_bytes([mem[off], mem[off + 1], mem[off + 2], mem[off + 3]]),
+            events: u16::from_ne_bytes([mem[off + 4], mem[off + 5]]),
+            revents: 0,
+        });
+    }
+
+    let mut flush = |polls: &[PollFd]| {
+        for (i, p) in polls.iter().enumerate() {
+            let off = i * pfsize + 6;
+            mem[off..off + 2].copy_from_slice(&p.revents.to_ne_bytes());
+        }
+    };
+
+    let deadline: Option<u64> = if tmo > 0 {
+        Some(crate::time::ticks() + ms_to_ticks(tmo as u64))
+    } else {
+        None
+    };
+
+    loop {
+        // A deliverable signal interrupts the wait (`EINTR`), or restarts it
+        // transparently when every deliverable handler asked for `SA_RESTART`.
+        if crate::sig::deliverable_now() {
+            if crate::sig::should_restart() {
+                crate::sig::defer_pending();
+            } else {
+                return crate::abi::errno::EINTR;
+            }
+        }
+
+        // Snapshot the target vnodes so a descriptor closed mid-poll is stable
+        // across the whole iteration.
+        let mut nodes: alloc::vec::Vec<Option<(crate::vfs::VnodeRef, u32)>> =
+            alloc::vec::Vec::with_capacity(n);
+        for p in &polls {
+            if p.fd < 0 {
+                nodes.push(None);
+                continue;
+            }
+            nodes.push(crate::vfs::fdtab::get_with_access(task, p.fd as usize).ok());
+        }
+
+        // Compute readiness; `POLLNVAL` for bad descriptors, and a descriptor
+        // opened without read/write access can never satisfy the masked side.
+        let mut ready = 0usize;
+        for (i, p) in polls.iter_mut().enumerate() {
+            let rev = match &nodes[i] {
+                None => driver_common::POLLNVAL,
+                Some((node, access)) => {
+                    let full = node.poll_events(p.events);
+                    let mut r = full & p.events;
+                    // EOF / error are always reported, requested or not.
+                    r |= full & (driver_common::POLLHUP | driver_common::POLLERR);
+                    if *access == crate::vfs::O_WRONLY {
+                        r &= !driver_common::POLLIN;
+                    }
+                    if *access == crate::vfs::O_RDONLY {
+                        r &= !driver_common::POLLOUT;
+                    }
+                    r
+                }
+            };
+            p.revents = rev;
+            if rev != 0 {
+                ready += 1;
+            }
+        }
+        if ready > 0 {
+            flush(&polls);
+            return ready as i64;
+        }
+        if tmo == 0 {
+            flush(&polls);
+            return 0;
+        }
+        if let Some(dl) = deadline {
+            if crate::time::ticks() >= dl {
+                flush(&polls);
+                return 0;
+            }
+        }
+
+        // Park on every pollable that is still not ready. Each vnode re-checks
+        // and registers under its own lock, so an event between this probe and
+        // the registration wakes us instead of being lost.
+        let mut became = false;
+        for (i, slot) in nodes.iter().enumerate() {
+            if polls[i].fd < 0 {
+                continue;
+            }
+            if let Some((node, _)) = slot {
+                if node.poll_park(task) {
+                    became = true;
+                }
+            }
+        }
+        if became {
+            // A node reported ready while parking: drop the registrations we
+            // just made and re-probe from the top.
+            for slot in &nodes {
+                if let Some((node, _)) = slot {
+                    node.poll_cancel(task);
+                }
+            }
+            continue;
+        }
+
+        // Block until a registered waiter fires or the timeout deadline passes.
+        // PTY vnodes have no event-driven wakeup, so a deadline is what makes
+        // the loop re-probe them.
+        crate::task::sched::clear_timeout();
+        crate::task::sched::block_until(deadline);
+        crate::task::sched::clear_timeout();
+
+        // Drop our registrations; the loop re-probes readiness from scratch.
+        for slot in &nodes {
+            if let Some((node, _)) = slot {
+                node.poll_cancel(task);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stat / permission / credential syscalls
+// ---------------------------------------------------------------------------
+
+/// Minimal `stat` result written into user memory by `STAT`.
+#[repr(C)]
+struct AbiStat {
+    /// Permission mode bits (see `S_*`).
+    mode: u32,
+    /// Owner user id.
+    uid: u32,
+    /// Owner group id.
+    gid: u32,
+    /// Node kind (`NodeKind` discriminant).
+    kind: u32,
+    /// Current size in bytes.
+    size: u64,
+}
+
+/// Full `stat` result written into user memory by `FSTAT`.
+///
+/// [`AbiStat`] answers "what is at this path" with the five fields the oldest
+/// part of the ABI needed. This is the whole POSIX `struct stat` content, kept
+/// to what the kernel actually knows:
+///
+///   * `dev` and `ino` give a file its identity. `ls -i`, a shell's tab
+///     completion, and `cp -l` all key off the pair, and a filesystem that
+///     reports neither makes every file look like every other file.
+///   * `nlink` is 1 because this kernel has no hard links. That is the truth,
+///     and a program testing `nlink > 1` to find "other names for this file"
+///     correctly finds none.
+///   * the timestamps come from the node's own clock, so `ls -l` and `tar` have
+///     something real to print. All three are set to the same value: atime
+///     tracking is not implemented, and inventing a separate atime that never
+///     moves would be worse than reporting mtime for both.
+#[repr(C)]
+struct AbiStatEx {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    kind: u32,
+    size: u64,
+    dev: u32,
+    /// Padding so `ino` lands on its natural 8-byte boundary, matching the
+    /// alignment a C `struct` with these members in this order would produce.
+    _pad: u32,
+    ino: u64,
+    nlink: u64,
+    atime: i64,
+    atime_nsec: u32,
+    mtime: i64,
+    mtime_nsec: u32,
+    ctime: i64,
+    ctime_nsec: u32,
+    /// Total bytes allocated, in 512-byte blocks, as `st_blocks`.
+    blocks: u64,
+    blksize: u32,
+    _pad2: u32,
+}
+
+impl AbiStatEx {
+    /// Build the answer for `node`.
+    fn of(node: &dyn crate::vfs::Vnode) -> Self {
+        let size = node.size_hint();
+        let (secs, nanos) = node.mtime().unwrap_or((0, 0));
+        AbiStatEx {
+            mode: node.mode(),
+            uid: node.uid(),
+            gid: node.gid(),
+            kind: node.kind() as u32,
+            size,
+            dev: node.device(),
+            _pad: 0,
+            ino: node.inode(),
+            nlink: 1,
+            atime: secs,
+            atime_nsec: nanos,
+            mtime: secs,
+            mtime_nsec: nanos,
+            ctime: secs,
+            ctime_nsec: nanos,
+            blocks: (size + 511) / 512,
+            blksize: 4096,
+            _pad2: 0,
+        }
+    }
+}
+
+fn sys_device_mmap(fd: u64, offset: u64, len: u64, prot: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if len == 0 {
+        return errno::EINVAL;
+    }
+    // Linux's PROT_* bits, unmodified, so a program computing them from its own
+    // <sys/mman.h> agrees with us.
+    const PROT_READ: u64 = 1;
+    const PROT_WRITE: u64 = 2;
+    const PROT_EXEC: u64 = 4;
+    if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+        return errno::EINVAL;
+    }
+    let node = match crate::vfs::fdtab::node_of(task, fd as usize) {
+        Ok(n) => n,
+        Err(e) => return e.into(),
+    };
+    // Only a node that declares a physical range can be mapped this way. A
+    // regular file answers `None`, and inventing a range for one would hand a
+    // process a way to map kernel memory.
+    let (base_phys, base_len) = match node.mmap_phys() {
+        Some(r) => r,
+        None => return errno::ENODEV,
+    };
+    // Reject a request that runs off the end of the device rather than
+    // clamping it: a partial map would fault on the last page, which is a much
+    // worse failure than a refusal at mmap time.
+    let end = match offset.checked_add(len) {
+        Some(e) if e <= base_len => e,
+        _ => return errno::EINVAL,
+    };
+    // Map a device range as uncached and write-through. That is not an
+    // optimization detail: a framebuffer is memory the device writes to behind
+    // our back, so a cached mapping can show stale pixels indefinitely. This is
+    // the same flag set the Rust runtime uses for `MAP_PHYS`.
+    let mut flags = crate::memory::vmm::USER_ACCESSIBLE | crate::memory::vmm::NO_EXECUTE;
+    if prot & PROT_WRITE != 0 {
+        flags |= crate::memory::vmm::WRITABLE;
+    }
+    // `map_phys` takes a frame count; round up so the final partial frame is
+    // mapped. The device range is already whole-frame aligned in practice, but
+    // rounding here means a caller asking for an odd length still gets a
+    // usable mapping rather than a page fault on its last page.
+    let frames = (len as usize).div_ceil(crate::memory::pmm::FRAME_SIZE);
+    match crate::memory::user_map::map_phys(base_phys + offset, frames, flags) {
+        Some(va) => va as i64,
+        None => errno::EPERM,
+    }
+}
+
+fn sys_munmap(va: u64, size: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match crate::memory::user_map::unmap_anon(va as usize, size as usize) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_mprotect(va: u64, size: u64, prot: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match crate::memory::user_map::protect_anon(va as usize, size as usize, prot as u32) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_getrandom(buf: u64, len: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    // Bound the request. A caller asking for an absurd amount is either buggy
+    // or hostile, and copying it would let a ring-3 process dictate how long
+    // the kernel spends in a loop with interrupts off.
+    const MAX_RANDOM: u64 = 1 << 20;
+    if len > MAX_RANDOM {
+        return errno::EINVAL;
+    }
+    let mem = match unsafe { user_bytes(buf, len) } {
+        Some(m) => m,
+        None => return errno::EFAULT,
+    };
+    // Any entropy instruction can report failure transiently; `fill` retries and
+    // then declines rather than leaving part of the buffer untouched. A short
+    // fill returned as success would hand back stale stack bytes, which is the
+    // same failure as not filling it at all.
+    if !crate::entropy::fill(mem) {
+        return errno::ENOSYS;
+    }
+    len as i64
+}
+
+fn sys_fstat(fd: u64, out: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    // Log the layout once. The libc side asserts the same numbers, but a
+    // disagreement would show up as a `struct stat` full of plausible garbage
+    // rather than as a crash, so make the size visible in the log.
+    static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        crate::log::kdebug!(
+            "abi: AbiStatEx size={} mtime@{} blocks@{}",
+            core::mem::size_of::<AbiStatEx>(),
+            core::mem::offset_of!(AbiStatEx, mtime),
+            core::mem::offset_of!(AbiStatEx, blocks),
+        );
+    }
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    // Look the descriptor up rather than resolving a path: this is the whole
+    // point of the call, since a descriptor may name a pipe or a terminal,
+    // neither of which has a name.
+    let node = match crate::vfs::fdtab::node_of(task, fd as usize) {
+        Ok(n) => n,
+        Err(e) => return e.into(),
+    };
+    let st = AbiStatEx::of(node.as_ref());
+    let mem = match unsafe { user_bytes(out, core::mem::size_of::<AbiStatEx>() as u64) } {
+        Some(m) => m,
+        None => return errno::EINVAL,
+    };
+    // SAFETY: `AbiStatEx` is `repr(C)` with no padding holes the compiler
+    // chose (every gap is explicit), and `mem` is exactly its size.
+    unsafe {
+        core::ptr::write_unaligned(
+            mem.as_mut_ptr() as *mut AbiStatEx,
+            st,
+        );
+    }
+    0
+}
+
+fn sys_stat(path: u64, path_len: u64, out: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let path = match user_str(path, path_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let cred = crate::cred::get(task);
+    let node = match crate::vfs::resolve_checked(&task_abs_path(&path), &cred) {
+        Ok(n) => n,
+        Err(e) => return e.into(),
+    };
+    let st = AbiStat {
+        mode: node.mode(),
+        uid: node.uid(),
+        gid: node.gid(),
+        kind: node.kind() as u32,
+        size: node.size_hint(),
+    };
+    let sz = core::mem::size_of::<AbiStat>();
+    if unsafe { user_bytes(out, sz as u64) }.is_none() {
+        return errno::EINVAL;
+    }
+    // SAFETY: [out, out+sz) was validated by `user_bytes` above.
+    unsafe {
+        core::ptr::copy_nonoverlapping(&st as *const AbiStat as *const u8, out as *mut u8, sz);
+    }
+    0
+}
+
+fn sys_chmod(path: u64, path_len: u64, mode: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let path = match user_str(path, path_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let cred = crate::cred::get(task);
+    let node = match crate::vfs::resolve_checked(&task_abs_path(&path), &cred) {
+        Ok(n) => n,
+        Err(e) => return e.into(),
+    };
+    // Only the owner (or a privileged process) may chmod.
+    if cred.fsuid != node.uid() && !cred.is_privileged() {
+        return errno::EPERM;
+    }
+    let mut m = (mode as u32) & driver_common::S_PERM_MASK;
+    // Unprivileged chmod clears the setuid/setgid bits.
+    if !cred.is_privileged() {
+        m &= !(driver_common::S_ISUID | driver_common::S_ISGID);
+    }
+    match node.set_mode(m) {
+        Ok(()) => 0,
+        Err(e) => e.into(),
+    }
+}
+
+fn sys_chown(path: u64, path_len: u64, uid: u64, gid: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let path = match user_str(path, path_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let uid = uid as u32;
+    let gid = gid as u32;
+    let cred = crate::cred::get(task);
+    let node = match crate::vfs::resolve_checked(&task_abs_path(&path), &cred) {
+        Ok(n) => n,
+        Err(e) => return e.into(),
+    };
+    let uid_changed = uid != u32::MAX;
+    let gid_changed = gid != u32::MAX;
+    let priv_ = cred.is_privileged();
+    let owner = cred.fsuid == node.uid();
+
+    // Changing the owner requires privilege; the owner may change the group
+    // only to a group the caller belongs to.
+    if uid_changed && !priv_ {
+        return errno::EPERM;
+    }
+    if gid_changed && !priv_ {
+        let gid_ok = owner && (cred.fsgid == gid || cred.groups.iter().any(|&g| g == gid));
+        if !gid_ok {
+            return errno::EPERM;
+        }
+    }
+    let target_uid = if uid_changed { uid } else { u32::MAX };
+    let target_gid = if gid_changed { gid } else { u32::MAX };
+    if let Err(e) = node.set_owner(target_uid, target_gid) {
+        return e.into();
+    }
+    // Ownership changes clear the setuid/setgid bits for unprivileged callers.
+    if !priv_ {
+        let _ = node.set_mode(node.mode() & !(driver_common::S_ISUID | driver_common::S_ISGID));
+    }
+    0
+}
+
+fn sys_kill(pid: u64, sig: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    crate::sig::kill(pid, sig as u32)
+}
+
+fn sys_getuid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match current_cred() {
+        Ok(c) => c.uid as i64,
+        Err(e) => e,
+    }
+}
+
+fn sys_getgid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match current_cred() {
+        Ok(c) => c.gid as i64,
+        Err(e) => e,
+    }
+}
+
+fn sys_geteuid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match current_cred() {
+        Ok(c) => c.euid as i64,
+        Err(e) => e,
+    }
+}
+
+fn sys_getegid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match current_cred() {
+        Ok(c) => c.egid as i64,
+        Err(e) => e,
+    }
+}
+
+fn sys_getresuid(out: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let c = match current_cred() {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    write_u32s(out, &[c.uid, c.euid, c.suid])
+}
+
+fn sys_getresgid(out: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let c = match current_cred() {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    write_u32s(out, &[c.gid, c.egid, c.sgid])
+}
+
+/// Copy a slice of `u32`s into a user buffer as little-endian words.
+fn write_u32s(out: u64, words: &[u32]) -> i64 {
+    let sz = words.len() * 4;
+    let mem = match unsafe { user_bytes(out, sz as u64) } {
+        Some(m) => m,
+        None => return errno::EINVAL,
+    };
+    let n = words.len().min(mem.len() / 4);
+    for (i, w) in words.iter().take(n).enumerate() {
+        mem[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    0
+}
+
+fn sys_getgroups(count: u64, list: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let c = match current_cred() {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let n = c.groups.len() as i64;
+    if count == 0 || list == 0 {
+        return n;
+    }
+    let take = (count.min(c.groups.len() as u64)) as usize;
+    let _ = write_u32s(list, &c.groups[..take]);
+    n
+}
+
+fn sys_setgroups(count: u64, list: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    const MAX_GROUPS: usize = 64;
+    let count = count.min(MAX_GROUPS as u64) as usize;
+    let sz = count * 4;
+    let mem = match unsafe { user_bytes(list, sz as u64) } {
+        Some(m) => m,
+        None => return errno::EINVAL,
+    };
+    let mut groups = alloc::vec::Vec::with_capacity(count);
+    for i in 0..count {
+        groups.push(u32::from_le_bytes([
+            mem[i * 4],
+            mem[i * 4 + 1],
+            mem[i * 4 + 2],
+            mem[i * 4 + 3],
+        ]));
+    }
+    match crate::cred::update(task, |c| c.setgroups(groups)) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_setuid(uid: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match crate::cred::update(task, |c| c.setuid(uid as u32)) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_setgid(gid: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match crate::cred::update(task, |c| c.setgid(gid as u32)) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_seteuid(euid: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match crate::cred::update(task, |c| c.seteuid(euid as u32)) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_setegid(egid: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match crate::cred::update(task, |c| c.setegid(egid as u32)) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_setreuid(ruid: u64, euid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match crate::cred::update(task, |c| c.setreuid(ruid as u32, euid as u32)) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_setregid(rgid: u64, egid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match crate::cred::update(task, |c| c.setregid(rgid as u32, egid as u32)) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_setresuid(ruid: u64, euid: u64, suid: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match crate::cred::update(task, |c| c.setresuid(ruid as u32, euid as u32, suid as u32)) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_setresgid(rgid: u64, egid: u64, sgid: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match crate::cred::update(task, |c| c.setresgid(rgid as u32, egid as u32, sgid as u32)) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_setfsuid(fsuid: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let mut old = 0u32;
+    let _ = crate::cred::update(task, |c| {
+        old = c.setfsuid(fsuid as u32);
+        Ok(())
+    });
+    old as i64
+}
+
+fn sys_setfsgid(fsgid: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let mut old = 0u32;
+    let _ = crate::cred::update(task, |c| {
+        old = c.setfsgid(fsgid as u32);
+        Ok(())
+    });
+    old as i64
+}
+
+fn sys_umask(mask: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    crate::cred::set_umask(task, mask as u32) as i64
+}
+
+// ---------------------------------------------------------------------------
+// Signal syscalls
+// ---------------------------------------------------------------------------
+
+/// # Safety
+/// Unaligned-copies a user-provided [`crate::sig::SigAction`] after range
+/// validation.
+unsafe fn read_sigaction(ptr: u64, out: &mut crate::sig::SigAction) -> bool {
+    let sz = core::mem::size_of::<crate::sig::SigAction>() as u64;
+    match unsafe { user_bytes(ptr, sz) } {
+        Some(buf) => {
+            // SAFETY: buffer is validated, `out` is `u64`-aligned kernel stack.
+            unsafe {
+                *out = (buf.as_ptr() as *const crate::sig::SigAction).read_unaligned();
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// # Safety
+/// Range-validated write of a [`crate::sig::SigAction`] to user memory.
+unsafe fn write_sigaction(ptr: u64, a: &crate::sig::SigAction) -> bool {
+    let sz = core::mem::size_of::<crate::sig::SigAction>() as u64;
+    match unsafe { user_bytes(ptr, sz) } {
+        Some(buf) => {
+            // SAFETY: buffer is validated, `a` is a kernel-owned struct.
+            unsafe {
+                (buf.as_mut_ptr() as *mut crate::sig::SigAction).write_unaligned(*a);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// # Safety
+/// Range-validated user read of a 64-bit value.
+unsafe fn read_u64(ptr: u64, out: &mut u64) -> bool {
+    match unsafe { user_bytes(ptr, 8) } {
+        Some(buf) => {
+            let bytes = unsafe { core::slice::from_raw_parts(buf.as_ptr(), 8) };
+            *out = u64::from_le_bytes(bytes.try_into().unwrap());
+            true
+        }
+        None => false,
+    }
+}
+
+/// # Safety
+/// Range-validated user write of a 64-bit value.
+unsafe fn write_u64(ptr: u64, v: u64) -> bool {
+    match unsafe { user_bytes(ptr, 8) } {
+        Some(buf) => {
+            buf[..8].copy_from_slice(&v.to_le_bytes());
+            true
+        }
+        None => false,
+    }
+}
+
+fn sys_nanosleep(ms: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    // 100 Hz timer tick = 10 ms.
+    let ticks = ms.saturating_add(9) / 10;
+    if crate::task::sched::sleep_ticks_interruptible(ticks) {
+        errno::EINTR // never restarted (POSIX)
+    } else {
+        0
+    }
+}
+
+fn sys_get_pid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match crate::task::sched::current_task_id() {
+        Some(t) => t.0 as i64,
+        None => errno::EPERM,
+    }
+}
+
+fn sys_sigaction(sig: u64, act: u64, oldact: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if sig == 0 {
+        // Signal 0 is the POSIX existence probe: "may I signal this?". It is
+        // not a signal that can be installed, so `EINVAL` is the honest answer.
+        return errno::EINVAL;
+    }
+    if sig > crate::sig::SIG_MAX as u64 {
+        // A signal number this kernel does not implement -- glibc's `SIGCANCEL`
+        // (32) is the one that actually turns up, because a libc probing for
+        // thread-cancellation support installs it.
+        //
+        // ENOSYS, not EINVAL, and the distinction is load-bearing rather than
+        // pedantic: mlibc's pthread setup treats ENOSYS as "cancellation is
+        // unavailable, carry on without it" and calls `__ensure` on anything
+        // else, so reporting EINVAL turns a routine capability probe into a
+        // panic before `main` ever runs. `EINVAL` is for a malformed argument;
+        // a well-formed signal this kernel simply has no support for is
+        // precisely "not implemented".
+        return errno::ENOSYS;
+    }
+    let mut a = crate::sig::SigAction {
+        sa_handler: 0,
+        sa_flags: 0,
+        sa_restorer: 0,
+        sa_mask: 0,
+    };
+    let have_act = act != 0 && unsafe { read_sigaction(act, &mut a) };
+    if act != 0 && !have_act {
+        return errno::EINVAL;
+    }
+    let mut old = crate::sig::SigAction {
+        sa_handler: 0,
+        sa_flags: 0,
+        sa_restorer: 0,
+        sa_mask: 0,
+    };
+    let r = crate::sig::sigaction(
+        task,
+        sig as u32,
+        if have_act { Some(&a) } else { None },
+        if oldact != 0 { Some(&mut old) } else { None },
+    );
+    if r < 0 {
+        return r;
+    }
+    if oldact != 0 && !unsafe { write_sigaction(oldact, &old) } {
+        return errno::EINVAL;
+    }
+    0
+}
+
+fn sys_sigprocmask(how: u64, set: u64, oldset: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let mut new = 0u64;
+    let have_set = set != 0 && unsafe { read_u64(set, &mut new) };
+    if set != 0 && !have_set {
+        return errno::EINVAL;
+    }
+    let mut old = 0u64;
+    let r = crate::sig::sigprocmask(
+        task,
+        how,
+        if have_set { Some(new) } else { None },
+        if oldset != 0 { Some(&mut old) } else { None },
+    );
+    if r < 0 {
+        return r;
+    }
+    if oldset != 0 && !unsafe { write_u64(oldset, old) } {
+        return errno::EINVAL;
+    }
+    0
+}
+
+fn sys_sigpending(set: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if set == 0 {
+        return errno::EINVAL;
+    }
+    if !unsafe { write_u64(set, crate::sig::sigpending(task)) } {
+        return errno::EINVAL;
+    }
+    0
+}
+
+fn sys_sigsuspend(mask: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    crate::sig::sigsuspend(mask)
+}
+
+fn sys_sigaltstack(ss: u64, old_ss: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let sz = core::mem::size_of::<crate::sig::AltStack>() as u64;
+    let mut a = crate::sig::AltStack {
+        ss_base: 0,
+        ss_size: 0,
+        ss_flags: 0,
+    };
+    let have_ss = ss != 0
+        && match unsafe { user_bytes(ss, sz) } {
+            Some(buf) => {
+                unsafe {
+                    a = (buf.as_ptr() as *const crate::sig::AltStack).read_unaligned();
+                }
+                true
+            }
+            None => false,
+        };
+    if ss != 0 && !have_ss {
+        return errno::EINVAL;
+    }
+    let mut old = crate::sig::AltStack {
+        ss_base: 0,
+        ss_size: 0,
+        ss_flags: 0,
+    };
+    let r = crate::sig::sigaltstack(
+        task,
+        if have_ss { Some(&a) } else { None },
+        if old_ss != 0 { Some(&mut old) } else { None },
+    );
+    if r < 0 {
+        return r;
+    }
+    if old_ss != 0 {
+        match unsafe { user_bytes(old_ss, sz) } {
+            Some(buf) => {
+                unsafe {
+                    (buf.as_mut_ptr() as *mut crate::sig::AltStack).write_unaligned(old);
+                }
+            }
+            None => return errno::EINVAL,
+        }
+    }
+    0
+}
+
+fn sys_sigreturn(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    crate::sig::sigreturn()
+}
+
+// ---------------------------------------------------------------------------
+// IPC / process syscalls (the microkernel surface)
+// ---------------------------------------------------------------------------
+
+/// Copy a user-provided [`MsgFrame`] into a kernel-owned buffer.
+fn read_msg_frame(ptr: u64) -> Result<Box<MsgFrame>, i64> {
+    let sz = core::mem::size_of::<MsgFrame>();
+    if validate_range(ptr as usize, sz) < sz {
+        return Err(errno::EINVAL);
+    }
+    let m = Box::new(MsgFrame::new());
+    // SAFETY: the whole range [ptr, ptr+sz) is validated above, and `m` is a
+    // kernel-owned buffer we may write freely.
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr as *const u8, (&*m as *const MsgFrame) as *mut u8, sz);
+    }
+    Ok(m)
+}
+
+/// Copy an in-kernel [`MsgFrame`] back into a user buffer.
+fn write_msg_frame(ptr: u64, f: &MsgFrame) -> Result<(), i64> {
+    let sz = core::mem::size_of::<MsgFrame>();
+    if validate_range(ptr as usize, sz) < sz {
+        return Err(errno::EINVAL);
+    }
+    // SAFETY: the whole range is validated above.
+    unsafe {
+        core::ptr::copy_nonoverlapping(f as *const MsgFrame as *const u8, ptr as *mut u8, sz);
+    }
+    Ok(())
+}
+
+/// Translate an [`MsgFrame`] into an in-kernel [`crate::ipc::Message`].
+fn frame_to_message(frame: &MsgFrame, kind: crate::ipc::MsgKind, from: u64, to: u64) -> crate::ipc::Message {
+    crate::ipc::Message {
+        kind,
+        from,
+        to,
+        call_id: frame.call_id,
+        tag: frame.tag,
+        args: frame.args,
+        data: frame.payload().to_vec(),
+    }
+}
+
+/// Serialize a kernel [`crate::ipc::Message`] into a user [`MsgFrame`].
+fn message_to_frame(m: &crate::ipc::Message) -> MsgFrame {
+    let mut f = MsgFrame::new();
+    f.tag = m.tag;
+    f.from = m.from as u32;
+    f.call_id = m.call_id;
+    f.args = m.args;
+    f.kind = m.kind as u32;
+    let n = m.data.len().min(crate::ipc::MAX_MSG_DATA);
+    f.data_len = n as u32;
+    f.data[..n].copy_from_slice(&m.data[..n]);
+    f
+}
+
+fn sys_ipc_send(dst: u64, frame: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let ep = match crate::task::sched::current_endpoint() {
+        Some(e) => e,
+        None => return errno::EPERM,
+    };
+    let f = match read_msg_frame(frame) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let msg = frame_to_message(&f, crate::ipc::MsgKind::Notify, ep, dst);
+    match crate::ipc::send(dst, msg) {
+        Ok(()) => 0,
+        Err(e) => e.to_abi(),
+    }
+}
+
+fn sys_ipc_reply(dst: u64, call_id: u64, frame: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let ep = match crate::task::sched::current_endpoint() {
+        Some(e) => e,
+        None => return errno::EPERM,
+    };
+    let f = match read_msg_frame(frame) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let mut msg = frame_to_message(&f, crate::ipc::MsgKind::Reply, ep, dst);
+    msg.call_id = call_id;
+    match crate::ipc::send(dst, msg) {
+        Ok(()) => 0,
+        Err(e) => e.to_abi(),
+    }
+}
+
+fn sys_ipc_recv(frame: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let ep = match crate::task::sched::current_endpoint() {
+        Some(e) => e,
+        None => return errno::EPERM,
+    };
+    // Block until a message is delivered to this endpoint.
+    loop {
+        match crate::ipc::recv_wait(ep) {
+            crate::ipc::RecvWait::Message(msg) => {
+                let f = message_to_frame(&msg);
+                return match write_msg_frame(frame, &f) {
+                    Ok(()) => 0,
+                    Err(e) => e,
+                };
+            }
+            crate::ipc::RecvWait::Interrupted => {
+                if crate::sig::should_restart() {
+                    crate::sig::defer_pending();
+                    continue;
+                }
+                return errno::EINTR;
+            }
+            crate::ipc::RecvWait::Gone => return errno::ENOENT,
+        }
+    }
+}
+
+fn sys_ipc_call(dst: u64, frame: u64, reply: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let ep = match crate::task::sched::current_endpoint() {
+        Some(e) => e,
+        None => return errno::EPERM,
+    };
+    let f = match read_msg_frame(frame) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let call_id = crate::ipc::gen_call_id();
+    {
+        let mut msg = frame_to_message(&f, crate::ipc::MsgKind::Call, ep, dst);
+        msg.call_id = call_id;
+        if let Err(e) = crate::ipc::send(dst, msg) {
+            return e.to_abi();
+        }
+    }
+    // Wait for the matching Reply; requeue anything else we wake up for.
+    loop {
+        match crate::ipc::recv_wait(ep) {
+            crate::ipc::RecvWait::Message(msg) => {
+                if msg.kind == crate::ipc::MsgKind::Reply && msg.call_id == call_id && msg.from == dst
+                {
+                    let f = message_to_frame(&msg);
+                    return match write_msg_frame(reply, &f) {
+                        Ok(()) => 0,
+                        Err(e) => e,
+                    };
+                }
+                crate::ipc::requeue(msg);
+            }
+            crate::ipc::RecvWait::Interrupted => {
+                if crate::sig::should_restart() {
+                    crate::sig::defer_pending();
+                    continue;
+                }
+                return errno::EINTR;
+            }
+            crate::ipc::RecvWait::Gone => return errno::ENOENT,
+        }
+    }
+}
+
+fn sys_get_epid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match crate::task::sched::current_endpoint() {
+        Some(e) => e as i64,
+        None => errno::EPERM,
+    }
+}
+
+fn sys_proc_exit(code: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    crate::log::kinfo!("proc: process exiting (status {})", code as i32);
+    crate::task::sched::exit_current(code as i32)
+}
+
+fn sys_fork(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match crate::task::sched::fork_current() {
+        Ok(pid) => pid.0 as i64,
+        Err(e) => e,
+    }
+}
+
+fn sys_exec(prog: u64, argv: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    // argv is a user pointer to the new image's argument vector; the array and
+    // its strings are copied before the address space is abandoned.
+    let args = unsafe { read_argv(argv) };
+    match crate::task::sched::exec_current(prog as usize, args) {
+        // exec_current only returns on failure; success abandons this frame.
+        Err(e) => e,
+        Ok(()) => errno::ENOENT,
+    }
+}
+
+fn sys_waitpid(pid: u64, status_ptr: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    loop {
+        // A deliverable signal interrupts the wait (or restarts it).
+        if crate::sig::deliverable_now() {
+            if crate::sig::should_restart() {
+                crate::sig::defer_pending();
+            } else {
+                return errno::EINTR;
+            }
+        }
+        match crate::task::sched::waitpid(pid as usize) {
+            crate::task::sched::WaitResult::Reaped(status) => {
+                let bytes = match unsafe { user_bytes(status_ptr, 8) } {
+                    Some(b) => b,
+                    None => return errno::EINVAL,
+                };
+                bytes[..4].copy_from_slice(&(status).to_le_bytes());
+                return 0;
+            }
+            // We were blocked; the child died while we slept. Retry to reap.
+            crate::task::sched::WaitResult::Wait => continue,
+            crate::task::sched::WaitResult::Err(e) => return e,
+        }
+    }
+}
+
+fn sys_proc_spawn(prog: u64, argv: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let args = unsafe { read_argv(argv) };
+    match crate::user::spawn_program_args(prog as usize, args) {
+        Ok(pid) => pid.0 as i64,
+        Err(_) => errno::ENOENT,
+    }
+}
+
+fn sys_get_args(buf: u64, cap: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match copy_args_out(task, buf, cap) {
+        Ok(n) => n,
+        Err(e) => e,
+    }
+}
+
+fn sys_get_env(buf: u64, cap: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    // A process spawned before the environment existed (or one that inherited
+    // an empty set) still gets a usable answer rather than a zero-length one,
+    // so a caller walking the result never has to special-case it.
+    let env = crate::task::sched::task_env(task);
+    let env = if env.is_empty() {
+        crate::user::default_env(&crate::task::sched::task_cwd(task))
+    } else {
+        env
+    };
+    match copy_strvec_out(&env, buf, cap) {
+        Ok(n) => n,
+        Err(e) => e,
+    }
+}
+
+fn sys_setpgid(pid: u64, pgid: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    // `pid == 0` addresses the caller, matching POSIX.
+    let target = if pid == 0 { task } else { pid as usize };
+    // `pgid == 0` means "use the target's pid", i.e. make it a group leader.
+    let want = if pgid == 0 {
+        target as u32
+    } else {
+        pgid as u32
+    };
+    if crate::task::sched::setpgid(target, want) {
+        0
+    } else {
+        errno::EPERM
+    }
+}
+
+fn sys_getpgrp(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    if current_task().is_err() {
+        return errno::EPERM;
+    }
+    crate::task::sched::current_pgid() as i64
+}
+
+fn sys_getpgid(pid: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let target = if pid == 0 { task } else { pid as usize };
+    let (pgid, _) = crate::task::sched::task_groups(target);
+    if pgid == 0 {
+        errno::ESRCH
+    } else {
+        pgid as i64
+    }
+}
+
+fn sys_setsid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match crate::task::sched::setsid() {
+        Ok(sid) => sid as i64,
+        Err(e) => e,
+    }
+}
+
+fn sys_getsid(pid: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let target = if pid == 0 { task } else { pid as usize };
+    let (_, sid) = crate::task::sched::task_groups(target);
+    if sid == 0 {
+        errno::ESRCH
+    } else {
+        sid as i64
+    }
+}
+
+/// Install `base` as the calling process's FS base.
+///
+/// A libc keeps its TCB pointer in FS and reloads it on every call through the
+/// red zone, so this has to work before the first libc function runs -- not
+/// merely eventually. It is the only route available: the MSR is not writable
+/// from ring 3, and `wrfsbase` needs `CR4.FSGSBASE`, which this kernel does not
+/// enable.
+fn sys_set_fs_base(base: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    // IA32_FS_BASE. A zero base is legal (it means "no TCB"), so it is not
+    // rejected here; a libc that wants to tear a TCB down passes 0.
+    unsafe {
+        core::arch::asm!("wrmsr", in("ecx") 0xc000_0100u32, in("eax") base as u32, in("edx") (base >> 32) as u32, options(nostack, preserves_flags));
+    }
+    0
+}
+
+fn sys_chdir(path: u64, path_len: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let path = match user_str(path, path_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let cred = crate::cred::get(task);
+    let abs = task_abs_path(&path);
+    let node = match crate::vfs::resolve_checked(&abs, &cred) {
+        Ok(n) => n,
+        Err(e) => return e.into(),
+    };
+    if node.kind() != crate::vfs::NodeKind::Dir {
+        return errno::ENOTDIR;
+    }
+    // Store the normalized absolute form (collapses `.`/`..` segments).
+    crate::task::sched::set_current_cwd(crate::vfs::normalize_abs(&abs));
+    0
+}
+
+fn sys_getcwd(buf: u64, cap: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let cwd = crate::task::sched::current_cwd();
+    if buf == 0 || cap == 0 {
+        return cwd.len() as i64;
+    }
+    let cap = (cap as usize).min(cwd.len());
+    let bytes = match unsafe { user_bytes(buf, cap as u64) } {
+        Some(b) => b,
+        None => return errno::EINVAL,
+    };
+    bytes.copy_from_slice(&cwd.as_bytes()[..cap]);
+    cap as i64
+}
+
+fn sys_readdir(path: u64, path_len: u64, buf: u64, cap: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let path = match user_str(path, path_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let cred = crate::cred::get(task);
+    let node = match crate::vfs::resolve_checked(&task_abs_path(&path), &cred) {
+        Ok(n) => n,
+        Err(e) => return e.into(),
+    };
+    if node.kind() != crate::vfs::NodeKind::Dir {
+        return errno::ENOTDIR;
+    }
+    let mut entries = match node.list() {
+        Ok(e) => e,
+        Err(e) => return e.into(),
+    };
+    // POSIX requires `.` and `..` in every directory listing, and plenty of
+    // real code depends on them: `ls -a` prints them, `find` starts from `.`,
+    // and a shell's tab completion reads `.` to find the cwd. `Vnode::list`
+    // reports only real children -- it is also used for mount-point bookkeeping,
+    // where a synthetic `.` would be wrong -- so they are added here, at the
+    // syscall boundary where the contract actually lives.
+    //
+    // `..` is reported by name. Whether it *resolves* to the parent is a
+    // separate matter handled by the path resolver, which walks no parent links
+    // on this flat tree (see vfs::resolve).
+    entries.insert(0, (String::from(".."), crate::vfs::NodeKind::Dir));
+    entries.insert(0, (String::from("."), crate::vfs::NodeKind::Dir));
+    let need = entries.iter().map(|(n, _)| n.len() + 1).sum::<usize>();
+    if buf == 0 || cap == 0 {
+        return need as i64;
+    }
+    let cap = cap.min(need as u64) as usize;
+    let bytes = match unsafe { user_bytes(buf, cap as u64) } {
+        Some(b) => b,
+        None => return errno::EINVAL,
+    };
+    let mut off = 0usize;
+    for (name, _) in &entries {
+        if off >= cap {
+            break;
+        }
+        let n = (name.len() + 1).min(cap - off);
+        bytes[off..off + n.saturating_sub(1)].copy_from_slice(&name.as_bytes()[..n.saturating_sub(1)]);
+        if n == name.len() + 1 {
+            bytes[off + name.len()] = 0;
+        }
+        off += n;
+    }
+    off as i64
+}
+
+fn sys_unlink(dirfd: u64, path: u64, path_len: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let path = match user_str(path, path_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // A relative path is interpreted against `dirfd` when one is given, and
+    // against the caller's working directory otherwise. Every current caller
+    // passes an absolute path with the reserved AT_FDCWD, so the descriptor is
+    // accepted and validated but not otherwise consulted.
+    const AT_FDCWD: i64 = -100;
+    let fd = dirfd as i64;
+    if fd != AT_FDCWD && fd < 0 {
+        return errno::EBADF;
+    }
+    let cred = crate::cred::get(task);
+    let abs = task_abs_path(&path);
+    // A directory may not be unlinked -- POSIX added `rmdir` for that, and this
+    // ABI does not have it yet. `unlink` on a directory is EISDIR, not EPERM,
+    // so a caller can tell "wrong call" from "not allowed".
+    if let Ok(node) = crate::vfs::resolve_checked(&abs, &cred) {
+        if node.kind() == crate::vfs::NodeKind::Dir {
+            return errno::EISDIR;
+        }
+    }
+    match crate::vfs::remove_checked(&abs, &cred) {
+        Ok(_) => 0,
+        Err(e) => e.into(),
+    }
+}
+
+fn sys_lseek(fd: u64, offset: u64, whence: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    // `offset` is signed on the wire; the caller passes the two's complement of
+    // a negative value, which arrives here as a large u64.
+    let offset = offset as i64;
+    match crate::vfs::fdtab::seek(task, fd as usize, offset, whence as u32) {
+        Ok(pos) => pos as i64,
+        Err(e) => e.into(),
+    }
+}
+
+fn sys_clock_realtime_ms(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    // Read the RTC fresh on every call rather than serving a tick counter: the
+    // point of this call is that it is the *correct* time, not a cheap
+    // approximation. A read is a handful of port writes.
+    crate::rtc::epoch_millis()
+}
+
+fn sys_set_time(secs: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    // Setting the clock is privileged: an unprivileged process that could do it
+    // could move every other process's idea of the present, which defeats
+    // anything that checks a timestamp. `settimeofday` is `CAP_SYS_TIME` for
+    // exactly this reason.
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if !crate::cred::get(task).is_privileged() {
+        return errno::EPERM;
+    }
+    crate::rtc::set_epoch(secs as i64);
+    0
+}
+
+fn sys_mkdir(path: u64, path_len: u64, mode: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let path = match user_str(path, path_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let cred = crate::cred::get(task);
+    let abs = task_abs_path(&path);
+    // mkdir fails when the target already exists (no recursive creation).
+    match crate::vfs::resolve_checked(&abs, &cred) {
+        Ok(_) => return errno::EEXIST,
+        Err(crate::vfs::FsError::NotFound) => {}
+        Err(e) => return e.into(),
+    }
+    let want = ((mode as u32) & driver_common::S_PERM_MASK) & !crate::cred::umask_of(task);
+    match crate::vfs::create_checked(
+        &abs,
+        crate::vfs::NodeKind::Dir,
+        cred.fsuid,
+        cred.fsgid,
+        want,
+        &cred,
+    ) {
+        Ok(_) => 0,
+        Err(e) => e.into(),
+    }
+}
+
+fn sys_port_allow(lo: u64, hi: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    if lo > hi || hi > 1023 {
+        return errno::EINVAL;
+    }
+    let mut ok = false;
+    crate::task::sched::with_current(|t| {
+        t.grant_io_ports(lo as u16, hi as u16);
+        ok = true;
+    });
+    if ok {
+        crate::task::sched::refresh_io_bitmap();
+    }
+    0
+}
+
+fn sys_irq_bind(irq: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    if irq >= 16 {
+        return errno::EINVAL;
+    }
+    let ep = match crate::task::sched::current_endpoint() {
+        Some(e) => e,
+        None => return errno::EPERM,
+    };
+    match crate::interrupts::idt::bind_irq(irq as u8, ep) {
+        Ok(()) => 0,
+        Err(_) => errno::EPERM,
+    }
+}
+
+fn sys_irq_unbind(irq: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    crate::interrupts::idt::unbind_irq(irq as u8);
+    0
+}
+
+fn sys_map_anon(frames: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match crate::memory::user_map::map_anon(frames as usize) {
+        Some(va) => va as i64,
+        None => errno::ENOSYS,
+    }
+}
+
+fn sys_map_phys(phys: u64, frames: u64, flags: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match crate::memory::user_map::map_phys(phys, frames as usize, flags) {
+        Some(va) => va as i64,
+        None => crate::abi::errno::EPERM,
+    }
+}
+
+fn sys_shm_create(frames: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match crate::memory::user_map::shm_create(frames as usize) {
+        Ok(handle) => handle as i64,
+        Err(e) => e,
+    }
+}
+
+fn sys_shm_map(handle: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match crate::memory::user_map::shm_map(handle) {
+        Ok(va) => va as i64,
+        Err(e) => e,
+    }
+}
+
+fn sys_shm_destroy(handle: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match crate::memory::user_map::shm_destroy(handle) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_fb_info(buf: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let sz = core::mem::size_of::<FbInfo>();
+    if validate_range(buf as usize, sz) < sz {
+        return errno::EINVAL;
+    }
+    let Some(fb) = crate::framebuffer::get() else {
+        return errno::ENOSYS;
+    };
+    let g = fb.geometry();
+    let info = FbInfo {
+        phys: g.phys as u64,
+        size: g.size as u64,
+        offset: g.offset as u32,
+        width: g.width as u32,
+        height: g.height as u32,
+        pitch: g.pitch as u32,
+        bpp: g.bpp as u32,
+        red_pos: g.red_pos as u32,
+        red_size: g.red_size as u32,
+        green_pos: g.green_pos as u32,
+        green_size: g.green_size as u32,
+        blue_pos: g.blue_pos as u32,
+        blue_size: g.blue_size as u32,
+    };
+    // SAFETY: `[buf, buf+size)` was validated as mapped user memory above.
+    unsafe {
+        core::ptr::write_unaligned(buf as *mut FbInfo, info);
+    }
+    0
+}
+
+fn sys_console_detach(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    crate::console::detach();
+    0
+}
+
+fn sys_console_attach(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    crate::console::init();
+    0
+}
+
+fn sys_dma_alloc(frames: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match crate::memory::user_map::dma_alloc(frames as usize) {
+        Some(va) => va as i64,
+        None => errno::ENOSYS,
+    }
+}
+
+fn sys_dma_free(va: u64, frames: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    match crate::memory::user_map::dma_free(va as usize, frames as usize) {
+        Ok(()) => 0,
+        Err(_) => errno::EINVAL,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MSR setup + assembly entry stub
+// ---------------------------------------------------------------------------
+
+const MSR_EFER: u32 = 0xC000_0080;
+const EFER_SCE: u64 = 1 << 0;
+const MSR_LSTAR: u32 = 0xC000_0082;
+const MSR_SFMASK: u32 = 0xC000_0084;
+const MSR_STAR: u32 = 0xC000_0081;
+
+/// Bits cleared from RFLAGS on syscall entry (IF, TF, DF, NT).
+const SYSCALL_RFLAGS_MASK: u64 = (1 << 9) | (1 << 8) | (1 << 10) | (1 << 14);
+
+unsafe fn wrmsr(msr: u32, value: u64) {
+    asm!(
+        "wrmsr",
+        in("ecx") msr,
+        in("eax") value as u32,
+        in("edx") (value >> 32) as u32,
+        options(nostack)
+    );
+}
+
+/// Enable the `syscall`/`sysret` instructions and point them at our stub.
+///
+/// STAR layout used by Samsara:
+/// * bits 47:32 — the kernel CS *selector* of `KERNEL_CODE`; the CPU masks it
+///   with `0xFFFC` on `syscall` and derives `SS = CS + 8` (`KERNEL_DATA`).
+/// * bits 63:48 — the `sysret` base selector; SYSRET derives the ring-3
+///   selectors as SS = base+8 and CS = base+16.
+unsafe fn enable_syscall_instruction() {
+    let kcode_sel = super::interrupts::gdt::KERNEL_CODE as u64;
+    // SYSRET loads CS = STAR[63:48] + 16 and SS = STAR[63:48] + 8 (RPL forced
+    // to 3). We keep USER_DATA one selector below USER_CODE, so choosing
+    // base = USER_DATA - 8 yields SS = USER_DATA and CS = USER_CODE.
+    let sysret_base = (super::interrupts::gdt::USER_DATA - 8) as u64 & 0xFFFF;
+
+    let star = (sysret_base << 48) | (kcode_sel << 32);
+
+    // Read-modify-write EFER to set SCE without disturbing long mode bits.
+    let efer_lo: u32;
+    let efer_hi: u32;
+    asm!("rdmsr", in("ecx") MSR_EFER, out("eax") efer_lo, out("edx") efer_hi, options(nostack));
+    let efer = ((efer_hi as u64) << 32) | efer_lo as u64;
+    wrmsr(MSR_EFER, efer | EFER_SCE);
+
+    wrmsr(MSR_STAR, star);
+    wrmsr(
+        MSR_LSTAR,
+        syscall_entry as usize as u64,
+    );
+    wrmsr(MSR_SFMASK, SYSCALL_RFLAGS_MASK);
+
+    // The kernel stack the syscall stub runs on is taken from the scheduler's
+    // per-thread `CURRENT_KSTACK_TOP`, updated on every context switch so
+    // each thread syscalls onto its own kernel stack.
+}
+
+
+core::arch::global_asm!(
+    ".section .text",
+    ".globl syscall_entry",
+    ".type syscall_entry, @function",
+    "syscall_entry:",
+    // Entry state: rax = nr, rcx = user rip, r11 = user rflags.
+    //
+    // Trap frame built on the kernel stack (offsets from final rsp):
+    //   +000 original rax          +056 original r10
+    //   +008 original rcx          +064 r12
+    //   +016 original rdx          +072 r13
+    //   +024 original rsi          +080 r14
+    //   +032 original rdi          +088 r15
+    //   +040 original r8           +096 rbx
+    //   +048 original r9           +104 rbp
+    //   +112 syscall nr            +120 user rip
+    //   +128 user cs (placeholder) +136 user rflags
+    //   +144 user rsp              +152 ss (placeholder)
+    "mov [rip + {scratch}], rsp",
+    "mov rsp, [rip + {kstack}]",
+    "push qword ptr 0",                      // ss placeholder
+    "push qword ptr [rip + {scratch}]",          // user rsp
+    "push r11",                              // user rflags
+    "push qword ptr 0x18",                       // user cs placeholder
+    "push rcx",                              // user rip
+    "push rax",                              // syscall nr
+    "push rbp",
+    "push rbx",
+    "push r15",
+    "push r14",
+    "push r13",
+    "push r12",
+    "push r10",
+    "push r9",
+    "push r8",
+    "push rdi",
+    "push rsi",
+    "push rdx",
+    "push rcx",
+    "push rax",
+    // samsara_dispatch(nr, a1..a6): rdi rsi rdx rcx r8 r9 [stack]
+    "mov rdi, [rsp + 112]",                  // nr
+    "mov rsi, [rsp + 32]",                   // a1 = user rdi
+    "mov rdx, [rsp + 24]",                   // a2 = user rsi
+    "mov rcx, [rsp + 16]",                   // a3 = user rdx
+    "mov r8,  [rsp + 56]",                   // a4 = user r10
+    "mov r9,  [rsp + 40]",                   // a5 = user r8
+    "push qword ptr [rsp + 48]",                 // a6 = user r9
+    "call {dispatch}",
+    // Post-`ret` rsp points at the 7th arg (a6); the original-rax slot is at
+    // [rsp + 8]. Stash the result there so the `pop rax` below returns it.
+    "mov [rsp + 8], rax",					// stash result in original-rax slot
+    "add rsp, 8",							// drop 7th argument
+    // Signal delivery hook: give `samsara_post_syscall` the trap frame base
+    // (the original-rax slot). It may rewrite rip/rsp/rdi to jump into a
+    // handler or terminate the process, and returns the rax value to load.
+    "mov rdi, rsp",
+    "call {post}",
+    "mov [rsp], rax",
+    "pop rax",
+    "pop rcx",
+    "pop rdx",
+    "pop rsi",
+    "pop rdi",
+    "pop r8",
+    "pop r9",
+    "pop r10",
+    "pop r12",
+    "pop r13",
+    "pop r14",
+    "pop r15",
+    "pop rbx",
+    "pop rbp",
+    "add rsp, 8",                            // discard syscall nr
+    "pop rcx",                               // user rip
+    "add rsp, 8",                            // discard user cs placeholder
+    "pop r11",                               // user rflags
+    "pop rsp",                               // back to the user stack
+    "sysretq",
+    ".size syscall_entry, . - syscall_entry",
+    scratch = sym SCRATCH_SLOT,
+    kstack = sym crate::task::sched::CURRENT_KSTACK_TOP,
+    dispatch = sym samsara_dispatch,
+    post = sym samsara_post_syscall,
+);
+
+static mut SCRATCH_SLOT: usize = 0;

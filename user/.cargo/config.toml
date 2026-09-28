@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Harsh Nikarsa
+#
+# Ring-3 programs are static-position-independent ELFs (-pie, ET_DYN) linked
+# at 0x110000 by user/linker.ld; the kernel loads them as its own dynamic
+# linker. Builds for this workspace are invoked from `user/` (see the
+# Makefile), so this file, not kernel/.cargo/config.toml, is what applies.
+
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# code-model=kernel matches the prebuilt sysroot rlibs (rust-embedded
+# builds its x86_64-unknown-none std that way), which LTO insists on.
+rustflags = [
+    "-C", "relocation-model=pic",
+    "-C", "code-model=kernel",
+    "-Z", "function-sections",
+    "-C", "link-arg=-Tlinker.ld",
+    "-C", "link-arg=-pie",
+]

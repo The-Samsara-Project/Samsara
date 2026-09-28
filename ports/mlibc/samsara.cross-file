@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Harsh Nikarsa
+#
+# Cross-compilation file for building mlibc against Samsara.
+#
+# Samsara has no hosted libc, no crt, and no dynamic linker for the compiler
+# to link against, so the toolchain is a freestanding clang targeting the
+# `x86_64-pc-samsara` triple. Link tests (e.g. meson's sanity checks) are
+# only allowed to produce entry-`main` static binaries.
+
+[binaries]
+c = ['clang', '--target=x86_64-pc-samsara', '-ffreestanding', '-fno-stack-protector', '-fno-asynchronous-unwind-tables', '-fno-unwind-tables', '-fuse-ld=lld']
+cpp = ['clang++', '--target=x86_64-pc-samsara', '-ffreestanding', '-fno-stack-protector', '-fno-asynchronous-unwind-tables', '-fno-unwind-tables', '-fuse-ld=lld']
+ar = ['llvm-ar']
+ranlib = ['llvm-ranlib']
+nm = ['llvm-nm']
+
+[built-in options]
+# The libc is compiled with _GNU_SOURCE so that mlibc-config.h elevates
+# _DEFAULT_SOURCE, _POSIX_C_SOURCE=202405L and _XOPEN_SOURCE. That exposes
+# Dl_info/dladdr() (via __MLIBC_POSIX2024) for options/posix/generic/dlfcn.cpp
+# while leaving the glibc option disabled (its strverscmp/versionsort surface
+# is not implemented). `-std=gnu++23` (see build.sh) additionally keeps
+# __STRICT_ANSI__ off so the default-source feature set stays enabled.
+c_args = ['-fno-builtin', '-D_GNU_SOURCE']
+cpp_args = ['-fno-builtin', '-D_GNU_SOURCE']
+c_link_args = ['-nostdlib', '-static', '-fuse-ld=lld', '-Wl,-e,main', '-Wl,--build-id=none']
+cpp_link_args = ['-nostdlib', '-static', '-fuse-ld=lld', '-Wl,-e,main', '-Wl,--build-id=none']
+
+[host_machine]
+system = 'samsara'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'

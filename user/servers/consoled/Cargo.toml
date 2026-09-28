@@ -1,0 +1,11 @@
+[package]
+name = "consoled"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "consoled"
+path = "src/main.rs"
+
+[dependencies]
+nutcracker-rt = { path = "../../nutcracker-rt" }
