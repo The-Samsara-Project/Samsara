@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Harsh Nikarsa
+#
+# Ask isatty(3) whether stdin is a terminal, instead of pattern-matching the
+# terminal path for "/dev/tty" or "/dev/vc".
+#
+# That substring test is a proxy for "is this interactive", and it rejects a
+# pty -- so fbterm would exit with "stdin isn't a interactive tty!" on
+# /dev/pts/0, which is the ordinary way a terminal is handed a pty. The test is
+# wrong on Linux too for anything on a pts, so this corrects a check that was
+# guessing at the wrong thing rather than accommodating a Samsara quirk.
+#
+# isatty(3) is a TCGETS probe, the same one Linux uses, so it cannot disagree
+# with the kernel about what counts as a terminal. That is the substantive
+# reason to prefer it: a name-based check and an isatty-based check can
+# disagree, and when they do the symptom is a terminal that starts and then
+# behaves as though it had no tty, which is far harder to diagnose than a clean
+# refusal at startup.
+#
+# The ttyname_r call is kept rather than deleted -- a program drawing to a
+# terminal wants its name for diagnostics and for --verbose output -- but its
+# failure is no longer fatal, and a successful one is reported. Deciding whether
+# to run is isatty's job; naming the terminal is informational.
+#
+# Generated with `git diff` against the pinned fbterm commit
+# 419c6be55413a7069fbcc66883d58caa94ba3933, on top of patch 0005. Regenerate
+# with ports/fbterm/build.sh; never edit by hand.
+
+diff --git a/src/input.cpp b/src/input.cpp
+index 3336c52..f1304a2 100644
+--- a/src/input.cpp
++++ b/src/input.cpp
+@@ -43,15 +43,48 @@ DEFINE_INSTANCE(TtyInput)
+ 
+ TtyInput *TtyInput::createInstance()
+ {
+-	s8 buf[64];
+-	if (ttyname_r(STDIN_FILENO, buf, sizeof(buf))) {
++	/*
++	 * Samsara: ask isatty(3) rather than pattern-matching the terminal's path.
++	 *
++	 * Upstream calls ttyname_r and then requires the name to contain
++	 * "/dev/tty" or "/dev/vc", which is a proxy for "is this an interactive
++	 * terminal". A Samsara pty slave is /dev/pts/0, so the check rejects it and
++	 * fbterm exits with "stdin isn't a interactive tty!" -- a terminal emulator
++	 * refusing to start because it was handed a pty, which is the ordinary way a
++	 * terminal is run.
++	 *
++	 * The check is wrong on Linux too, for anything on a pty: a pts is a
++	 * perfectly good interactive terminal and upstream rejects it as well. So
++	 * this is a correction of a check that guesses at the wrong thing, not an
++	 * accommodation for a Samsara quirk.
++	 *
++	 * isatty(3) asks the actual question. It is a TCGETS probe -- the same one
++	 * Linux uses to decide whether a descriptor is a terminal -- so it cannot
++	 * disagree with the kernel about what counts as one. That matters more than
++	 * the tidiness: a name-based check and an isatty-based check *can* disagree,
++	 * and when they do the symptom is a terminal that starts and then behaves as
++	 * though it had no tty, which is much harder to diagnose than a clean
++	 * refusal at startup.
++	 *
++	 * The ttyname_r call is not simply deleted. A program drawing to a terminal
++	 * legitimately wants its name, for --verbose output and so that a failure is
++	 * reported against something the user can act on. So the name is still
++	 * obtained, and its absence is reported -- it just no longer decides whether
++	 * fbterm runs.
++	 */
++	if (!isatty(STDIN_FILENO)) {
+ 		fprintf(stderr, "stdin isn't a tty!\n");
+ 		return 0;
+ 	}
+ 
+-	if (!strstr(buf, "/dev/tty") && !strstr(buf, "/dev/vc")) {
+-		fprintf(stderr, "stdin isn't a interactive tty!\n");
+-		return 0;
++	s8 buf[64];
++	if (ttyname_r(STDIN_FILENO, buf, sizeof(buf))) {
++		// Not fatal. The terminal is real and usable; only its name is
++		// unavailable, and nothing below needs the name in order to function.
++		fprintf(stderr, "[input] could not determine the terminal's name; "
++				"continuing without it\n");
++	} else {
++		fprintf(stderr, "[input] terminal: %s\n", buf);
+ 	}
+ 
+ 	return new TtyInput();

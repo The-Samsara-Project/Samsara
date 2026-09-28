@@ -215,6 +215,74 @@ impl CharDevice for FbDevice {
         Some((g.phys as u64, g.size as u64))
     }
 
+    /// Answer the Linux framebuffer queries.
+    ///
+    /// A ported terminal learns the display's shape from these rather than from
+    /// the geometry Samsara reports over `FB_INFO`, because that is the
+    /// interface it already speaks. Two of them matter:
+    ///
+    ///   - `FBIOGET_VSCREENINFO`, which carries the resolution, the bit depth
+    ///     and the position of each colour channel.
+    ///   - `FBIOGET_FSCREENINFO`, which carries the scanline length and the
+    ///     length of the mappable range -- the latter is what the terminal
+    ///     passes to `mmap(2)`.
+    ///
+    /// Everything else in the Linux request set is refused. In particular the
+    /// pan and palette requests are refused rather than approximated: a terminal
+    /// that believes it panned the display when it did not scrolls into nothing,
+    /// and one that believes it set a palette on a truecolour display misdraws
+    /// the screen. Both are already true here -- the pan steps in
+    /// `FBIOGET_FSCREENINFO` are zero and the visual is truecolour -- so a
+    /// terminal that honours them simply never asks.
+    fn ioctl(&self, cmd: u32, data: &mut [u8]) -> Result<(), ()> {
+        use crate::abi::framebuffer_ioctl::{
+            FbFixScreeninfo, FbVarScreeninfo, FBIOGET_FSCREENINFO, FBIOGET_VSCREENINFO,
+        };
+
+        let Some(fb) = crate::framebuffer::get() else {
+            return Err(());
+        };
+        let g = fb.geometry();
+
+        match cmd {
+            FBIOGET_VSCREENINFO => {
+                // Length-checked against the kernel's own struct, so a mismatch
+                // with the caller's idea of the layout is reported rather than
+                // silently truncating. The ABI layer already sized the copy
+                // from the same struct, so this is belt and braces -- and
+                // cheap, because this ioctl runs once at startup.
+                let v = FbVarScreeninfo::from_geometry(&g);
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        &v as *const FbVarScreeninfo as *const u8,
+                        core::mem::size_of::<FbVarScreeninfo>(),
+                    )
+                };
+                if data.len() < bytes.len() {
+                    return Err(());
+                }
+                data[..bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            }
+            FBIOGET_FSCREENINFO => {
+                let f = FbFixScreeninfo::from_geometry(&g);
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        &f as *const FbFixScreeninfo as *const u8,
+                        core::mem::size_of::<FbFixScreeninfo>(),
+                    )
+                };
+                if data.len() < bytes.len() {
+                    return Err(());
+                }
+                data[..bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            }
+            // Not a query this device implements. Refused, never faked.
+            _ => Err(()),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "linear-framebuffer"
     }
@@ -401,6 +469,53 @@ pub fn char_node(dev: Arc<dyn CharDevice>) -> VnodeRef {
     anonymous(dev)
 }
 
+/// Every published `/dev/...` path, paired with the node it resolves to.
+///
+/// This is the reverse index that `resolve` alone cannot provide: given a node,
+/// `path_of` recovers the name it was registered under. It exists for
+/// `ttyname(3)`, which hands a program the *path* of its terminal so the program
+/// can reopen it or report it.
+///
+/// A flat list rather than a tree walk, and deliberately so. Recovering a path
+/// from a `&dyn Vnode` otherwise requires downcasting the trait object back to
+/// `DevSubdir`, and `Vnode` has no `Any` supertrait to make that safe -- so the
+/// choices are an unsafe vtable cast or an index maintained at registration. The
+/// index is better: the cast is sound only while every devfs directory really
+/// is a `DevSubdir`, which is a property of today's code rather than of the
+/// type, and a future devfs directory type would silently turn it into a
+/// wrong-pointer dereference.
+///
+/// Comparison is by node identity (`Arc::ptr_eq`), never by a name a device
+/// reports about itself. devfs assigned the name, so devfs is what remembers
+/// it; a device that supplied its own name could disagree with the name it is
+/// actually reachable under, and the caller would be handed a path that does
+/// not open.
+static NAMES: Spinlock<Vec<(String, VnodeRef)>> = Spinlock::new(Vec::new());
+
+/// Record that `node` is reachable at `path`.
+///
+/// A later duplicate of the same node is kept rather than replacing the earlier
+/// entry, and `path_of` returns the first. A device published under two names is
+/// reachable under both, so either answer is truthful; what matters is that the
+/// choice is deterministic, and insertion order is that.
+fn record(path: String, node: VnodeRef) {
+    NAMES.lock().push((path, node));
+}
+
+/// The `/dev/...` path at which `target` is published, if it is.
+///
+/// Returns `None` for a node that is not in devfs at all -- a ramfs file, or a
+/// terminal reached through some mount other than devfs. Reporting no name is
+/// correct there; inventing one would hand back a path that does not resolve,
+/// and a program that trusted it would fail later, and further away.
+pub fn path_of(target: &VnodeRef) -> Option<String> {
+    NAMES
+        .lock()
+        .iter()
+        .find(|(_, node)| Arc::ptr_eq(node, target))
+        .map(|(path, _)| path.clone())
+}
+
 /// Publish an already-populated subdirectory at `/dev/<name>`.
 ///
 /// Separate from [`register`] because the caller has already filled the
@@ -409,9 +524,19 @@ pub fn char_node(dev: Arc<dyn CharDevice>) -> VnodeRef {
 pub fn register_subdir(name: &str, dir: Arc<DevSubdir>) -> Result<(), FsError> {
     let guard = DEV_DIR.lock();
     let root = guard.as_ref().ok_or(FsError::NotFound)?;
-    root.devices
-        .lock()
-        .insert(String::from(name), dir as VnodeRef);
+    let base = alloc::format!("/dev/{}", name);
+    let node: VnodeRef = dir.clone();
+    root.devices.lock().insert(String::from(name), node.clone());
+    drop(guard);
+    // The directory itself is addressable by path, and so is every child
+    // already inside it. Children are recorded here rather than at insert time
+    // because a subdirectory is normally populated *before* it is published --
+    // the input device builds its tree first and is then registered -- so at
+    // insert time the full path does not exist yet.
+    record(base.clone(), node);
+    for (child_name, child) in dir.children.lock().iter() {
+        record(alloc::format!("{}/{}", base, child_name), child.clone());
+    }
     Ok(())
 }
 
@@ -445,7 +570,12 @@ pub fn register(name: &str, dev: Arc<dyn CharDevice>) -> Result<(), FsError> {
         return Err(FsError::Exists);
     }
     crate::log::kdebug!("devfs: registered /dev/{} ({})", name, dev.name());
-    devs.insert(String::from(name), Arc::new(CharDeviceNode { dev }));
+    let node: VnodeRef = Arc::new(CharDeviceNode { dev });
+    devs.insert(String::from(name), node.clone());
+    // Record after the insert succeeded, so the reverse index never names a
+    // path that resolve() would refuse.
+    drop(devs);
+    record(alloc::format!("/dev/{}", name), node);
     Ok(())
 }
 

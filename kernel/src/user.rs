@@ -50,6 +50,10 @@ pub const PROG_SAMUTILS: usize = 13;
 /// only non-Rust user image, so it is what proves the libc port runs rather
 /// than merely links; the installer runs it as a boot self-test.
 pub const PROG_CHELLO: usize = 14;
+/// Index of `fbterm`, the ported Linux terminal emulator. Present in the table
+/// unconditionally so the index is stable whether or not the port has been
+/// built; see the table entry for how the image is gated.
+pub const PROG_FBTERM: usize = 15;
 
 /// A boot-time user-space program.
 struct Program {
@@ -62,7 +66,7 @@ struct Program {
     image: &'static [u8],
 }
 
-const PROGRAMS: [Program; 15] = [
+const PROGRAMS: [Program; 16] = [
     Program {
         name: "hello",
         endpoint: None,
@@ -157,6 +161,26 @@ const PROGRAMS: [Program; 15] = [
         endpoint: None,
         root: false,
         image: include_bytes!("../../target/user-chello.elf"),
+    },
+    // The ported Linux terminal emulator, from ports/fbterm. Feature-gated
+    // because it is not a cargo target: it is built by ports/fbterm/build.sh
+    // against the mlibc sysroot, and making `make` depend on that would force
+    // a libc port on anyone building the tree. `make fbterm` builds it and
+    // `make fbterm-run` rebuilds the kernel with the feature so the image is
+    // actually present.
+    //
+    // Without the feature the image is empty rather than absent, which keeps
+    // this array a fixed size and keeps every other index stable. Spawning an
+    // empty image fails in the ELF loader, which is the honest outcome: the
+    // program is not there, and nothing pretends otherwise.
+    Program {
+        name: "fbterm",
+        endpoint: None,
+        root: false,
+        #[cfg(feature = "fbterm")]
+        image: include_bytes!("../../target/user-fbterm.elf"),
+        #[cfg(not(feature = "fbterm"))]
+        image: &[],
     },
 ];
 

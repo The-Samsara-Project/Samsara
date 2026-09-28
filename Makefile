@@ -34,7 +34,7 @@ USER_SERVERS   := consoled inputd
 USER_UTILS     := samutils
 USER_EXAMPLES  := hello forkx exectst pipetest credtst signaltst polltest termiostst sh term installer
 
-.PHONY: all kernel iso run debug clean user-bins mlibc fbterm
+.PHONY: all kernel iso run run-fbterm debug clean user-bins mlibc fbterm fbterm-run
 
 all: iso
 
@@ -49,6 +49,33 @@ mlibc:
 # anything else could be built. Run `make mlibc fbterm` for a terminal binary.
 fbterm:
 	./ports/fbterm/build.sh
+
+# Build fbterm and rebuild the kernel with it embedded, then produce a bootable
+# ISO that can actually spawn it. `make` alone does not do this: fbterm is not a
+# cargo target, it is built by ports/fbterm/build.sh against the mlibc sysroot,
+# and making the default target depend on that would require a libc port before
+# anything else could be built.
+#
+# The kernel is built into a separate target directory so a later plain `make`
+# still produces the fbterm-free ISO rather than silently keeping the feature.
+fbterm-run: fbterm
+	@mkdir -p target/fbterm
+	cp build/fbterm-build/fbterm.elf target/user-fbterm.elf
+	cd kernel && CARGO_TARGET_DIR="$(CURDIR)/target/fbterm" \
+	    cargo build --release --features fbterm
+	nasm -f elf64 -g -F dwarf boot/boot.s -o target/fbterm/boot.o
+	$(LLD) -nostdlib -static --gc-sections --no-dynamic-linker \
+	       -z noexecstack -T kernel/linker.ld \
+	       target/fbterm/boot.o \
+	       target/fbterm/x86_64-unknown-none/release/libsamsara.a \
+	       -o target/fbterm/kernel.elf
+	rm -rf $(ISODIR)
+	mkdir -p $(ISODIR)/boot/grub
+	cp target/fbterm/kernel.elf $(ISODIR)/boot/samsara.bin
+	cp grub/grub.cfg $(ISODIR)/boot/grub/grub.cfg
+	grub-mkrescue -o samsara-fbterm.iso $(ISODIR) 2>/dev/null
+	@echo "created samsara-fbterm.iso"
+	@echo "run it with: make run-fbterm"
 
 # Build the Nutcracker user images (example programs and servers) as static-PIE
 # ELFs for the kernel loader. `chello` is built here too even though it is the
@@ -93,13 +120,21 @@ iso: $(KERNEL_ELF)
 	grub-mkrescue -o $(ISO) $(ISODIR) 2>/dev/null
 	@echo "created $(ISO)"
 
-run: iso
-# `+rdseed,+rdrand` asks QEMU to present the hardware entropy instructions the
+run: iso# `+rdseed,+rdrand` asks QEMU to present the hardware entropy instructions the
 # host CPU has. The kernel probes for them (entropy.rs) and prefers them over the
 # timing-jitter fallback, which is measurably weaker; without this flag `make run`
 # boots with the fallback and `getrandom` still works, just less well.
 	qemu-system-x86_64 \
 	    -cdrom $(ISO) \
+	    -cpu qemu64,+rdseed,+rdrand \
+	    -serial stdio \
+	    -display none \
+	    -no-reboot
+
+# Boot the ISO built by `make fbterm-run`, which has the ported fbterm embedded.
+run-fbterm:
+	qemu-system-x86_64 \
+	    -cdrom samsara-fbterm.iso \
 	    -cpu qemu64,+rdseed,+rdrand \
 	    -serial stdio \
 	    -display none \

@@ -162,12 +162,33 @@ extern "C" int getopt_long(int argc, char *const *argv, const char *shortopts,
 			slot[2] = '\0';
 		}
 		optind++;
-		// A required argument supplied separately must be consumed as
-		// optarg, because the short form now ends at the option character.
-		if (found->has_arg == required_argument && !val_attached) {
-			optarg = argv[optind];
-			optind++;
+
+		// optarg must be set for *both* shapes of a required argument.
+		//
+		// The separate one (`--font-names mono`) is the obvious case. The
+		// attached one (`--font-size=12`) is the one that is easy to miss,
+		// and missing it is silent: optarg keeps whatever the *previous*
+		// option left there, so a program asking for two options in a row gets
+		// the first one's value twice and never notices. The argv rewrite
+		// above does not help, because the short form `-s=12` is never handed
+		// to getopt -- the entry is consumed above and the character returned
+		// directly, precisely so the following operand is not skipped.
+		//
+		// `val` points into the original argv entry, which the rewrite above
+		// overwrote in place. So the value is copied out before the rewrite,
+		// not read from `slot` afterwards.
+		if (found->has_arg == required_argument) {
+			if (val_attached) {
+				// Already copied to the tail of `slot` by the rewrite above,
+				// which is where optarg should point: a pointer into the
+				// caller's own argv, exactly as the libc's getopt returns.
+				optarg = slot + 3;
+			} else {
+				optarg = argv[optind];
+				optind++;
+			}
 		}
+
 		// Return the short character directly rather than re-entering getopt:
 		// the entry has been consumed above, so calling getopt again would
 		// skip the following operand.

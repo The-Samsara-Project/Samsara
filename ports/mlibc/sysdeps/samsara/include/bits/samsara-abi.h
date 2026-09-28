@@ -65,6 +65,15 @@
 #define SYSCALL_MUNMAP         84
 #define SYSCALL_MPROTECT       85
 #define SYSCALL_DEVICE_MMAP    86
+#define SYSCALL_TTYNAME        87
+#define SYSCALL_GETUID          31
+#define SYSCALL_GETGID          32
+#define SYSCALL_GETEUID         33
+#define SYSCALL_GETEGID         34
+#define SYSCALL_SETUID          39
+#define SYSCALL_SETGID          40
+#define SYSCALL_SETEUID         41
+#define SYSCALL_SETEGID         42
 
 /*
  * Terminal ioctl requests. These *are* Linux's, so a program that computes a

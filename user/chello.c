@@ -441,6 +441,112 @@ int main(void) {
 			munmap(fbm, fblen);
 			check(1, "munmap /dev/fb0");
 		}
+		// The Linux framebuffer queries. A ported terminal learns the display's
+		// shape from these rather than from FB_INFO, so they have to describe
+		// the same framebuffer.
+		//
+		// The sizes matter as much as the values: the kernel writes a struct
+		// whose layout is defined independently in Rust and in this program's
+		// <linux/fb.h>. A single wrong field width would shift everything after
+		// it, and the symptom would be a terminal that believes it has a
+		// zero-width framebuffer -- not a crash, and nothing pointing at the
+		// cause. So compare against the geometry FB_INFO reports, which is the
+		// independent source of truth.
+		uint32_t vinfo[64] = { 0 };
+		uint32_t finfo[16] = { 0 };
+		check(ioctl(fb, 0x4600 /* FBIOGET_VSCREENINFO */, vinfo) == 0,
+		      "FBIOGET_VSCREENINFO");
+		check(ioctl(fb, 0x4602 /* FBIOGET_FSCREENINFO */, finfo) == 0,
+		      "FBIOGET_FSCREENINFO");
+		// xres, yres at offsets 0 and 4; bits_per_pixel at offset 24.
+		check(vinfo[0] == geo[0], "FBIOGET_VSCREENINFO xres matches");
+		check(vinfo[1] == geo[1], "FBIOGET_VSCREENINFO yres matches");
+		check(vinfo[6] == geo[3], "FBIOGET_VSCREENINFO bpp matches");
+		// A terminal refuses to start on a 0-bit framebuffer, so this is the
+		// field that decides whether the port works at all.
+		check(vinfo[6] == 16 || vinfo[6] == 24 || vinfo[6] == 32,
+		      "FBIOGET_VSCREENINFO bpp is usable");
+		// Red channel placement starts at byte 32: offset, length, msb_right.
+		// A zero length does not draw black, it draws nothing at all, while
+		// looking like a successful query -- so this is checked, not assumed.
+		check(vinfo[8] > 0 && vinfo[8] < 32, "FBIOGET_VSCREENINFO red offset sane");
+		check(vinfo[9] > 0 && vinfo[9] <= 8, "FBIOGET_VSCREENINFO red length sane");
+		// Green and blue must be placed too, or a terminal writing "red" gets
+		// a colour with two of three channels in the wrong bits.
+		check(vinfo[12] > 0 && vinfo[12] < 32, "FBIOGET_VSCREENINFO green offset sane");
+		check(vinfo[15] > 0 && vinfo[15] < 32, "FBIOGET_VSCREENINFO blue offset sane");
+		// The three channels must not overlap. Overlap is invisible in any
+		// single-field check and produces plausible wrong colours.
+		//
+		// Note this is a pairwise test, not an ordering test. On this hardware
+		// the channels run blue, green, red as the bit position rises, so
+		// asserting that red sits below green -- which is what a first reading
+		// of the field order suggests -- fails on a perfectly correct mode.
+		// Overlap is the actual hazard, and it is order-independent.
+		{
+			uint32_t roff = vinfo[8], rlen = vinfo[9];
+			uint32_t goff = vinfo[12], glen = vinfo[13];
+			uint32_t boff = vinfo[15], blen = vinfo[16];
+			int overlap = (roff < goff + glen && goff < roff + rlen) ||
+			              (roff < boff + blen && boff < roff + rlen) ||
+			              (goff < boff + blen && boff < goff + glen);
+			check(!overlap, "FBIOGET_VSCREENINFO channels do not overlap");
+			// And all three must fit inside one pixel. A channel that ran past
+			// the pixel would write into its neighbour, which on a 32bpp mode
+			// means into the next pixel's bits.
+			uint32_t deepest = roff + rlen;
+			if (goff + glen > deepest)
+				deepest = goff + glen;
+			if (boff + blen > deepest)
+				deepest = boff + blen;
+			check(deepest <= vinfo[6], "FBIOGET_VSCREENINFO channels fit a pixel");
+		}
+		//
+		// fb_fix_screeninfo is NOT packed, so these are read at byte offsets
+		// rather than as u32 indices. Its layout is:
+		//
+		//   0  char id[16]
+		//  16  u64 smem_len            (8-byte aligned, no pad needed here)
+		//  24  u32 type
+		//  28  u32 type_aux
+		//  32  u32 visual
+		//  36  u16 xpanstep
+		//  38  u16 ypanstep
+		//  40  u16 ywrapstep
+		//  42  (2 bytes padding to reach 8-byte alignment)
+		//  48  u64 line_length
+		//
+		// The 6 bytes of padding at 42 are why an index-based read is wrong:
+		// it puts line_length four bytes early and reads padding as a field.
+		unsigned char *fx = (unsigned char *)finfo;
+		uint64_t smem_len, line_length;
+		memcpy(&smem_len, fx + 16, sizeof smem_len);
+		memcpy(&line_length, fx + 48, sizeof line_length);
+		check(smem_len == (uint64_t)geo[2] * geo[1], "FBIOGET_FSCREENINFO smem_len");
+		check(line_length == (uint64_t)geo[2], "FBIOGET_FSCREENINFO line_length");
+		uint32_t ftype, fvisual;
+		memcpy(&ftype, fx + 24, sizeof ftype);
+		memcpy(&fvisual, fx + 32, sizeof fvisual);
+		check(ftype == 0 /* FB_TYPE_PACKED_PIXELS */,
+		      "FBIOGET_FSCREENINFO packed pixels");
+		check(fvisual == 2 /* FB_VISUAL_TRUECOLOR */,
+		      "FBIOGET_FSCREENINFO truecolour");
+		// The pan steps decide whether a terminal believes it can scroll by
+		// panning. Non-zero here would make it scroll into whatever the next
+		// page holds, so all three must be zero.
+		uint16_t xpan, ypan, ywrap;
+		memcpy(&xpan, fx + 36, sizeof xpan);
+		memcpy(&ypan, fx + 38, sizeof ypan);
+		memcpy(&ywrap, fx + 40, sizeof ywrap);
+		check(xpan == 0 && ypan == 0 && ywrap == 0,
+		      "FBIOGET_FSCREENINFO no pan steps");
+		// An unimplemented request must be refused, not answered with zeros: a
+		// terminal that believed a palette call succeeded on a truecolour
+		// display would misdraw the screen.
+		uint32_t junk[8] = { 0 };
+		check(ioctl(fb, 0x4606 /* FBIOPAN_DISPLAY */, junk) != 0,
+		      "FBIOPAN_DISPLAY is refused");
+
 		// A private mapping of a device must be refused, not silently
 		// accepted: copy-on-write over device memory would not see the
 		// device's own writes, which is a bug a program cannot detect.
@@ -549,6 +655,55 @@ int main(void) {
 		}
 		close(m0);
 		close(s0);
+	}
+
+	// ttyname(3). A program needs the *path* of its terminal, not the
+	// descriptor: to reopen it, hand it to a child, or report it. This is what
+	// a ported terminal checks before it will run at all, so it has to work for
+	// a pty slave and not just for a Linux virtual console.
+	if (isatty(0)) {
+		char tn[64] = { 0 };
+		// The reentrant form first: it is the one that reports a real error
+		// instead of a static buffer, so it is the one worth exercising.
+		int tr = ttyname_r(0, tn, sizeof tn);
+		check(tr == 0, "ttyname_r on the controlling terminal");
+		if (tr == 0) {
+			// A device path has to start with /dev and be NUL terminated
+			// within the buffer. Checking the NUL matters: ttyname_r fills a
+			// caller-supplied buffer, and a missing terminator would make
+			// every later string operation on it read off the end.
+			check(tn[0] == '/', "ttyname_r returns an absolute path");
+			check(strlen(tn) < sizeof tn, "ttyname_r NUL terminates");
+			// The path has to actually open, or it is worse than useless: a
+			// program that reopened it would fail somewhere far from the
+			// mistake.
+			int t = open(tn, O_RDWR | O_NOCTTY);
+			check(t >= 0, "ttyname_r path reopens");
+			if (t >= 0)
+				close(t);
+			// The non-reentrant form must agree with it.
+			const char *tn2 = ttyname(0);
+			check(tn2 != NULL && strcmp(tn, tn2) == 0, "ttyname agrees with ttyname_r");
+		}
+		// A buffer too small must be refused rather than truncated. Half a
+		// path is not a path, and a program that used one would fail later
+		// and further away.
+		char tiny[2];
+		int te = ttyname_r(0, tiny, sizeof tiny);
+		check(te != 0, "ttyname_r refuses a short buffer");
+	} else {
+		// stdin is not a terminal in this configuration, which is worth
+		// saying rather than skipping silently.
+		printf("[chello] SKIP ttyname: stdin is not a terminal\n");
+	}
+	// ttyname on something that is definitively not a terminal: /dev/fb0 is a
+	// character device but has no line discipline, so it must be refused.
+	int fbcheck = open("/dev/fb0", O_RDWR, 0);
+	if (fbcheck >= 0) {
+		char nb[64];
+		int ne = ttyname_r(fbcheck, nb, sizeof nb);
+		check(ne != 0, "ttyname_r refuses a non-terminal");
+		close(fbcheck);
 	}
 
 	// The old framing must still be reachable: the evdev device is layered

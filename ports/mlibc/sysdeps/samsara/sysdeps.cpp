@@ -978,16 +978,89 @@ int Sysdeps<Unlockpt>::operator()(int fd) {
 	return 0;
 }
 
+/*
+ * Credentials.
+ *
+ * These eight sysdeps were missing, and the way that failed was worth the
+ * trouble of writing down.
+ *
+ * mlibc reports an unimplemented sysdep by panicking, not by returning an
+ * error -- `MLIBC_MISSING_SYSDEP()` then `__ensure(!"Cannot continue without
+ * sys_getuid()")`. That is a defensible design for a libc that would otherwise
+ * have to guess, but it means the *absence* of a sysdep is indistinguishable
+ * from a program that genuinely cannot continue. fbterm's main() opens with
+ * `seteuid(getuid())`, and the ported fbterm therefore died on its first
+ * statement with a libc assertion and no message of its own -- which reads as
+ * "the program is broken" rather than "the libc is missing eight functions".
+ *
+ * The kernel had the handlers for all eight the whole time; only these wrappers
+ * were absent, and the GET* syscall numbers were reserved but unregistered.
+ * Both halves are fixed.
+ *
+ * The getters return the raw value with no error convention to speak of: mlibc's
+ * signature is uid_t, not int, so a failure cannot be reported as an errno here
+ * at all. getuid(2) cannot fail on this kernel -- there is always a current
+ * task, and a task always has credentials -- so a -1 would be a lie. The
+ * setters do return an errno, because changing identity can genuinely be
+ * refused: only a privileged process may give up or assume another identity, and
+ * an unprivileged setuid(2) that quietly succeeded would be a privilege
+ * escalation.
+ */
+
+uid_t Sysdeps<GetUid>::operator()() {
+	return (uid_t)syscall(SYSCALL_GETUID);
+}
+
+uid_t Sysdeps<GetEuid>::operator()() {
+	return (uid_t)syscall(SYSCALL_GETEUID);
+}
+
+gid_t Sysdeps<GetGid>::operator()() {
+	return (gid_t)syscall(SYSCALL_GETGID);
+}
+
+gid_t Sysdeps<GetEgid>::operator()() {
+	return (gid_t)syscall(SYSCALL_GETEGID);
+}
+
+int Sysdeps<SetUid>::operator()(uid_t uid) {
+	auto ret = syscall(SYSCALL_SETUID, (long)uid);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int Sysdeps<SetEuid>::operator()(uid_t uid) {
+	auto ret = syscall(SYSCALL_SETEUID, (long)uid);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int Sysdeps<SetGid>::operator()(gid_t gid) {
+	auto ret = syscall(SYSCALL_SETGID, (long)gid);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int Sysdeps<SetEgid>::operator()(gid_t gid) {
+	auto ret = syscall(SYSCALL_SETEGID, (long)gid);
+	return ret < 0 ? (int)-ret : 0;
+}
+
 int Sysdeps<Ttyname>::operator()(int fd, char *buf, size_t size) {
-	// Confirm it is a terminal, then report the truth: the kernel keeps no
-	// devname for a vnode, so a descriptor cannot be named.
-	struct termios attr;
-	if (syscall(SYSCALL_IOCTL, fd, SYSCALL_TCGETS, (long)&attr) < 0) {
-		return ENOTTY;
-	}
-	(void)buf;
-	(void)size;
-	return ENOTTY;
+	// The kernel reports the number of bytes written, NUL included, and a
+	// negative errno on failure. mlibc's convention for this sysdep is an errno
+	// with 0 meaning success, so the count must be discarded rather than
+	// returned: passing it through would make every *successful* call look like
+	// an error, because a non-zero byte count is indistinguishable from a
+	// non-zero errno. The same inversion Isatty documents, in the other
+	// direction.
+	//
+	// The count is still checked, because a kernel reporting success without
+	// writing anything would leave `buf` uninitialised and the caller would
+	// build a device path out of stack contents.
+	auto ret = syscall(SYSCALL_TTYNAME, (long)fd, (long)buf, (long)size);
+	if (ret < 0)
+		return -ret;
+	if (ret == 0)
+		return EIO;
+	return 0;
 }
 
 // --- polling -------------------------------------------------------------

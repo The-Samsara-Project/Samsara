@@ -101,7 +101,18 @@ struct SamsaraSysdepTags :
 	VmProtect,
 	// Futex.
 	FutexWake,
-	FutexWait
+	FutexWait,
+	// Credential getters and setters. See Sysdeps<GetUid> in sysdeps.cpp: these
+	// were absent, and mlibc reports an absent sysdep with a panic rather than a
+	// failed call, so a program that merely asked "who am I?" died.
+	GetUid,
+	GetEuid,
+	GetGid,
+	GetEgid,
+	SetUid,
+	SetEuid,
+	SetGid,
+	SetEgid
 {};
 
 template<typename Tag>

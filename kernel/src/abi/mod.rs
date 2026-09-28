@@ -81,6 +81,13 @@ pub mod errno {
     /// mapping is requested for a node that has no mappable physical range --
     /// a request that is well-formed and simply cannot be served.
     pub const ENODEV: i64 = -19;
+    /// Result too large to fit (POSIX `ERANGE`).
+    ///
+    /// Distinct from `EINVAL` because nothing is wrong with the request: the
+    /// caller asked for a correct thing in a buffer that is too small to hold
+    /// the answer. Used by `ttyname(3)`, where returning a truncated device
+    /// path would hand back a path that does not open.
+    pub const ERANGE: i64 = -34;
 }
 
 /// Stable system call numbers. Never renumber; only append.
@@ -348,6 +355,26 @@ pub mod nr {
     /// Only ranges a device actually declares are mappable, which is what stops
     /// a process turning this into "map any physical address I like".
     pub const DEVICE_MMAP: u64 = 86;
+    /// Write the `/dev/...` path of the node behind a descriptor.
+    /// `(fd, buf, len) -> bytes written`, or a negative errno.
+    ///
+    /// `ttyname(3)`: a program needs the *path* of its terminal, not the
+    /// descriptor, so it can reopen it, hand it to a child, or report it. The
+    /// distinction matters in practice -- a terminal is routinely reached
+    /// through a descriptor that is a dup, a pipe end, or a descriptor passed
+    /// over IPC, none of which say where they came from.
+    ///
+    /// The path is written with a terminating NUL, and the returned count
+    /// includes that NUL, as Linux does. `len` is the size of the caller's
+    /// buffer, and a buffer too small yields ERANGE rather than a truncated
+    /// path: half a device path is not a path, and a program that reopened it
+    /// would fail somewhere unrelated to the real problem.
+    ///
+    /// Fails with ENOTTY when the descriptor is not a terminal and ENOENT when
+    /// it is one whose path cannot be recovered -- which is the honest answer
+    /// for a terminal that did not come from devfs, and better than a
+    /// fabricated path that would not open.
+    pub const TTYNAME: u64 = 87;
     /// First number reserved for out-of-tree/experimental use.
     pub const EXPERIMENTAL_BASE: u64 = 0x8000_0000_0000_0000;
 }
@@ -569,6 +596,20 @@ pub fn register_defaults() {
     register(nr::GETRESGID, sys_getresgid);
     register(nr::GETGROUPS, sys_getgroups);
     register(nr::SETGROUPS, sys_setgroups);
+    // The credential getters. Handlers for all four already existed; they were
+    // simply never registered, so the numbers were reserved and the calls went
+    // nowhere.
+    //
+    // The symptom was unusually indirect. mlibc turns a *missing sysdep* into a
+    // panic rather than a failed call, so a program whose first statement was
+    // `seteuid(getuid())` -- which is what fbterm's main() does -- died with a
+    // libc assertion and no message of its own. An unregistered syscall number
+    // producing a panic inside the libc, rather than an ENOSYS the program could
+    // handle, is worth remembering when adding numbers to the table.
+    register(nr::GETUID, sys_getuid);
+    register(nr::GETEUID, sys_geteuid);
+    register(nr::GETGID, sys_getgid);
+    register(nr::GETEGID, sys_getegid);
     register(nr::SETUID, sys_setuid);
     register(nr::SETGID, sys_setgid);
     register(nr::SETEUID, sys_seteuid);
@@ -634,6 +675,7 @@ pub fn register_defaults() {
     register(nr::MUNMAP, sys_munmap);
     register(nr::MPROTECT, sys_mprotect);
     register(nr::DEVICE_MMAP, sys_device_mmap);
+    register(nr::TTYNAME, sys_ttyname);
     register(nr::MKDIR, sys_mkdir);
     register(nr::SHM_CREATE, sys_shm_create);
     register(nr::SHM_MAP, sys_shm_map);
@@ -974,6 +1016,259 @@ fn sys_write(fd: u64, buf: u64, len: u64, _a3: u64, _a4: u64, _a5: u64) -> i64 {
     }
 }
 
+/// Linux-compatible framebuffer ioctl requests, and the two structures they
+/// exchange with `/dev/fb0`.
+///
+/// These are Linux's UAPI values, copied rather than invented, and the struct
+/// layouts below are laid out field for field and type for type as Linux has
+/// them. That is not a style preference: the kernel writes one of these into a
+/// user buffer and a ported terminal reads it with its own `<linux/fb.h>`, and
+/// the two definitions are compiled independently. A single wrong field width
+/// shifts every field after it, and the symptom is a terminal that believes it
+/// has a 0-bit framebuffer and refuses to start -- not a crash, and not anything
+/// that points at the cause.
+///
+/// The two C headers that must agree with these are:
+///   - ports/fbterm/include/linux/fb.h
+///   - any future consumer's own <linux/fb.h>
+///
+/// A mismatch between them is the failure mode to watch for when either side is
+/// edited. There is no way for the compiler to catch it, which is why the
+/// layout is duplicated in full rather than trimmed to the fields in use: a
+/// trimmed struct would move every following field and hide the disagreement
+/// behind a struct that merely happens to be smaller.
+pub mod framebuffer_ioctl {
+    use crate::framebuffer::FbGeometry;
+
+    /// Report the display mode. Linux's request number.
+    pub const FBIOGET_VSCREENINFO: u32 = 0x4600;
+    /// Report the display's fixed properties. Linux's request number.
+    pub const FBIOGET_FSCREENINFO: u32 = 0x4602;
+
+    /// Pixel storage classes, from `linux/fb.h`.
+    pub const FB_TYPE_PACKED_PIXELS: u32 = 0;
+    /// Visual type for a packed truecolour display.
+    pub const FB_VISUAL_TRUECOLOR: u32 = 2;
+
+    /// One colour channel within a pixel.
+    ///
+    /// `msb_right` is left zero, which is correct rather than merely convenient:
+    /// x86 is little-endian and the bootloader's framebuffer tag describes
+    /// left-aligned channels, so zero is the true value. Setting it would tell a
+    /// program to reverse the channel it is about to write.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct FbBitfield {
+        /// Bit position of the channel within one pixel.
+        pub offset: u32,
+        /// Width of the channel in bits.
+        pub length: u32,
+        /// Non-zero when the channel's most significant bit is rightmost.
+        ///
+        /// Always zero here: x86 is little-endian and the bootloader's tag
+        /// describes left-aligned channels. Setting it would tell a program to
+        /// reverse the channel it is about to write.
+        pub msb_right: u32,
+    }
+
+    /// `struct fb_var_screeninfo` from `linux/fb.h`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct FbVarScreeninfo {
+        /// Visible width in pixels.
+        pub xres: u32,
+        /// Visible height in pixels.
+        pub yres: u32,
+        /// Width of the backing buffer. Equal to `xres`: there is no overscan.
+        pub xres_virtual: u32,
+        /// Height of the backing buffer. Equal to `yres`: there is no overscan.
+        pub yres_virtual: u32,
+        /// Horizontal pan offset. Always zero: the display cannot pan.
+        pub xoffset: u32,
+        /// Vertical pan offset. Always zero: the display cannot pan.
+        pub yoffset: u32,
+        /// Bits per pixel. 32 on every mode the bootloader or the Bochs
+        /// fallback produces.
+        pub bits_per_pixel: u32,
+        /// Non-zero for a greyscale mode. Always zero here.
+        pub grayscale: u32,
+        /// Red channel placement.
+        pub red: FbBitfield,
+        /// Green channel placement.
+        pub green: FbBitfield,
+        /// Blue channel placement.
+        pub blue: FbBitfield,
+        /// Alpha channel placement. Unused; the modes here are opaque.
+        pub transp: FbBitfield,
+        /// Non-zero if the mode is not one of the standard types.
+        pub nonstd: u32,
+        /// Bit mask of which fields should be changed on a mode set. The set
+        /// requests that can be honoured are refused rather than ignored.
+        pub activate: u32,
+        /// Physical display height in millimetres. Zero: unknown.
+        pub height: u32,
+        /// Physical display width in millimetres. Zero: unknown.
+        pub width: u32,
+        /// Acceleration flags. Zero: no hardware acceleration.
+        pub accel_flags: u32,
+        /// Pixel clock in picoseconds. Zero: not applicable, and a terminal
+        /// reading a plausible-looking clock would derive a refresh rate for
+        /// hardware that has none.
+        pub pixclock: u32,
+        /// Left margin in pixels. Zero: no pan range.
+        pub left_margin: u32,
+        /// Right margin in pixels. Zero: no pan range.
+        pub right_margin: u32,
+        /// Upper margin in pixels. Zero: no pan range.
+        pub upper_margin: u32,
+        /// Lower margin in pixels. Zero: no pan range.
+        pub lower_margin: u32,
+        /// Horizontal sync length in pixels.
+        pub hsync_len: u32,
+        /// Vertical sync length in pixels.
+        pub vsync_len: u32,
+        /// Bit mask of synchronisation polarity and drive type.
+        pub sync: u32,
+        /// Bit mask of `FB_VMODE_*` flags. Zero: no vertical panning.
+        pub vmode: u32,
+        /// Rotation. Zero: none.
+        pub rotate: u32,
+        /// Colour space. Zero: the default.
+        pub colorspace: u32,
+        /// Reserved for future use. Always zero.
+        pub reserved: [u32; 4],
+    }
+
+    /// `struct fb_fix_screeninfo` from `linux/fb.h`.
+    ///
+    /// `smem_len` is deliberately named for the length it holds rather than
+    /// following modern Linux's `smem_start`. A ported fbterm reads this member
+    /// as the length argument to `mmap(2)`, so the kernel fills it with a size;
+    /// renaming the member to `smem_start` without changing that would make a
+    /// terminal map a physical address as a length.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct FbFixScreeninfo {
+        /// Driver identifier string, NUL-padded. Zeroed rather than invented:
+        /// a program may print it, and a made-up name would be a false claim
+        /// about which driver is in use.
+        pub id: [u8; 16],
+        /// Length in bytes of the mappable range.
+        ///
+        /// Not a base address, despite the position modern Linux gives
+        /// `smem_start`: a ported terminal reads this member as the length
+        /// argument to `mmap(2)`, so a physical address here would make it try
+        /// to map a terabyte.
+        pub smem_len: usize,
+        /// Pixel storage class. `FB_TYPE_PACKED_PIXELS`.
+        pub type_: u32,
+        /// Auxiliary type. Zero.
+        pub type_aux: u32,
+        /// Visual type. `FB_VISUAL_TRUECOLOR`.
+        pub visual: u32,
+        /// Horizontal pan step in pixels. Zero: cannot pan horizontally.
+        pub xpanstep: u16,
+        /// Vertical pan step in pixels. Zero: cannot pan vertically.
+        ///
+        /// The true value, not a placeholder. The bootloader's tag describes a
+        /// single visible window with no larger virtual screen behind it, so a
+        /// non-zero step here would make a terminal believe it could scroll by
+        /// shifting a window -- and it would then scroll into whatever the next
+        /// page happened to hold.
+        pub ypanstep: u16,
+        /// Vertical wrap step in lines. Zero: cannot wrap vertically.
+        pub ywrapstep: u16,
+        /// Bytes per scanline. May exceed `xres * bits_per_pixel / 8`.
+        pub line_length: usize,
+        /// Physical base of an MMIO region. Zero: this is memory, not registers.
+        pub mmio_start: usize,
+        /// Length of the MMIO region. Zero: none.
+        pub mmio_len: u32,
+        /// Acceleration type. Zero: none.
+        pub accel: u32,
+        /// Capability flags. Zero.
+        pub capabilities: u16,
+        /// Reserved for future use. Always zero.
+        pub reserved: [u16; 2],
+    }
+
+    impl FbFixScreeninfo {
+        /// Build the fixed-properties block for an active framebuffer.
+        pub fn from_geometry(g: &FbGeometry) -> Self {
+            FbFixScreeninfo {
+                id: [0; 16],
+                // The mappable range, not a base address. See the note on the
+                // field.
+                smem_len: g.size,
+                type_: FB_TYPE_PACKED_PIXELS,
+                type_aux: 0,
+                visual: FB_VISUAL_TRUECOLOR,
+                // Zero on all three, and that is the true answer rather than a
+                // placeholder. The bootloader's tag describes a single visible
+                // window with no larger virtual screen behind it, so the
+                // hardware cannot pan. A non-zero step here would make a
+                // terminal believe it could scroll by shifting a window, and it
+                // would then scroll into whatever the next page happens to hold.
+                xpanstep: 0,
+                ypanstep: 0,
+                ywrapstep: 0,
+                line_length: g.pitch,
+                mmio_start: 0,
+                mmio_len: 0,
+                accel: 0,
+                capabilities: 0,
+                reserved: [0; 2],
+            }
+        }
+    }
+
+    impl FbVarScreeninfo {
+        /// Build the mode block for an active framebuffer.
+        pub fn from_geometry(g: &FbGeometry) -> Self {
+            // The virtual resolution equals the visible one: there is no
+            // overscan area to pan into, and claiming a larger virtual screen
+            // would advertise scroll range that does not exist.
+            FbVarScreeninfo {
+                xres: g.width as u32,
+                yres: g.height as u32,
+                xres_virtual: g.width as u32,
+                yres_virtual: g.height as u32,
+                xoffset: 0,
+                yoffset: 0,
+                bits_per_pixel: g.bpp as u32,
+                // The colour channel placement is not optional. A terminal
+                // derives the shift and mask for each channel from these, and
+                // all-zero means "a channel of zero width" -- so leaving them
+                // zeroed does not draw black, it draws nothing at all, while
+                // looking like a successful query. The multiboot2 framebuffer
+                // tag states the positions, so pass them through rather than
+                // assuming a layout.
+                red: FbBitfield {
+                    offset: g.red_pos as u32,
+                    length: g.red_size as u32,
+                    msb_right: 0,
+                },
+                green: FbBitfield {
+                    offset: g.green_pos as u32,
+                    length: g.green_size as u32,
+                    msb_right: 0,
+                },
+                blue: FbBitfield {
+                    offset: g.blue_pos as u32,
+                    length: g.blue_size as u32,
+                    msb_right: 0,
+                },
+                // Zeroed is correct for every remaining field: no greyscale
+                // mode, no non-standard timing, unknown physical dimensions, and
+                // no hardware acceleration. A terminal reading a plausible-
+                // looking clock or margin would compute a refresh rate for
+                // hardware that has none.
+                ..Default::default()
+            }
+        }
+    }
+}
+
 /// Linux-compatible terminal ioctl request numbers supported by PTY slaves.
 /// The syscall itself is Samsara ABI; these request values make existing
 /// termios-oriented userspace straightforward to port.
@@ -1006,6 +1301,7 @@ mod terminal_ioctl {
 /// implement it.
 fn ioctl_arg_len(cmd: u32) -> Option<usize> {
     use terminal_ioctl::*;
+    use framebuffer_ioctl::*;
     let termios = core::mem::size_of::<crate::drivers::pty::Termios>();
     match cmd {
         TCGETS | TCGETA | TCSETS | TCSETSW | TCSETSF | TCSETA | TCSETAW | TCSETAF => {
@@ -1015,6 +1311,8 @@ fn ioctl_arg_len(cmd: u32) -> Option<usize> {
         // These all take or return a single `int`/`pid_t`.
         TIOCGPGRP | TIOCSPGRP | TIOCGSID | FIONREAD | TCXONC | TCFLSH | TIOCGPTN => Some(4),
         TCSBRK => Some(4),
+        FBIOGET_VSCREENINFO => Some(core::mem::size_of::<FbVarScreeninfo>()),
+        FBIOGET_FSCREENINFO => Some(core::mem::size_of::<FbFixScreeninfo>()),
         _ => None,
     }
 }
@@ -2647,6 +2945,50 @@ fn sys_shm_destroy(handle: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64
         Ok(()) => 0,
         Err(e) => e,
     }
+}
+
+fn sys_ttyname(fd: u64, buf: u64, len: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if len == 0 {
+        return errno::EINVAL;
+    }
+    let node = match crate::vfs::fdtab::node_of(task, fd as usize) {
+        Ok(n) => n,
+        Err(e) => return e.into(),
+    };
+    // Not a terminal. Checked before the path lookup so a program gets the
+    // specific, actionable errno for "that is not a terminal" rather than the
+    // vaguer "no such file" that a failed lookup would produce.
+    if !node.is_terminal() {
+        return errno::ENOTTY;
+    }
+    // A terminal that devfs did not publish -- reached through some other
+    // mount, say -- has no path this kernel can name. ENOENT says "there is no
+    // such name", which is true, and a program that falls back to its
+    // descriptor still works.
+    let Some(path) = crate::vfs::devfs::path_of(&node) else {
+        return errno::ENOENT;
+    };
+    // +1 for the NUL, which is part of the reported length.
+    let needed = path.len() as u64 + 1;
+    if needed > len {
+        return errno::ERANGE;
+    }
+    if validate_range(buf as usize, needed as usize) < needed as usize {
+        return errno::EFAULT;
+    }
+    let dst = buf as *mut u8;
+    // SAFETY: validate_range above proved `needed` bytes at `buf` are both
+    // mapped and writable by this process, and `needed` is exactly the size of
+    // the copy.
+    unsafe {
+        core::ptr::copy_nonoverlapping(path.as_ptr(), dst, path.len());
+        *dst.add(path.len()) = 0;
+    }
+    needed as i64
 }
 
 fn sys_fb_info(buf: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
