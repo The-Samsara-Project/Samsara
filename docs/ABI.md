@@ -72,6 +72,10 @@ negative = negated errno (see table below).
 | 84 | `MUNMAP`       | `(va, size) -> 0`                   | release an anonymous mapping; `EPERM` if it is not yours |
 | 85 | `MPROTECT`     | `(va, size, prot) -> 0`             | change a mapping's protection; `prot` is Linux's `PROT_*` |
 | 86 | `DEVICE_MMAP`  | `(fd, offset, len, prot) -> va`     | map a device node's physical range; the file-backed half of `mmap(2)` |
+| 87 | `TTYNAME`      | `(fd, buf, len) -> len`            | write the `/dev/...` path of a descriptor's node, NUL included; `ttyname(3)`. `ENOTTY` if not a terminal, `ENOENT` if devfs never published it, `ERANGE` if `buf` is too small |
+| 88 | `DUP`          | `(oldfd) -> newfd`                 | duplicate a descriptor, **sharing** its file offset; the lowest free descriptor |
+| 89 | `DUP2`         | `(oldfd, newfd) -> newfd`          | as `DUP` into a specific slot, closing what was there. `oldfd == newfd` succeeds and changes nothing |
+| 90 | `PSELECT6`     | `(nfds, r, w, e, timeout, sigmask) -> n` | `pselect(6)`, and what libc `select(3)` routes through. `fd_set` is Linux's: 1024 bits / 128 bytes. Readiness is reported by clearing the bits of descriptors that are not ready. A non-null `sigmask` returns `ENOSYS` |
 | ≥ `0x8000_0000_0000_0000` | experimental range | — | reserved for out-of-tree experiments, never standardized |
 
 `GET_ENV` (71) copies the calling process's environment in the same encoding as

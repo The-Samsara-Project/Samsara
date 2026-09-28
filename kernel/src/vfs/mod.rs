@@ -13,9 +13,11 @@ pub mod procfs;
 pub mod ramfs;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::Spinlock;
 
 // Node type, error space, and the vnode abstraction live in `driver_common`
@@ -214,7 +216,18 @@ pub struct FileHandle {
     /// Backing vnode.
     pub node: VnodeRef,
     /// Read/write cursor.
-    pub offset: u64,
+    ///
+    /// Shared, not per-descriptor, and that is the whole point of `dup(2)`:
+    /// a duplicated descriptor refers to the *same* open file description, so
+    /// the two must advance together. Two descriptors over a plain `u64` would
+    /// each keep their own cursor, and a program writing through one while
+    /// reading through the other -- which is what a shell's `cmd > f` does with
+    /// a shared output -- would silently overwrite itself.
+    ///
+    /// It is an atomic rather than a plain cell for the same reason: the
+    /// descriptors are not mutually exclusive, and two tasks sharing a pipe
+    /// through a duplicated descriptor can be inside `read` at the same time.
+    pub offset: Arc<AtomicU64>,
     /// Access mode granted by `open` (`O_RDONLY`/`O_WRONLY`/`O_RDWR`).
     pub access: u32,
     /// Status flags currently in effect, as set by `open` and changed by
@@ -230,8 +243,11 @@ impl FileHandle {
         if self.access == O_WRONLY {
             return Err(FsError::BadDescriptor);
         }
-        let n = self.node.read_at(self.offset, buf)?;
-        self.offset += n as u64;
+        let at = self.offset.load(Ordering::Relaxed);
+        let n = self.node.read_at(at, buf)?;
+        // Advance by however much was actually read, not by what was asked
+        // for: a short read must not skip the bytes that were not delivered.
+        self.offset.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
     }
 
@@ -240,8 +256,9 @@ impl FileHandle {
         if self.access == O_RDONLY {
             return Err(FsError::BadDescriptor);
         }
-        let n = self.node.write_at(self.offset, buf)?;
-        self.offset += n as u64;
+        let at = self.offset.load(Ordering::Relaxed);
+        let n = self.node.write_at(at, buf)?;
+        self.offset.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
     }
 }
@@ -272,7 +289,7 @@ impl FdTable {
             if slot.is_none() {
                 *slot = Some(FileHandle {
                     node,
-                    offset: 0,
+                    offset: Arc::new(AtomicU64::new(0)),
                     access,
                     status,
                 });
@@ -281,11 +298,54 @@ impl FdTable {
         }
         self.fds.push(Some(FileHandle {
             node,
-            offset: 0,
+            offset: Arc::new(AtomicU64::new(0)),
             access,
             status,
         }));
         self.fds.len() - 1
+    }
+
+    /// Fetch a clone of the whole open-file description behind `fd`.
+    ///
+    /// Cloning shares the offset rather than copying it, which is what makes
+    /// the clone usable as a `dup(2)`. A caller wanting only the node should use
+    /// [`FdTable::get`].
+    pub fn description(&self, fd: usize) -> Result<FileHandle, FsError> {
+        self.fds
+            .get(fd)
+            .and_then(|s| s.as_ref())
+            .cloned()
+            .ok_or(FsError::BadDescriptor)
+    }
+
+    /// Install an existing open-file description, keeping its shared offset.
+    ///
+    /// The counterpart to [`FdTable::install_full`], which starts a *new*
+    /// description at offset zero. Confusing the two is the bug `dup` exists to
+    /// avoid, so the distinction is in the name and the doc rather than left to
+    /// the caller.
+    pub fn install_description(&mut self, handle: FileHandle) -> usize {
+        self.insert(handle)
+    }
+
+    fn insert(&mut self, handle: FileHandle) -> usize {
+        for (i, slot) in self.fds.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(handle);
+                return i;
+            }
+        }
+        self.fds.push(Some(handle));
+        self.fds.len() - 1
+    }
+
+    /// Place `handle` at exactly `fd`, displacing and returning whatever was
+    /// there. For `dup2(2)`.
+    pub fn replace_at(&mut self, fd: usize, handle: FileHandle) -> Option<FileHandle> {
+        while self.fds.len() <= fd {
+            self.fds.push(None);
+        }
+        self.fds[fd].replace(handle)
     }
 
     /// Fetch a mutable open-file description behind `fd`.

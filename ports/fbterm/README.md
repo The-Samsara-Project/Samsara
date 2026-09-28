@@ -44,7 +44,7 @@ output is a function of this directory and the sysroot only, and the final
 `sha256sum` lets you verify two builds agree. Verified identical across clean
 rebuilds at the time of writing:
 
-    de45861ebb0c4f0ce263bcc5a7b5fd44352474e8aa81cd97e9fa1c0a89f6965f
+    (see the sha256sum printed by build.sh; it changes with any patch)
 
 Set `V=1` to see the compile lines; they are hidden otherwise, because twenty
 clang invocations with paths long enough to wrap bury the handful of lines
@@ -60,10 +60,11 @@ emulating it. The removals are listed below because each is a real reduction in
 capability, and a reader deciding whether fbterm is the right terminal for
 Samsara needs to see them rather than discover them.
 
-The kernel work this port depends on is small and already present:
-`/dev/fb0` with `DEVICE_MMAP`, a pty with a real termios line discipline,
-`TIOCGPTN`, and `fork`/`setsid`. `/dev/input/event0` exists and works but is
-*not* used -- see the input note below.
+The kernel work this port depends on is small and was added alongside the port:
+`/dev/fb0` with `DEVICE_MMAP` and the `FBIOGET_*` queries, a pty with a real
+termios line discipline, `TIOCGPTN`, `TTYNAME`, `DUP`/`DUP2`, `PSELECT6`, and
+`fork`/`setsid`. `/dev/input/event0` exists and works but is *not* used -- see
+the input note below.
 
 Changes
 -------
@@ -77,6 +78,7 @@ Each patch is one concern, and the header comment on each says why in prose.
     0005  drop the console keymap patch and the raw-key decoder
     0006  null-check getpwuid()
     0007  include the headers for symbols these files actually use
+    0008  ask isatty(3) instead of pattern-matching the terminal path
 
 Port-provided code
 ------------------
@@ -141,12 +143,20 @@ would leave fbterm with no shell at all to fix a convenience.
 descriptors, for which epoll's O(1) readiness is not an advantage. The
 limitation is real but not reached.
 
-**The `ttyname_r` name check.** `TtyInput::createInstance` rejects input unless
-the terminal is named `/dev/tty*` or `/dev/vc*`, printing "stdin isn't a
-interactive tty!" and refusing to start. A Samsara pty slave is `/dev/pts0`,
-so this check is still outstanding and is the next thing to fix; there is no
-`ttyname` syscall yet. Note that the check is wrong on Linux too for anything on
-a pty, and a pty is a perfectly good interactive terminal.
+**No cursor blink, and no shell output yet.** fbterm drives its cursor blink
+with `setitimer(ITIMER_REAL)`, and Samsara has no interval timers, so the call
+fails and the cursor stays solid. That is the last missing libc function fbterm
+touches; everything else it needs is implemented.
+
+fbterm also currently draws a black screen, which is correct rather than broken:
+it clears the framebuffer and has nothing to display, because it spawns a shell
+with `forkpty` and there is no `/bin/sh` to exec yet. That is the gap busybox
+fills, and it is the next piece of work.
+
+The `ttyname_r` name check that used to be listed here is resolved: patch 0008
+replaces it with `isatty(3)`, and syscall 87 (`TTYNAME`) now lets a program ask
+the kernel for a descriptor's device path. fbterm starts, reports its terminal,
+maps the framebuffer and stays running.
 
 Rebuilding against a newer fbterm
 ---------------------------------

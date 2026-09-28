@@ -1043,6 +1043,57 @@ int Sysdeps<SetEgid>::operator()(gid_t gid) {
 	return ret < 0 ? (int)-ret : 0;
 }
 
+/*
+ * pselect(2), and the syscall behind select(2) as well.
+ *
+ * mlibc routes `select` through this same sysdep with a null signal mask, so
+ * implementing it here is what makes both work. The arguments are handed
+ * straight through: the three `fd_set`s are the kernel's own layout (1024 bits,
+ * 128 bytes, matching Linux's), the timeout is a `struct timespec` the kernel
+ * reads in place, and the kernel writes readiness back into the caller's sets by
+ * clearing the bits of descriptors that are not ready -- which is what select(2)
+ * specifies, and the reason a caller may loop on the same set without reloading
+ * it.
+ *
+ * A non-null `sigmask` is passed through and refused by the kernel with ENOSYS,
+ * which surfaces here as ENOSYS and makes pselect(3) fail honestly. See the note
+ * on sys_pselect6 for why a partial implementation would be worse than none.
+ */
+int Sysdeps<Pselect>::operator()(int nfds, fd_set *read_set, fd_set *write_set,
+                                 fd_set *except_set, const struct timespec *timeout,
+                                 const sigset_t *sigmask, int *num_events) {
+	auto ret = syscall(SYSCALL_PSELECT6, (long)nfds, (long)read_set, (long)write_set,
+	                   (long)except_set, (long)timeout, (long)sigmask);
+	if (ret < 0)
+		return -ret;
+	*num_events = (int)ret;
+	return 0;
+}
+
+int Sysdeps<Dup>::operator()(int fd, int flags, int *newfd) {
+	// `flags` is O_CLOEXEC. The kernel has no close-on-exec flag to set, so the
+	// value is accepted and ignored rather than refused: refusing would make
+	// dup(2) fail for a caller that merely asked for the default, safer
+	// behaviour, and the consequence of ignoring it is that a duplicated
+	// descriptor survives an exec it perhaps should not have. That is a real
+	// (if minor) leak, and it is the honest price of a kernel without
+	// FD_CLOEXEC tracking; it is noted here rather than hidden.
+	(void)flags;
+	auto ret = syscall(SYSCALL_DUP, (long)fd);
+	if (ret < 0)
+		return -ret;
+	*newfd = (int)ret;
+	return 0;
+}
+
+int Sysdeps<Dup2>::operator()(int fd, int flags, int newfd) {
+	(void)flags;
+	auto ret = syscall(SYSCALL_DUP2, (long)fd, (long)newfd);
+	if (ret < 0)
+		return -ret;
+	return 0;
+}
+
 int Sysdeps<Ttyname>::operator()(int fd, char *buf, size_t size) {
 	// The kernel reports the number of bytes written, NUL included, and a
 	// negative errno on failure. mlibc's convention for this sysdep is an errno

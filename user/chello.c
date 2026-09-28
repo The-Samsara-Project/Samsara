@@ -706,6 +706,114 @@ int main(void) {
 		close(fbcheck);
 	}
 
+	// dup(2) / dup2(2). The property that matters is that the duplicate shares
+	// the file offset, not that it opens the same file: a program that writes
+	// through one descriptor and reads through the other -- which is what a
+	// shell's `cmd > f` and a protocol's handshake both do -- only works if the
+	// two advance together. Two descriptors with independent cursors would
+	// silently overwrite each other.
+	{
+		char tmpa[] = "/tmp/dup-a";
+		char tmpb[] = "/tmp/dup-b";
+		int a = open(tmpa, O_RDWR | O_CREAT | O_TRUNC, 0600);
+		int b = open(tmpb, O_RDWR | O_CREAT | O_TRUNC, 0600);
+		check(a >= 0 && b >= 0, "open two files for the dup test");
+		if (a >= 0 && b >= 0) {
+			int d = dup(a);
+			check(d >= 0, "dup");
+			if (d >= 0) {
+				// The lowest free descriptor, which in a program that has
+				// closed things can be below 3. Only the "not the original"
+				// part is portable; a specific number is not.
+				check(d != a, "dup returns a different descriptor");
+				write(a, "0123456789", 10);
+				// Reading through the duplicate must start where the write
+				// left off -- that is the sharing, and it is the whole point.
+				char rb[16] = { 0 };
+				ssize_t rn = read(d, rb, sizeof rb);
+				check(rn == 0, "dup shares the file offset");
+				lseek(a, 0, SEEK_SET);
+				// And the offset is shared, so the seek is visible through
+				// the duplicate as well.
+				rn = read(d, rb, 4);
+				check(rn == 4 && memcmp(rb, "0123", 4) == 0,
+				      "dup sees the original's seek");
+				close(d);
+			}
+			// dup2 onto a specific slot, displacing what was there.
+			int n2 = dup2(a, b);
+			check(n2 == b, "dup2 returns newfd");
+			// Sharing, proved without depending on the file's contents:
+			// seek to a known place and write, then ask the *other*
+			// descriptor where it is. If the offsets were independent, b
+			// would still report 0 and the write through a would be
+			// invisible to b's idea of where it is.
+			lseek(a, 0, SEEK_SET);
+			write(a, "Q", 1);
+			off_t seen = lseek(b, 0, SEEK_CUR);
+			check(seen == 1, "dup2 shares the offset too");
+			// dup2 with oldfd == newfd must succeed and change nothing --
+			// POSIX is explicit, and a program checking the return value
+			// would otherwise have closed the descriptor it meant to keep.
+			check(dup2(b, b) == b, "dup2 with oldfd == newfd succeeds");
+			// Seeks are explicit throughout: the descriptor shares an offset
+			// with `a`, so its position is whatever the previous check left
+			// behind, and a test that assumed 0 would fail for the right
+			// reason at the wrong place. If dup2 had closed the descriptor,
+			// the write below would fail with EBADF -- which is the point.
+			lseek(b, 0, SEEK_SET);
+			char rc[8] = { 0 };
+			check(write(b, "z", 1) == 1, "dup2 oldfd == newfd left it open");
+			lseek(b, 0, SEEK_SET);
+			check(read(b, rc, 1) == 1 && rc[0] == 'z',
+			      "dup2 oldfd == newfd wrote through the same fd");
+			close(a);
+			close(b);
+		}
+		unlink(tmpa);
+		unlink(tmpb);
+	}
+
+	// select(2), which mlibc routes through the same syscall as pselect(2).
+	// fbterm's whole event loop is select, so this is not a nicety.
+	{
+		// A descriptor with nothing on it must block until the timeout, and
+		// report a zero count. If it returned ready, a program looping on
+		// select would spin at 100% CPU.
+		int sv[2];
+		check(pipe(sv) == 0, "pipe for the select test");
+		if (sv[0] >= 0) {
+			fd_set rf;
+			FD_ZERO(&rf);
+			FD_SET(sv[0], &rf);
+			struct timeval tv = { 0, 50000 }; /* 50ms */
+			int n = select(sv[0] + 1, &rf, NULL, NULL, &tv);
+			check(n == 0, "select times out on an idle pipe");
+			// Now make it ready and check both the count and that the set
+			// still has the bit set. The set is modified in place, so a
+			// select that reports ready but clears the bit would make a
+			// retry loop hang.
+			write(sv[1], "k", 1);
+			FD_ZERO(&rf);
+			FD_SET(sv[0], &rf);
+			tv.tv_sec = 1;
+			tv.tv_usec = 0;
+			n = select(sv[0] + 1, &rf, NULL, NULL, &tv);
+			check(n == 1, "select reports the readable end");
+			check(FD_ISSET(sv[0], &rf), "select leaves the ready bit set");
+			// A write-only watch on the read end can never be satisfied, so
+			// it must time out rather than report ready.
+			FD_ZERO(&rf);
+			FD_SET(sv[0], &rf);
+			tv.tv_sec = 0;
+			tv.tv_usec = 50000;
+			check(select(sv[0] + 1, NULL, &rf, NULL, &tv) == 0,
+			      "select will not report a read end as writable");
+			close(sv[0]);
+			close(sv[1]);
+		}
+	}
+
 	// The old framing must still be reachable: the evdev device is layered
 	// over these, not instead of them, and anything already using them --
 	// the installer, the Rust runtime -- depends on it.

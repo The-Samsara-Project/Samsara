@@ -66,6 +66,9 @@
 #define SYSCALL_MPROTECT       85
 #define SYSCALL_DEVICE_MMAP    86
 #define SYSCALL_TTYNAME        87
+#define SYSCALL_DUP            88
+#define SYSCALL_DUP2           89
+#define SYSCALL_PSELECT6       90
 #define SYSCALL_GETUID          31
 #define SYSCALL_GETGID          32
 #define SYSCALL_GETEUID         33

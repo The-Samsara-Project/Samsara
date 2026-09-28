@@ -112,7 +112,10 @@ struct SamsaraSysdepTags :
 	SetUid,
 	SetEuid,
 	SetGid,
-	SetEgid
+	SetEgid,
+	Dup,
+	Dup2,
+	Pselect
 {};
 
 template<typename Tag>

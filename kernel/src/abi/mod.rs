@@ -375,6 +375,29 @@ pub mod nr {
     /// for a terminal that did not come from devfs, and better than a
     /// fabricated path that would not open.
     pub const TTYNAME: u64 = 87;
+    /// `(oldfd) -> newfd`. Duplicate a descriptor, sharing its file offset.
+    ///
+    /// The sharing is the whole point and the reason this is not a copy. Two
+    /// descriptors over one open file description must advance together, and
+    /// that is what every shell redirection and every `dup2`-based protocol
+    /// handshake is built on.
+    pub const DUP: u64 = 88;
+    /// `(oldfd, newfd) -> newfd`. As [`DUP`] but into a specific slot,
+    /// closing whatever was there.
+    ///
+    /// `oldfd == newfd` succeeds and changes nothing, as POSIX requires.
+    pub const DUP2: u64 = 89;
+    /// `(nfds, rfds, wfds, efds, timeout, sigmask) -> ready count`.
+    ///
+    /// `pselect(6)`, and the syscall behind libc `select(3)` -- mlibc routes
+    /// `select` through this with a null signal mask. `timeout` is a
+    /// `struct timespec` or null for an indefinite wait; each of the three
+    /// descriptor arguments is a `fd_set` (1024 bits) or null.
+    ///
+    /// A non-null `sigmask` is refused with ENOSYS. Doing it properly means
+    /// swapping the blocked mask atomically with respect to delivery, and a
+    /// subtly wrong version is worse than none.
+    pub const PSELECT6: u64 = 90;
     /// First number reserved for out-of-tree/experimental use.
     pub const EXPERIMENTAL_BASE: u64 = 0x8000_0000_0000_0000;
 }
@@ -676,6 +699,9 @@ pub fn register_defaults() {
     register(nr::MPROTECT, sys_mprotect);
     register(nr::DEVICE_MMAP, sys_device_mmap);
     register(nr::TTYNAME, sys_ttyname);
+    register(nr::DUP, sys_dup);
+    register(nr::DUP2, sys_dup2);
+    register(nr::PSELECT6, sys_pselect6);
     register(nr::MKDIR, sys_mkdir);
     register(nr::SHM_CREATE, sys_shm_create);
     register(nr::SHM_MAP, sys_shm_map);
@@ -1449,12 +1475,31 @@ fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64, _a4: u64, _a5: u64, _a6: u64) 
         });
     }
 
-    let mut flush = |polls: &[PollFd]| {
-        for (i, p) in polls.iter().enumerate() {
-            let off = i * pfsize + 6;
-            mem[off..off + 2].copy_from_slice(&p.revents.to_ne_bytes());
-        }
-    };
+    let ret = wait_on_polls(task, &mut polls, tmo);
+
+    // Write the results back before reporting the count, so a caller that sees
+    // a non-zero return always finds revents populated.
+    for (i, p) in polls.iter().enumerate() {
+        let off = i * pfsize + 6;
+        mem[off..off + 2].copy_from_slice(&p.revents.to_ne_bytes());
+    }
+    ret
+}
+
+/// Block until at least one of `polls` is ready, `tmo` milliseconds elapse, or
+/// a signal arrives. Fills in each `revents` and returns the ready count.
+///
+/// The shared body of `poll(2)` and `pselect(2)`. The two syscalls differ only
+/// in how a caller describes what it wants to watch -- an array of `pollfd`
+/// versus three descriptor bitmaps -- and in how results are written back. The
+/// part that is easy to get subtly wrong is deciding readiness, parking without
+/// losing a wakeup, and honouring the timeout, and none of that should be
+/// written twice.
+///
+/// `tmo` is milliseconds, signed: negative waits indefinitely, zero probes once
+/// and returns.
+fn wait_on_polls(task: usize, polls: &mut alloc::vec::Vec<PollFd>, tmo: i64) -> i64 {
+    let n = polls.len();
 
     let deadline: Option<u64> = if tmo > 0 {
         Some(crate::time::ticks() + ms_to_ticks(tmo as u64))
@@ -1477,7 +1522,7 @@ fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64, _a4: u64, _a5: u64, _a6: u64) 
         // across the whole iteration.
         let mut nodes: alloc::vec::Vec<Option<(crate::vfs::VnodeRef, u32)>> =
             alloc::vec::Vec::with_capacity(n);
-        for p in &polls {
+        for p in polls.iter() {
             if p.fd < 0 {
                 nodes.push(None);
                 continue;
@@ -1511,16 +1556,13 @@ fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64, _a4: u64, _a5: u64, _a6: u64) 
             }
         }
         if ready > 0 {
-            flush(&polls);
             return ready as i64;
         }
         if tmo == 0 {
-            flush(&polls);
             return 0;
         }
         if let Some(dl) = deadline {
             if crate::time::ticks() >= dl {
-                flush(&polls);
                 return 0;
             }
         }
@@ -2944,6 +2986,180 @@ fn sys_shm_destroy(handle: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64
     match crate::memory::user_map::shm_destroy(handle) {
         Ok(()) => 0,
         Err(e) => e,
+    }
+}
+
+/// `(nfds, rfds, wfds, efds, timeout, sigmask) -> ready count`.
+///
+/// `pselect(6)`, and the syscall behind libc `select(3)` as well: mlibc routes
+/// `select` through this one with a null signal mask.
+///
+/// The three descriptor bitmaps are Linux's `fd_set`: 1024 bits, one per
+/// possible descriptor, 128 bytes. The same limit is imposed on the caller
+/// rather than silently truncating, because a descriptor above the limit would
+/// otherwise be dropped from the watch set and the program would then block
+/// forever on something it believed it was watching.
+///
+/// `timeout` is a `struct timespec`, or null to wait indefinitely.
+///
+/// A non-null `sigmask` is refused with ENOSYS. Implementing it means swapping
+/// the blocked mask atomically with respect to signal delivery, and getting
+/// that subtly wrong is worse than not having it: a signal that arrives in the
+/// window would be delivered against the wrong mask, or lost. `select(3)` --
+/// which passes null -- works, and `pselect(3)` reports that it cannot. That is
+/// the "absent rather than plausible" rule applied to a case where a plausible
+/// implementation would be a lie.
+fn sys_pselect6(
+    nfds: u64,
+    rfds: u64,
+    wfds: u64,
+    efds: u64,
+    timeout: u64,
+    sigmask: u64,
+) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if sigmask != 0 {
+        return crate::abi::errno::ENOSYS;
+    }
+
+    // One fd_set is 128 bytes of bitmap. Reject an out-of-range descriptor
+    // count rather than clamping it: a caller watching descriptor 2000 must be
+    // told no, not left blocking on a set that quietly omitted it.
+    const FD_SETSIZE: usize = 1024;
+    if nfds as usize > FD_SETSIZE {
+        return crate::abi::errno::EINVAL;
+    }
+    let setsz = FD_SETSIZE / 8;
+
+    // The three sets are read-only here; readiness is reported back by clearing
+    // the bits of descriptors that are *not* ready, which is what select(2)
+    // specifies. Each is copied in first so a null pointer means "not watching"
+    // rather than a fault.
+    let mut sets: [Option<alloc::vec::Vec<u8>>; 3] = [None, None, None];
+    for (i, addr) in [rfds, wfds, efds].iter().enumerate() {
+        if *addr == 0 {
+            continue;
+        }
+        match unsafe { user_bytes(*addr, setsz as u64) } {
+            Some(m) => sets[i] = Some(m.to_vec()),
+            None => return crate::abi::errno::EINVAL,
+        }
+    }
+
+    // Milliseconds, or -1 for an indefinite wait. A timespec is converted with
+    // rounding *up* on the sub-millisecond remainder: a caller asking to wait
+    // 500 microseconds and being woken after 0 would spin, which for a select
+    // loop is a livelock rather than a rounding error.
+    let tmo: i64 = if timeout == 0 {
+        -1
+    } else {
+        let sz = 2 * core::mem::size_of::<u64>();
+        let mem = match unsafe { user_bytes(timeout, sz as u64) } {
+            Some(m) => m,
+            None => return crate::abi::errno::EINVAL,
+        };
+        let sec = i64::from_ne_bytes([mem[0], mem[1], mem[2], mem[3], mem[4], mem[5], mem[6], mem[7]]);
+        let nsec = i64::from_ne_bytes([
+            mem[8], mem[9], mem[10], mem[11], mem[12], mem[13], mem[14], mem[15],
+        ]);
+        if sec < 0 || nsec < 0 {
+            return crate::abi::errno::EINVAL;
+        }
+        let ms = sec.saturating_mul(1000) + (nsec + 999_999) / 1_000_000;
+        ms.clamp(0, i64::from(u32::MAX)) as i64
+    };
+
+    // Fold the three bitmaps into one pollfd array. A descriptor watched on more
+    // than one set gets the union of its interests, which is what select(2)
+    // means by appearing in several sets.
+    let mut polls: alloc::vec::Vec<PollFd> = alloc::vec::Vec::new();
+    for fd in 0..nfds as usize {
+        let mut events = 0u16;
+        for (i, set) in sets.iter().enumerate() {
+            if let Some(bits) = set {
+                if bits[fd / 8] & (1 << (fd % 8)) != 0 {
+                    events |= match i {
+                        0 => driver_common::POLLIN,
+                        1 => driver_common::POLLOUT,
+                        _ => 0, // exceptional conditions: never requested
+                    };
+                }
+            }
+        }
+        if events != 0 {
+            polls.push(PollFd {
+                fd: fd as i32,
+                events,
+                revents: 0,
+            });
+        }
+    }
+
+    let ret = wait_on_polls(task, &mut polls, tmo);
+    if ret < 0 {
+        return ret;
+    }
+
+    // Report back by clearing every bit of every set, then setting the ones that
+    // fired. Clearing first is what makes a second call with the same (now
+    // modified) set see only what is still ready, which is the documented
+    // behaviour and the reason a caller may loop on select without reloading.
+    for (i, set) in sets.iter_mut().enumerate() {
+        let Some(bits) = set.as_mut() else { continue };
+        let ready_on_this = match i {
+            0 => driver_common::POLLIN,
+            1 => driver_common::POLLOUT,
+            _ => 0,
+        };
+        for fd in 0..nfds as usize {
+            let bit = 1u8 << (fd % 8);
+            if bits[fd / 8] & bit == 0 {
+                continue;
+            }
+            let fired = polls
+                .iter()
+                .any(|p| p.fd as usize == fd && p.revents & ready_on_this != 0);
+            if !fired {
+                bits[fd / 8] &= !bit;
+            }
+        }
+        if let Some(bits) = set.as_ref() {
+            let addr = [rfds, wfds, efds][i];
+            // SAFETY: `addr` and `setsz` were validated when the set was read
+            // in, and the kernel is writing back to the same range and nothing
+            // else. `user_bytes` hands back a mutable view of exactly that many
+            // bytes.
+            if let Some(dst) = unsafe { user_bytes(addr, setsz as u64) } {
+                dst.copy_from_slice(bits.as_slice());
+            }
+        }
+    }
+
+    ret
+}
+
+fn sys_dup(oldfd: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match crate::vfs::fdtab::dup(task, oldfd as usize) {
+        Ok(fd) => fd as i64,
+        Err(e) => e.into(),
+    }
+}
+
+fn sys_dup2(oldfd: u64, newfd: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match crate::vfs::fdtab::dup2(task, oldfd as usize, newfd as usize) {
+        Ok(fd) => fd as i64,
+        Err(e) => e.into(),
     }
 }
 

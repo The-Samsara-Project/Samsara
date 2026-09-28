@@ -8,6 +8,7 @@
 //! with per-task kernel stacks once user tasks arrive.
 
 use super::{FdTable, FsError, Vnode, VnodeRef};
+use core::sync::atomic::Ordering;
 use crate::sync::Spinlock;
 use alloc::collections::BTreeMap;
 use alloc::boxed::Box;
@@ -77,7 +78,7 @@ pub fn seek(task: usize, fd: usize, offset: i64, whence: u32) -> Result<u64, FsE
 
     let base: i64 = match whence {
         SEEK_SET => 0,
-        SEEK_CUR => h.offset as i64,
+        SEEK_CUR => h.offset.load(Ordering::Relaxed) as i64,
         SEEK_END => h.node.file_size() as i64,
         _ => return Err(FsError::Invalid),
     };
@@ -88,8 +89,55 @@ pub fn seek(task: usize, fd: usize, offset: i64, whence: u32) -> Result<u64, FsE
         return Err(FsError::Invalid);
     }
     let target = target as u64;
-    h.offset = target;
+    h.offset.store(target, Ordering::Relaxed);
     Ok(target)
+}
+
+/// Duplicate `task`'s descriptor `oldfd` into the lowest free slot.
+///
+/// The duplicate refers to the *same* open file description, so it shares the
+/// file offset rather than getting one of its own -- see `FileHandle::offset`.
+/// This is what `dup(2)`, `dup2(2)` and every shell redirection are built on,
+/// and getting the sharing wrong is not a subtle bug: a program that writes
+/// through one descriptor and reads through the other would find the read
+/// position following from the write, or not following at all, depending on
+/// which mistake was made.
+///
+/// The access mode and status flags are copied as well, so the duplicate cannot
+/// be more privileged than its original.
+pub fn dup(task: usize, oldfd: usize) -> Result<usize, FsError> {
+    let mut tables = TABLES.lock();
+    let table = tables.get_mut(&task).ok_or(FsError::BadDescriptor)?;
+    let handle = table.description(oldfd)?;
+    Ok(table.install_description(handle))
+}
+
+/// As [`dup`], but into a specific slot, for `dup2(2)`.
+///
+/// `newfd == oldfd` is *not* an error and must not close anything: POSIX
+/// requires dup2 to succeed and leave the descriptor alone in that case.
+/// Treating it as a no-op-by-error would make a program that checks the return
+/// value close a descriptor it meant to keep.
+pub fn dup2(task: usize, oldfd: usize, newfd: usize) -> Result<usize, FsError> {
+    if oldfd == newfd {
+        // Still a validity check, so dup2 on a bad descriptor is EBADF rather
+        // than a silent success.
+        let mut tables = TABLES.lock();
+        let table = tables.get(&task).ok_or(FsError::BadDescriptor)?;
+        table.description(oldfd)?;
+        return Ok(newfd);
+    }
+    let mut tables = TABLES.lock();
+    let table = tables.get_mut(&task).ok_or(FsError::BadDescriptor)?;
+    let handle = table.description(oldfd)?;
+    // Replaces whatever was in the slot, and closes it. The displaced
+    // descriptor's vnode is told the reference is gone, which is what lets a
+    // pipe see its last reader disappear.
+    let displaced = table.replace_at(newfd, handle);
+    if let Some(old) = displaced {
+        old.node.on_close();
+    }
+    Ok(newfd)
 }
 
 /// Current status flags of `task`'s descriptor (`F_GETFL`).
@@ -167,7 +215,7 @@ pub fn read(task: usize, fd: usize, buf: &mut [u8]) -> Result<usize, FsError> {
             .get_mut(&task)
             .and_then(|t| t.get_mut(fd))
             .ok_or(FsError::BadDescriptor)?;
-        (h.node.clone(), h.offset, h.access, h.status)
+        (h.node.clone(), h.offset.load(Ordering::Relaxed), h.access, h.status)
     };
     if access == super::O_WRONLY {
         return Err(FsError::BadDescriptor);
@@ -187,7 +235,7 @@ pub fn read(task: usize, fd: usize, buf: &mut [u8]) -> Result<usize, FsError> {
     {
         let mut tables = TABLES.lock();
         if let Some(h) = tables.get_mut(&task).and_then(|t| t.get_mut(fd)) {
-            h.offset = offset + n as u64;
+            h.offset.store(offset + n as u64, Ordering::Relaxed);
         }
     }
     Ok(n)
@@ -243,7 +291,7 @@ pub fn write(task: usize, fd: usize, buf: &[u8]) -> Result<usize, FsError> {
             .get_mut(&task)
             .and_then(|t| t.get_mut(fd))
             .ok_or(FsError::BadDescriptor)?;
-        (h.node.clone(), h.offset, h.access)
+        (h.node.clone(), h.offset.load(Ordering::Relaxed), h.access)
     };
     if access == super::O_RDONLY {
         return Err(FsError::BadDescriptor);
@@ -252,7 +300,7 @@ pub fn write(task: usize, fd: usize, buf: &[u8]) -> Result<usize, FsError> {
     {
         let mut tables = TABLES.lock();
         if let Some(h) = tables.get_mut(&task).and_then(|t| t.get_mut(fd)) {
-            h.offset = offset + n as u64;
+            h.offset.store(offset + n as u64, Ordering::Relaxed);
         }
     }
     Ok(n)
