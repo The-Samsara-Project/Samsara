@@ -463,6 +463,30 @@ pub mod nr {
     /// report the link instead of the file. Nothing would fail. The appended
     /// number costs one line in the table and cannot surprise anyone.
     pub const LSTAT: u64 = 93;
+    /// `execve(2)`: `(path, path_len, argv) -> never` on success.
+    ///
+    /// Exec a program *by path*. [`EXEC`] names a program by its index in the
+    /// kernel's embedded table, which is how the boot servers and the self-tests
+    /// are started; this is the other thing a Unix has, and without it a file in
+    /// the filesystem cannot be run at all.
+    ///
+    /// Without it the whole of a userland is decorative. `/bin/ls` can be a symlink
+    /// to `/bin/busybox` and resolve correctly, and still be unrunnable, because
+    /// the only exec available names something the kernel already holds. A shell
+    /// could run its builtins and its in-process applets and nothing else, which is
+    /// the shape of a system that has a binary and no way to start it.
+    ///
+    /// `argv` is the usual pointer array, and `argv[0]` is the conventional
+    /// program name. The path is followed through symbolic links, as it is for
+    /// every other path-taking call here: the caller asked to run what the name
+    /// refers to now.
+    ///
+    /// `envp` is accepted and ignored, as it is for [`EXEC`]: an exec'd image
+    /// inherits the caller's environment, which is what `EXEC` does and what makes
+    /// the two consistent. A program that wants to *replace* its environment has
+    /// no way to here, and that gap is recorded here rather than left to be
+    /// discovered.
+    pub const EXECVE: u64 = 94;
     /// First number reserved for out-of-tree/experimental use.
     pub const EXPERIMENTAL_BASE: u64 = 0x8000_0000_0000_0000;
 }
@@ -774,6 +798,7 @@ pub fn register_defaults() {
     register(nr::SYMLINK, sys_symlink);
     register(nr::READLINK, sys_readlink);
     register(nr::LSTAT, sys_lstat);
+    register(nr::EXECVE, sys_execve);
 
     unsafe {
         enable_syscall_instruction();
@@ -2780,6 +2805,85 @@ fn sys_exec(prog: u64, argv: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64
     let args = unsafe { read_argv(argv) };
     match crate::task::sched::exec_current(prog as usize, args) {
         // exec_current only returns on failure; success abandons this frame.
+        Err(e) => e,
+        Ok(()) => errno::ENOENT,
+    }
+}
+
+/// `execve(2)`: replace this process with the program at `path`.
+///
+/// The image is read out of the filesystem and loaded like any other, so the
+/// program is whatever the path resolves to. That is the whole difference from
+/// [`EXEC`], which loads one of the kernel's own embedded images, and it is what
+/// lets a shell run a file it found rather than one the kernel happened to carry.
+fn sys_execve(path: u64, path_len: u64, argv: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let path_str = match user_str(path, path_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if path_str.contains('\0') {
+        return errno::EINVAL;
+    }
+    let args = unsafe { read_argv(argv) };
+    // An empty argv is not "no arguments", it is a program that cannot report its
+    // own name. glibc substitutes the path, and so does every program that later
+    // looks at argv[0] to decide what it is -- which is the entire basis of applet
+    // dispatch. A shell running `/bin/ls` with an empty argv would otherwise get
+    // a program that cannot tell it is `ls`.
+    let args = if args.is_empty() {
+        alloc::vec![task_abs_path(&path_str)]
+    } else {
+        args
+    };
+
+    let cred = crate::cred::get(task);
+    let node = match crate::vfs::resolve_checked(&task_abs_path(&path_str), &cred) {
+        Ok(n) => n,
+        Err(e) => return e.into(),
+    };
+    // A directory is a path that resolves and cannot be run. EACCES rather than
+    // EISDIR because the ELF load would fail anyway and the caller learns more
+    // from being told it may not execute this than from being told the file type
+    // was wrong -- and because `execve` on a directory is a permission question on
+    // every system that answers it at all.
+    if node.kind() == crate::vfs::NodeKind::Dir {
+        return errno::EACCES;
+    }
+
+    // The whole file, then load from memory.
+    //
+    // Read in full rather than in pieces because `elf::load` wants a slice, and
+    // because a program is not going to be exec'd while it is being written: the
+    // alternative is a loader that takes a reader, and the size is bounded by the
+    // same 4 MiB cap every other ramfs write is bounded by.
+    let size = node.size_hint() as usize;
+    if size == 0 {
+        return errno::ENOEXEC;
+    }
+    let mut image = alloc::vec![0u8; size];
+    let mut filled = 0usize;
+    while filled < size {
+        match node.read_at(filled as u64, &mut image[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) => return e.into(),
+        }
+    }
+    image.truncate(filled);
+    if image.is_empty() {
+        return errno::ENOEXEC;
+    }
+    // One line, after the read rather than before: the size the caller asked to
+    // read and the size actually read are different numbers when the file is
+    // truncated underneath, and only the second one is what got loaded.
+    crate::log::kdebug!("execve: {} -> {} bytes", path_str, image.len());
+
+    match crate::task::sched::exec_path(image, args, &path_str) {
+        // exec_path only returns on failure.
         Err(e) => e,
         Ok(()) => errno::ENOENT,
     }

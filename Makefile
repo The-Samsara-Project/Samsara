@@ -6,6 +6,7 @@
 #   make          - build the kernel image (release)
 #   make iso      - produce a bootable GRUB ISO
 #   make mlibc    - build the mlibc sysroot port (see ports/mlibc/README)
+#   make busybox  - build the busybox port (see ports/busybox/README)
 #   make run      - boot the ISO in QEMU with serial on stdio
 #   make debug    - QEMU with a GDB stub listening on :1234
 #   make clean    - remove all build artifacts
@@ -35,6 +36,7 @@ USER_UTILS     := samutils
 USER_EXAMPLES  := hello forkx exectst pipetest credtst signaltst polltest termiostst sh installer
 
 .PHONY: all kernel iso run run-fbterm debug clean user-bins fbterm-run
+.PHONY: mlibc fbterm busybox
 
 all: iso
 
@@ -44,6 +46,7 @@ all: iso
 # thousands of files would make the dependency set enormous and unstable.
 MLIBC_INPUTS  := $(shell find ports/mlibc -type f -not -path '*/build/*' 2>/dev/null)
 FBTERM_INPUTS := $(shell find ports/fbterm -type f -not -path '*/build/*' 2>/dev/null)
+BUSYBOX_INPUTS := $(shell find ports/busybox -type f -not -path '*/build/*' 2>/dev/null)
 
 # Stamps rather than phony prerequisites, so `make` does not rebuild a libc on
 # every invocation. Both build scripts are slow and both are deterministic, so
@@ -60,6 +63,15 @@ build/.fbterm.stamp: $(FBTERM_INPUTS) build/.mlibc.stamp
 	./ports/fbterm/build.sh
 	@mkdir -p build && touch $@
 
+# busybox depends on the mlibc stamp for the same reason fbterm does: it is
+# linked against the sysroot, so a rebuilt libc invalidates every object built
+# against the old headers. It also depends on the fbterm stamp, but only
+# through ordering -- both ports exist in the same kernel image and there is no
+# reason for one to be staler than the other.
+build/.busybox.stamp: $(BUSYBOX_INPUTS) build/.mlibc.stamp
+	./ports/busybox/build.sh
+	@mkdir -p build && touch $@
+
 # Force a rebuild of either port, ignoring the stamps. For when a build script
 # itself has to change behaviour without its own contents changing.
 .PHONY: mlibc fbterm mlibc-force fbterm-force
@@ -70,6 +82,10 @@ mlibc mlibc-force:
 fbterm fbterm-force: build/.mlibc.stamp
 	./ports/fbterm/build.sh
 	@mkdir -p build && touch build/.fbterm.stamp
+
+busybox busybox-force: build/.mlibc.stamp
+	./ports/busybox/build.sh
+	@mkdir -p build && touch build/.busybox.stamp
 
 # Build fbterm into a standalone ISO without disturbing the default build.
 # Kept for bisecting: a boot that misbehaves with fbterm embedded can be compared
@@ -101,7 +117,7 @@ fbterm-run: build/.fbterm.stamp
 # fail at the include_bytes! in kernel/src/user.rs. Ordering them here means a
 # clean tree still builds with one command, at the cost of needing git, meson,
 # ninja and a freestanding clang -- which the mlibc port already required.
-user-bins: build/.mlibc.stamp build/.fbterm.stamp
+user-bins: build/.mlibc.stamp build/.fbterm.stamp build/.busybox.stamp
 	cd user && CARGO_TARGET_DIR="$(CURDIR)/target/user" cargo build --release --target x86_64-unknown-none --examples --bins
 	@for b in $(USER_EXAMPLES); do cp \
 	    target/user/x86_64-unknown-none/release/examples/$$b target/user-$$b.elf; done
@@ -114,6 +130,12 @@ user-bins: build/.mlibc.stamp build/.fbterm.stamp
 	@# mlibc sysroot, not a cargo target, so it is copied into place here. The
 	@# kernel embeds it unconditionally as the system terminal.
 	@cp build/fbterm-build/fbterm.elf target/user-fbterm.elf
+	@# busybox likewise is a ported program built by its own script, and the
+	@# kernel embeds it as the system userland. It has to be *the* image under
+	@# /bin: /bin/ls and its siblings are symlinks to /bin/busybox, and busybox
+	@# picks the applet from argv[0]. A stale copy here would be a userland that
+	@# disagrees with the port that is supposed to have built it.
+	@cp target/busybox.elf target/user-busybox.elf
 	@ls -l target/user-*.elf
 
 kernel: user-bins

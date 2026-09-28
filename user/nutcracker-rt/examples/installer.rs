@@ -41,6 +41,8 @@ const PROG_CREDTST: u64 = 5;
 const PROG_SIGNALTST: u64 = 6;
 const PROG_TERMIOS_TST: u64 = 7;
 const PROG_POLLTEST: u64 = 8;
+/// `busybox`, the ported userland. Spawned once, to make its own applet links.
+const PROG_BUSYBOX: u64 = 15;
 /// `chello`, the C program linked against the mlibc port. The only non-Rust
 /// user image, so it is what shows the libc port runs and not merely links.
 const PROG_CHELLO: u64 = 13;
@@ -570,7 +572,171 @@ impl App {
     /// fbterm's first frame, and the completion message is printed after the
     /// detach too -- which means it reaches the serial log and not the screen,
     /// which is right: the screen belongs to fbterm from here on.
+    /// Populate `/bin` with the userland's applet links.
+    ///
+    /// The installer does this itself, as root, rather than handing the job to
+    /// `busybox --install -s /bin`. The reason is ownership: `/bin` is root-owned
+    /// and mode 0755, which is correct -- a userland directory that any process
+    /// can add names to is a directory nobody can reason about -- and busybox is
+    /// deliberately *not* privileged. Run as the user it is meant to be, every one
+    /// of its 106 `symlink` calls fails with EACCES, and the failure is silent in
+    /// the sense that matters: the applet still works when named explicitly, so
+    /// the system looks almost right and `/bin/ls` alone is missing.
+    ///
+    /// The list comes from `busybox --list`, which is the binary's own answer to
+    /// "which applets are in this build". Hardcoding it here would be a second
+    /// copy that goes stale when the port's config changes, and a stale copy means
+    /// `/bin/foo` missing while `busybox foo` works -- which reads as a broken
+    /// kernel rather than a forgotten edit.
+    ///
+    /// So: run busybox with stdout on a pipe, read the names, link each one.
+    fn install_userland(&mut self) {
+        let (rd, wr) = match syscall::pipe() {
+            Ok(p) => p,
+            Err(e) => {
+                println!("[installer] could not make a pipe: {}", e);
+                return;
+            }
+        };
+        // Put the console back afterwards, whatever happens. Two descriptors are
+        // involved and the order matters:
+        //
+        //   dup(1)   a spare, because `dup2` returns the *new* descriptor, not the
+        //             old one. Saving its return value saves 1, and closing that
+        //             would close the pipe we just installed rather than the
+        //             console -- leaving the child with no stdout at all, which
+        //             shows up as an empty read and reads as "busybox printed
+        //             nothing" rather than as a descriptor mistake.
+        //   dup2(wr,1) point stdout at the pipe
+        //   close(wr)  drop the spare, so the pipe has exactly one write end and
+        //             read-to-EOF below can actually reach EOF
+        let saved_stdout = syscall::dup(1);
+        if syscall::dup2(wr as u64, 1).is_err() {
+            println!("[installer] could not redirect stdout");
+            syscall::close(rd);
+            syscall::close(wr);
+            return;
+        }
+        syscall::close(wr);
+
+        // argv[0] is the program's own name. `/bin/busybox` rather than
+        // "busybox" because the loader and busybox both take the applet hint from
+        // it, and a relative name would be resolved against the installer's
+        // working directory rather than against /bin.
+        let argv: [&str; 2] = ["/bin/busybox", "--list"];
+        let pid = match syscall::proc_spawn(PROG_BUSYBOX, Some(&argv)) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("[installer] could not run busybox --list: {}", e);
+                return;
+            }
+        };
+
+        // Drain to end-of-file, then close. The child inherited the installer's
+        // descriptor table, so at the moment of the spawn it held fd 1 -- the pipe
+        // -- and that copy is what closes when it exits, which is the EOF this is
+        // waiting for. Our own spare write end was already closed above, so there
+        // is exactly one and it belongs to the child.
+        let names = read_pipe_lines(rd);
+        syscall::close(rd);
+
+        let mut status = 0i32;
+        let _ = syscall::waitpid(pid, &mut status);
+
+        // The console back on fd 1, so every later `println!` is visible again.
+        if let Ok(saved) = saved_stdout {
+            let _ = syscall::dup2(saved as u64, 1);
+            syscall::close(saved);
+        }
+
+        if names.is_empty() {
+            println!("[installer] busybox --list produced nothing; /bin left empty");
+            return;
+        }
+
+        let mut made = 0usize;
+        let mut failed = 0usize;
+        for name in &names {
+            let path = format!("/bin/{}", name);
+            match syscall::symlink("/bin/busybox", &path) {
+                // EEXIST is success in effect: the name is already reachable by
+                // this path, which is the only thing the link was for.
+                Ok(()) => made += 1,
+                Err(-17) => made += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        // `sh` is not a separate applet -- this busybox is configured with
+        // CONFIG_SH_IS_ASH, so the shell's *name* is `ash` -- but everything in a
+        // system expects /bin/sh, and the shell is resolved from argv[0] like any
+        // other applet. Linked by hand, because it is a name the binary does not
+        // report under `--list` and so no amount of asking would produce it.
+        //
+        // EEXIST counts as made: on a system where `sh` *is* in the applet table
+        // the link above has already created it, and the name is reachable either
+        // way, which is the only thing the link was for.
+        match syscall::symlink("/bin/busybox", "/bin/sh") {
+            Ok(()) | Err(-17) => made += 1,
+            Err(_) => failed += 1,
+        }
+        println!(
+            "[installer] /bin populated: {} links, {} failed",
+            made, failed
+        );
+
+        // Prove it, rather than assume it.
+        //
+        // A link that exists is not a link that *resolves*, and the difference is
+        // exactly what applet dispatch depends on. So a program is run through its
+        // own path, by path, with no help from the program table: `execve` on
+        // `/bin/echo` is the only route to the `echo` applet, and if that fails
+        // then `/bin` is a directory of decoration no matter how many links it
+        // contains.
+        //
+        // Each applet is checked in a child so that the exec happens in a process
+        // this one can survive: a successful execve never returns, so a failed one
+        // has to be observable through an exit status rather than through a
+        // return value.
+        for probe in ["/bin/true", "/bin/echo", "/bin/ls"] {
+            // argv[0] is the path, which is what the applet dispatch reads.
+            // `true` and `echo` need no argument; `ls` lists /bin, which is a
+            // real listing and exercises the link, the directory read behind it,
+            // and the program's own output path in one go.
+            let argv: [&str; 2] = [probe, "--"];
+
+            // Each probe execs in a child, because a successful execve does not
+            // return: a failure can only be observed through an exit status.
+            let child = syscall::fork();
+            if child <= 0 {
+                if child < 0 {
+                    println!("[installer] could not fork for {}: {}", probe, child);
+                } else {
+                    match syscall::execve(probe, &argv) {
+                        // Unreachable in practice: the exec either replaces this
+                        // process or reports why it could not.
+                        Ok(()) => syscall::proc_exit_code(0),
+                        Err(e) => {
+                            println!("[installer] execve {} failed: {}", probe, e);
+                            syscall::proc_exit_code(1);
+                        }
+                    }
+                }
+                continue;
+            }
+            let mut st = 0i32;
+            match syscall::waitpid(child as u64, &mut st) {
+                Ok(_) if st == 0 => println!("[installer] {} runs as an applet", probe),
+                Ok(_) => println!("[installer] {} exited {}", probe, st),
+                Err(e) => println!("[installer] {} unreaped: {}", probe, e),
+            }
+        }
+    }
+
     fn handoff(&mut self) -> ! {
+        // Before the framebuffer changes hands. Once fbterm is running it owns the
+        // display and anything written to the console afterwards is invisible, so
+        // a step that reports itself has to report itself first.
+        self.install_userland();
         // 1. The child reads keys from the pty, so give it the pty on stdin.
         let pts = self.pts;
         if syscall::dup2(pts as u64, 0).is_err() {
@@ -593,6 +759,63 @@ impl App {
         );
         syscall::proc_exit_code(0);
     }
+}
+
+/// Read a pipe to end-of-file and return its non-empty lines.
+///
+/// End-of-file, not "whatever is in the buffer now": the child is still running
+/// when this is called, and a read that returned after one short chunk would
+/// truncate the list at whatever fitted. A child that exits without closing would
+/// block here forever, which is the correct behaviour for a pipe read and not
+/// something to work around with a timeout -- the alternative is a half-installed
+/// `/bin` that reports success.
+///
+/// One byte is dropped from each line's length and then excluded from the
+/// accumulator, so the buffer is a sliding window rather than being copied into a
+/// second allocation per chunk.
+fn read_pipe_lines(fd: usize) -> Vec<String> {
+    const CHUNK: usize = 1024;
+    let mut buf = [0u8; CHUNK];
+    let mut acc: Vec<u8> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+
+    loop {
+        let n = match syscall::read(fd, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let mut consumed = 0usize;
+        for i in 0..n {
+            if buf[i] == b'\n' {
+                if i > consumed {
+                    acc.extend_from_slice(&buf[consumed..i]);
+                }
+                if !acc.is_empty() {
+                    if let Ok(s) = core::str::from_utf8(&acc) {
+                        let t = s.trim();
+                        if !t.is_empty() {
+                            lines.push(String::from(t));
+                        }
+                    }
+                }
+                acc.clear();
+                consumed = i + 1;
+            }
+        }
+        if consumed < n {
+            acc.extend_from_slice(&buf[consumed..n]);
+        }
+    }
+    // A last line with no trailing newline is still a line.
+    if !acc.is_empty() {
+        if let Ok(s) = core::str::from_utf8(&acc) {
+            let t = s.trim();
+            if !t.is_empty() {
+                lines.push(String::from(t));
+            }
+        }
+    }
+    lines
 }
 
 /// Convert owned menu rows into the borrowed form the renderer wants, so

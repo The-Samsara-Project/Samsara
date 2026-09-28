@@ -188,6 +188,40 @@ int Sysdeps<Readlink>::operator()(const char *path, void *buffer, size_t max_siz
 	return 0;
 }
 
+int Sysdeps<Execve>::operator()(const char *path, char *const argv[],
+                                char *const envp[]) {
+	// `envp` is accepted and discarded. The kernel's exec gives the new image the
+	// caller's environment, exactly as the index-based EXEC does, and having the
+	// two disagree would be worse than either: a program that replaced its
+	// environment through one path and not the other would behave differently
+	// depending on how it was started.
+	//
+	// What is *not* discarded is argv, and above all argv[0]. It is the whole basis
+	// of applet dispatch: `/bin/ls` is a symlink to `/bin/busybox`, and the only
+	// way busybox knows to run `ls` is by looking at the name it was invoked under.
+	// Synthesising a name here would make every applet run as `busybox`, which
+	// prints the list of applets instead of doing anything.
+	//
+	// The array is handed to the kernel as-is rather than copied. `argv` is already
+	// a NULL-terminated array of pointers in this process's address space, which is
+	// exactly the shape the kernel's reader expects, and copying it would mean
+	// allocating at the last possible moment before an operation that replaces the
+	// address space and cannot fail afterwards.
+	if (!path)
+		return EFAULT;
+	if (!argv)
+		return EFAULT;
+
+	// A successful exec never returns; mlibc's caller asserts as much. Reaching the
+	// return at all means the kernel reported a failure, and it reports failures
+	// as a negative value rather than by setting errno.
+	auto ret = syscall(SYSCALL_EXECVE, (long)path, (long)strlen(path), (long)argv);
+	if (ret < 0) {
+		return -ret;
+	}
+	return 0;
+}
+
 int Sysdeps<Openat>::operator()(int dirfd, const char *path, int flags, mode_t mode, int *fd) {
 	// The kernel resolves every path against the calling process's working
 	// directory and has no directory-relative resolution. An absolute path is

@@ -82,6 +82,10 @@
  * STAT's shape is frozen and a program calling a three-argument syscall leaves
  * that register holding whatever it had. */
 #define SYSCALL_LSTAT          93
+/* `execve(2)`: exec a program *by path*. Without it a file in the filesystem
+ * cannot be run at all: EXEC names a program by index in the kernel's embedded
+ * table, so a userland would be a binary nobody can start. */
+#define SYSCALL_EXECVE         94
 #define SYSCALL_GETUID          31
 #define SYSCALL_GETGID          32
 #define SYSCALL_GETEUID         33

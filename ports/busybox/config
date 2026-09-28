@@ -50,6 +50,39 @@
 CONFIG_STATIC=y
 CONFIG_LFS=y
 
+# How this port links, as a checked-in fact rather than a Makefile variable,
+# because every part of it is an ABI fact and none of it is machine-specific.
+#
+# `CONFIG_STATIC` is not sufficient on its own and the distinction is the whole
+# point of the flags below. `-static` alone produces an ET_EXEC linked at
+# 0x400000; the kernel maps user images at their *link-time* addresses, load bias
+# zero, exactly as Linux handles static-PIE. So an ET_EXEC busybox is loaded at an
+# address nothing else in this system uses, while every other user image sits at
+# 0x110000 -- and the ELF load fails with no message that names the cause.
+#
+#   -static-pie -fPIE   builds a position-independent image, so the flag is
+#                        accepted by the driver and the link is relocation-safe
+#   --image-base        puts it at 0x110000, the address every other user image
+#                        in this system uses
+#
+# The result is still ET_EXEC rather than ET_DYN, because the kernel's loader maps
+# a user image at its link-time virtual addresses with load bias zero -- exactly as
+# Linux handles static-PIE -- and so the base address is not negotiable either way.
+# What matters is that it agrees with the other images. An ET_EXEC busybox linked
+# at 0x400000 by the default `-static` is loaded somewhere nothing else is, and the
+# ELF load fails with no message that names the cause.
+#
+# These are the same flags user/build-chhello.sh uses, which is the point: there
+# is one answer to "how does a C program get into this kernel" and every program
+# is built with it.
+#
+# `--defsym=syscall=__do_syscall4` is mlibc's: this kernel's `syscall`
+# instruction is not the one libc's generic syscall() emits, and every ported
+# program -- chello, fbterm, busybox -- has to be told. The build script adds only
+# the sysroot's -L, which is the one piece that genuinely differs per machine.
+CONFIG_EXTRA_CFLAGS="-fPIE"
+CONFIG_EXTRA_LDFLAGS="-nostdlib -static-pie -fPIE -Wl,--image-base=0x110000 -Wl,--defsym=syscall=__do_syscall4 -Wl,--build-id=none"
+
 # Build one binary and let argv[0] choose the applet: /bin/ls, /bin/cat and the
 # rest are all the same image, reached by name.
 #
@@ -67,6 +100,39 @@ CONFIG_LFS=y
 CONFIG_FEATURE_PREFER_APPLETS=y
 CONFIG_BUSYBOX_EXEC_PATH="/bin/busybox"
 CONFIG_INSTALL_APPLET_SYMLINKS=n
+
+# `busybox --install -s /bin`.
+#
+# This is how /bin/ls comes to exist. busybox makes its own links rather than the
+# kernel seeding them from a list, and the reason is that the list lives in
+# busybox's generated applet table: a kernel-side list would be a second copy of
+# it, stale the moment the port's config changes. A stale list means `/bin/foo`
+# missing while `busybox foo` works, which reads as a broken kernel rather than a
+# forgotten regeneration step.
+#
+# `--install -s` also gets the *target* right without being told: it readlinks
+# bb_busybox_exec_path and falls back to argv[0] when that is not a link, so
+# spawning it as `/bin/busybox` is the whole of the wiring.
+#
+# INSTALL_APPLET_SYMLINKS stays off because that is about `make install` writing
+# links at *build* time, and these have to be written at *boot* time -- onto a
+# filesystem that does not exist until the kernel has created it.
+# CONFIG_BUSYBOX and CONFIG_FEATURE_INSTALLER, together, are what make
+# `busybox --install -s /bin` exist.
+#
+# Both are needed and neither alone does anything: the whole `--install` block
+# lives inside `#if ENABLE_BUSYBOX`, and FEATURE_INSTALLER `depends on` BUSYBOX,
+# so enabling only the second is silently dropped by oldconfig. The result is that
+# `--install` is not an option at all, falls through to "run the applet named
+# --install", and exits 127 -- which is POSIX's "command not found" and reads as
+# a spawn problem rather than a missing build option.
+#
+# BUSYBOX is worth having for the other half of what it provides: `busybox
+# --list` is the authoritative answer to "which applets are in this build", which
+# is what makes the applet list something the binary reports rather than something
+# the kernel has to keep a copy of.
+CONFIG_BUSYBOX=y
+CONFIG_FEATURE_INSTALLER=y
 
 # ---------------------------------------------------------------------------
 # The shell.

@@ -115,6 +115,19 @@ pub const GETCWD: u64 = 65;
 pub const READDIR: u64 = 66;
 /// Create a directory: `(path, path_len, mode) -> 0`.
 pub const MKDIR: u64 = 67;
+/// Create a symbolic link: `(target, target_len, path, path_len) -> 0`.
+pub const SYMLINK: u64 = 91;
+/// Read a symlink's target: `(path, path_len, buf, cap) -> bytes`.
+pub const READLINK: u64 = 92;
+/// `(oldfd) -> newfd`. Duplicate a descriptor, sharing its file offset.
+pub const DUP: u64 = 88;
+/// `(path, path_len, argv)`. Exec a program *by path*.
+///
+/// The other exec is `exec(prog: u64, ...)`, which names a program by its
+/// index in the kernel's embedded table. This one names a file, and is what
+/// makes a userland runnable: without it `/bin/ls` can be a correct symlink and
+/// still be unrunnable, because nothing could start it.
+pub const EXECVE: u64 = 94;
 /// Create a shared-memory region of `frames` pages mapped into the caller:
 /// `(frames) -> shared handle`.
 pub const SHM_CREATE: u64 = 68;
@@ -740,6 +753,29 @@ pub fn console_attach() -> Result<(), i64> {
 /// and still usable.
 ///
 /// `oldfd == newfd` succeeds and changes nothing, matching POSIX.
+/// `dup(2)`: `(oldfd) -> newfd`, a second descriptor for the same open file.
+///
+/// Present because `dup2` alone is not enough to redirect a standard descriptor
+/// and put it back: `dup2` returns the *new* descriptor, so a caller that saves
+/// its return value has saved the number it just overwrote, not the one it
+/// wanted to keep. The sequence that works is `dup(1)`, `dup2(wr, 1)`, and later
+/// `dup2(saved, 1)` -- and the "later" is the reason this exists rather than being
+/// spelled out at the call site each time.
+///
+/// Shares the open file description, so the offset is shared too. That is what
+/// makes `dup` useful for handing a child a descriptor and is the same property
+/// that makes it wrong for saving a descriptor whose position you intend to keep
+/// separate.
+pub fn dup(oldfd: usize) -> Result<usize, i64> {
+    // SAFETY: a pure descriptor-table operation; the kernel resolves it.
+    let r = unsafe { raw(DUP, oldfd as u64, 0, 0, 0, 0, 0) };
+    if r < 0 {
+        Err(r)
+    } else {
+        Ok(r as usize)
+    }
+}
+
 pub fn dup2(oldfd: u64, newfd: u64) -> Result<u64, i64> {
     // SAFETY: a pure descriptor-table operation; both arguments are plain
     // integers and the kernel resolves them.
@@ -905,6 +941,28 @@ pub fn proc_spawn(prog: u64, argv: Option<&[&str]>) -> Result<u64, i64> {
     }
 }
 
+/// Replace this process with the program at `path`, resolving symbolic links.
+///
+/// `argv` is the usual vector with `argv[0]` as the program name, and an empty
+/// vector is not an error: the kernel substitutes `path` for it, as glibc does,
+/// because a program that cannot see what it was invoked as cannot work -- applet
+/// dispatch is entirely `argv[0]`.
+///
+/// Takes the vector as a slice of `&str` so that the caller cannot get the
+/// NULL-termination wrong. On success this does not return.
+pub fn execve(path: &str, argv: &[&str]) -> Result<(), i64> {
+    let (_backing, ptrs) = nul_terminated(Some(argv));
+    // SAFETY: the kernel reads the string and the pointer array out of this
+    // process's address space, and both are alive for the duration of the call.
+    // A successful exec replaces this address space; it never writes to either.
+    let r = unsafe { raw(EXECVE, path.as_ptr() as u64, path.len() as u64, ptrs.as_ptr() as u64, 0, 0, 0) };
+    if r < 0 {
+        Err(r)
+    } else {
+        Ok(())
+    }
+}
+
 /// Fetch this process's argument vector. Each entry is a byte slice of one
 /// argument (see [`exec`]/[`proc_spawn`] for how they were supplied).
 pub fn args() -> Vec<Vec<u8>> {
@@ -956,6 +1014,68 @@ fn fetch_strvec(nr: u64) -> Vec<Vec<u8>> {
         i += 1;
     }
     out
+}
+
+/// Create a symbolic link: `SYMLINK(target, link_path) -> 0`.
+///
+/// The target is recorded verbatim. Resolving it is the kernel's path walker's
+/// job and has to stay there: a relative target is meaningless without knowing
+/// which directory the link sits in, so resolving at creation time would bake in
+/// an answer that is wrong the moment the link is moved.
+pub fn symlink(target: &str, link_path: &str) -> Result<(), i64> {
+    let r = unsafe {
+        raw(
+            SYMLINK,
+            target.as_ptr() as u64,
+            target.len() as u64,
+            link_path.as_ptr() as u64,
+            link_path.len() as u64,
+            0,
+            0,
+        )
+    };
+    if r < 0 {
+        Err(r)
+    } else {
+        Ok(())
+    }
+}
+
+/// Read a symbolic link's stored target into `buf`, with no trailing NUL.
+/// Returns bytes written.
+///
+/// No NUL because the caller is entitled to learn what was written rather than a
+/// resolved form of it, and because a shell composing a path out of the result
+/// would otherwise have to strip one first.
+pub fn readlink(path: &str, buf: &mut [u8]) -> Result<usize, i64> {
+    let r = unsafe {
+        raw(
+            READLINK,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        )
+    };
+    if r < 0 {
+        Err(r)
+    } else {
+        Ok(r as usize)
+    }
+}
+
+/// `readlink` as a `String`. Errors rather than truncating, matching the
+/// kernel's `ERANGE`: half a target is a path that does not exist, and a
+/// caller that went on to use one would fail somewhere unrelated to the real
+/// problem.
+pub fn readlink_str(path: &str) -> Result<String, i64> {
+    let mut buf = vec![0u8; 4096];
+    let n = readlink(path, &mut buf)?;
+    core::str::from_utf8(&buf[..n])
+        .map(String::from)
+        .map_err(|_| -22i64)
 }
 
 /// Change this process's working directory to `path` (absolute or relative to

@@ -128,7 +128,14 @@ struct SamsaraSysdepTags :
 	// meaning on a filesystem reached by path, and honouring one would mean
 	// openat's resolution becoming a full path walk of its own.
 	Symlink,
-	Readlink
+	Readlink,
+	// Exec by path. See Sysdeps<Execve> in sysdeps.cpp: this is what makes a
+	// file in the filesystem runnable, and therefore what makes /bin a thing
+	// rather than a directory of decoration.
+	//
+	// `Execve` and not `Execveat`: there is no directory-relative exec to
+	// honour, for the same reason there is no `Symlinkat`.
+	Execve
 {};
 
 template<typename Tag>

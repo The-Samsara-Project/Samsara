@@ -52,6 +52,10 @@ pub const PROG_CHELLO: usize = 13;
 /// unconditionally so the index is stable whether or not the port has been
 /// built; see the table entry for how the image is gated.
 pub const PROG_FBTERM: usize = 14;
+/// Index of `busybox`, the ported multi-call binary and the system userland.
+/// One image; the applet is chosen by `argv[0]`, which is why every name under
+/// `/bin` is a symlink to it rather than a copy.
+pub const PROG_BUSYBOX: usize = 15;
 
 /// A boot-time user-space program.
 struct Program {
@@ -64,7 +68,7 @@ struct Program {
     image: &'static [u8],
 }
 
-const PROGRAMS: [Program; 15] = [
+const PROGRAMS: [Program; 16] = [
     Program {
         name: "hello",
         endpoint: None,
@@ -171,6 +175,22 @@ const PROGRAMS: [Program; 15] = [
         root: false,
         image: include_bytes!("../../target/user-fbterm.elf"),
     },
+    // busybox, the ported multi-call binary from ports/busybox. This is the
+    // system userland: `/bin/ls`, `/bin/cat` and the rest are all this one image,
+    // reached by name through symlinks, and busybox selects the applet from
+    // argv[0]. A copy per applet would be 106 copies of a 1 MB binary and a
+    // package manager to keep them in step.
+    //
+    // Like fbterm it is not a cargo target, so it is built by its port's own
+    // script and copied into place by the Makefile. The image is embedded
+    // unconditionally, which is what makes `make` fail loudly rather than boot a
+    // kernel whose userland is missing.
+    Program {
+        name: "busybox",
+        endpoint: None,
+        root: false,
+        image: include_bytes!("../../target/user-busybox.elf"),
+    },
 ];
 
 /// Default search path for spawned programs. `samutils` lives in `/bin`, and
@@ -203,6 +223,21 @@ pub fn default_env(cwd: &str) -> Vec<String> {
     ]
 }
 
+/// The raw image bytes of embedded program `index`.
+///
+/// Exists for the one caller that needs the program *as a file* rather than as
+/// something to run: the boot-time userland seeding, which writes `/bin/busybox`
+/// into the filesystem. A spawned program gets its image from the ELF loader and
+/// never reads this.
+///
+/// The alternative -- spawning busybox and having it ask the kernel for its own
+/// image -- would need a syscall to read a program's bytes, which is a way for a
+/// process to reach kernel memory layout. The kernel already has the image; a
+/// process has no business asking for it.
+pub fn image(index: usize) -> Option<&'static [u8]> {
+    PROGRAMS.get(index).map(|p| &p.image[..])
+}
+
 /// Build a fresh address space for embedded program `index`: the loader maps
 /// and links the ELF, then maps a stack. Returns `(cr3, entry, rsp)`.
 /// Shared with `exec`, which swaps a process onto this image in place.
@@ -220,6 +255,36 @@ pub(crate) fn build_image(
         "user: staged \"{}\" ({} bytes) at {:#x}, cr3={:#x}",
         p.name,
         p.image.len(),
+        entry,
+        cr3
+    );
+    Ok((cr3, entry, rsp))
+}
+
+/// Build a fresh address space for an ELF image held in memory: `(cr3, entry,
+/// rsp)`.
+///
+/// The counterpart to [`build_image`], for a program that came out of the
+/// filesystem rather than out of this table. The split is deliberate: the boot
+/// path names programs by index and must not be able to reach the filesystem,
+/// while `execve` names one by path and must not be able to reach the table --
+/// a program that ran "whatever the kernel happens to carry" would make the
+/// filesystem a suggestion.
+///
+/// `name` is only for the log line. A path is already in the log from the
+/// syscall that got here.
+pub(crate) fn build_image_bytes(
+    image: &[u8],
+    name: &str,
+    args: &[String],
+    env: &[String],
+) -> Result<(usize, usize, usize), i64> {
+    let stack_base = USER_STACK_END - USER_STACK_SIZE;
+    let (cr3, entry, rsp) = crate::elf::load(image, stack_base, USER_STACK_END, args, env)?;
+    crate::log::kdebug!(
+        "user: staged \"{}\" ({} bytes) at {:#x}, cr3={:#x}",
+        name,
+        image.len(),
         entry,
         cr3
     );

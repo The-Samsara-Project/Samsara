@@ -157,6 +157,10 @@ pub extern "C" fn kmain(magic: u32, mbi_phys: u64) -> ! {
     // World-writable scratch directory (sticky, so children only create).
     let _ = vfs::create_as("/tmp", vfs::NodeKind::Dir, 0, 0, 0o1777);
 
+    // ---- the userland ------------------------------------------------------
+    seed_userland();
+    seed_passwd();
+
     // ---- block devices (NVMe, AHCI/SATA) ------------------------------------
     drivers::nvme::init();
     drivers::storage::init();
@@ -191,6 +195,80 @@ pub extern "C" fn kmain(magic: u32, mbi_phys: u64) -> ! {
     crate::user::start_first_user();
     log::kinfo!("scheduler online; handing over CPU");
     task::sched::enter_scheduler();
+}
+
+/// Put the userland's one real binary at `/bin/busybox`.
+///
+/// Everything else under `/bin` is a symlink to this file, made by busybox itself
+/// (`--install -s /bin`) once userspace is running. The split is not arbitrary: the
+/// image has to exist before any user program runs, and only the kernel can put
+/// it there, whereas the list of names is busybox's own and belongs to busybox. A
+/// kernel-side list would be a second copy of it, stale the moment the port's
+/// config changes -- and a stale list means `/bin/ls` missing while `busybox ls`
+/// works, which reads as a broken kernel rather than a forgotten regeneration step.
+///
+/// Failure is reported rather than swallowed. A kernel that boots with no
+/// `/bin/busybox` produces a system where the shell starts and then every command
+/// inside it fails, and the cause is several steps from the symptom. One warning
+/// here saves that search; a missing image means the Makefile did not copy one,
+/// which is a build problem and should read as one.
+fn seed_userland() {
+    let image = match crate::user::image(crate::user::PROG_BUSYBOX) {
+        Some(i) => i,
+        None => {
+            log::kwarn!("userland: busybox is not in the program table");
+            return;
+        }
+    };
+    // `/bin` first: `create_as` resolves the parent directory rather than
+    // creating it, so a single call for the file would fail with ENOENT on a
+    // system with no `/bin` yet -- which is exactly the state this runs in.
+    let _ = vfs::create_as("/bin", vfs::NodeKind::Dir, 0, 0, 0o755);
+    // `/usr/bin` too, because `DEFAULT_PATH` offers it and a program looking for
+    // `/usr/bin/foo` should get ENOENT from the search rather than from a
+    // directory that was never there.
+    let _ = vfs::create_as("/usr/bin", vfs::NodeKind::Dir, 0, 0, 0o755);
+    let _ = vfs::create_as("/root", vfs::NodeKind::Dir, 0, 0, 0o700);
+    match vfs::create_as("/bin/busybox", vfs::NodeKind::File, 0, 0, 0o755) {
+        Ok(node) => {
+            // One `write_at`, not a loop: ramfs grows the file to fit, so this is
+            // both correct and the cheapest thing available. A chunked loop would
+            // be correct too and would exist only to reimplement a copy that is
+            // already a copy.
+            if let Err(e) = node.write_at(0, image) {
+                log::kwarn!("userland: /bin/busybox write failed: {:?}", e);
+            } else {
+                log::kdebug!("userland: /bin/busybox seeded, {} bytes", image.len());
+            }
+        }
+        Err(e) => log::kwarn!("userland: could not create /bin/busybox: {:?}", e),
+    }
+}
+
+/// Seed `/etc/passwd` and `/etc/group`.
+///
+/// Present because `id`, `whoami`, `groups` and the shell's own idea of where
+/// `$HOME` is all resolve the caller's name through the passwd database, and this
+/// port's mlibc reads that database out of this file. Without it those three
+/// applets abort on their first call rather than reporting that they have no name
+/// to report -- mlibc's `getpwnam` returning "not found" is not a thing a program
+/// checks for, so the failure is a panic rather than a message.
+///
+/// The entries answer "who is calling", which is the only question anything here
+/// asks. There is no password field worth having: one user, always uid 0, and a
+/// hash would be a credential for a system that has no way to log in. `nobody` is
+/// present because a program that drops privileges looks itself up afterwards and
+/// deserves a name to find.
+fn seed_passwd() {
+    if let Ok(pw) = vfs::create("/etc/passwd", vfs::NodeKind::File) {
+        let _ = pw.write_at(
+            0,
+            b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/bin/false\n",
+        );
+    }
+    if let Ok(gr) = vfs::create("/etc/group", vfs::NodeKind::File) {
+        let _ = gr.write_at(0, b"root:x:0:\nnogroup:x:65534:\n");
+    }
 }
 
 /// Log the active framebuffer console's grid size, if one is up.
