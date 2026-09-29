@@ -74,6 +74,21 @@ libc_sources += files(
 	'getrandom.cpp',
 )
 
+# `getopt_long(3)` and `getopt_long_only(3)`, plus the `<getopt.h>` that declares
+# them. mlibc puts both behind its glibc option, which this port cannot enable --
+# it would also require `strverscmp`/`versionsort` support that does not exist
+# here. They are worth having anyway: they are the parser behind
+# `--long-options`, and busybox cannot be built with `CONFIG_LONG_OPTS=y` without
+# the header, which takes `ls --color`, `ls --full-time`, `cp --preserve` and a
+# long list of other invocations along with it.
+#
+# Almost none of this is new code. mlibc's POSIX option already contains the whole
+# parser including its long-option path; what the glibc option adds is the
+# two-line public wrapper that names the mode. See getopt.cpp.
+libc_sources += files(
+	'getopt.cpp',
+)
+
 if not no_headers
 	install_headers(
 		'include/abi-bits/access.h',
@@ -137,6 +152,13 @@ if not no_headers
 	install_headers(
 		'include/sys/random.h',
 		subdir: 'sys',
+		follow_symlinks: true
+	)
+	# <getopt.h>, for the same reason as <sys/ioctl.h> above: the glibc option
+	# that normally supplies it is not enabled, but `getopt_long` is implemented
+	# and every program that takes `--long-options` needs to declare it.
+	install_headers(
+		'include/getopt.h',
 		follow_symlinks: true
 	)
 endif

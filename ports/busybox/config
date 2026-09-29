@@ -50,6 +50,29 @@
 CONFIG_STATIC=y
 CONFIG_LFS=y
 
+# `--long-options`, which `allnoconfig` leaves off and which nothing else in this
+# file pulls in.
+#
+# It reads like a convenience option and is not one. With it off, every long
+# option in busybox compiles out and `include/libbb.h` redirects `getopt32long` to
+# plain `getopt32`, which knows only single-character options. So `ls --color`
+# and `ls --full-time` are not merely unsupported: the option string they would
+# have been parsed from is not in the binary, and every applet's long-option table
+# is compiled away with it. What a user sees is a shell that rejects half the
+# invocations they have used everywhere else.
+#
+# The applets affected are not a short list. `ls`, `cp`, `rm`, `grep`, `sed`,
+# `find`, `sort`, `cut`, `readlink`, `realpath` and more all carry long options
+# behind this one symbol, and `ls --color` additionally needs
+# `CONFIG_FEATURE_LS_COLOR` to be meaningful -- which is already set below, and
+# was doing nothing at all without this.
+#
+# Cost: a little more code in `libbb/getopt32.c`, which is where the long-option
+# parser lives. No new dependency: it is busybox's own parser, and the reason it
+# was off here is only that `allnoconfig` turns everything off and this file
+# lists what the port wants rather than what a desktop wants.
+CONFIG_LONG_OPTS=y
+
 # How this port links, as a checked-in fact rather than a Makefile variable,
 # because every part of it is an ABI fact and none of it is machine-specific.
 #
