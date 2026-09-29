@@ -93,6 +93,14 @@ shot() {
 
 key() { mon "sendkey $1"; sleep 0.35; }
 
+# Decode a shot by matching cells against the font's own glyph table, rather than
+# by recognising shapes the way fbshot.py does. A broken font makes OCR report
+# garbage, and garbage cannot be told apart from a broken framebuffer, a wrong
+# palette or a corrupted pixmap -- which is exactly the ambiguity that made a font
+# bug look like a rendering bug. This asks a question with a decidable answer:
+# do these pixels match the glyphs that were supposed to be drawn here?
+decode() { python3 "$ROOT/scripts/fbdecode.py" "$1" "$ROOT/build/fbterm-src" 2>/dev/null; }
+
 # Type a literal string one QEMU key name at a time. QEMU's monitor has no
 # "paste", and inventing a per-character mapping here would be a second keyboard
 # layout to keep in step with the first; `type` in scripts/fbshot.py already owns
@@ -212,11 +220,25 @@ sleep 4
 shot 07-ls
 
 echo
-echo "--- screen after 'echo' ---"
-python3 "$ROOT/scripts/fbshot.py" "$SHOTS/06-echo.ppm" 2>/dev/null | grep -avE '^[[:space:]|]*$' | tail -20
+echo "=== the session, read back out of the framebuffer ==="
+echo "--- after 'echo hello from the shell' ---"
+decode "$SHOTS/06-echo.ppm" | tail -8
 echo
-echo "--- screen after 'ls /bin' ---"
-python3 "$ROOT/scripts/fbshot.py" "$SHOTS/07-ls.ppm" 2>/dev/null | grep -avE '^[[:space:]|]*$' | tail -20
+echo "--- after 'ls /bin' ---"
+decode "$SHOTS/07-ls.ppm" | tail -8
+
+# Did the shell actually answer? Decoding the screen is the only way to know, and
+# "the terminal drew something" is not the same as "the terminal is readable" --
+# which is the distinction this whole script exists to make.
+if decode "$SHOTS/07-ls.ppm" | grep -q 'hello from the shell'; then
+    echo
+    echo "the shell ran the command and its output is legible on screen"
+else
+    echo
+    echo "=== the shell's output is not legible on screen ==="
+    exit 1
+fi
+
 echo
 echo "--- kernel-side faults ---"
 grep -aE "killing pid" "$LOG" | sed 's/\x1b\[[0-9;]*m//g' || echo "(none)"
