@@ -248,12 +248,13 @@ fn do_switch(next: TaskId) {
         // First time this thread runs: stage whichever trampoline it needs.
         if let Some(u) = next_user {
             crate::log::kdebug!(
-                "sched: first-run user {} entry={:#x} stack={:#x}",
+                "sched: first-run user {} entry={:#x} stack={:#x} fs={:#x}",
                 next.0,
                 u.entry,
-                u.stack_top
+                u.stack_top,
+                next_fs
             );
-            context::stage_user_entry(u.entry, u.stack_top);
+            context::stage_user_entry(u.entry, u.stack_top, next_fs);
         }
     }
 
@@ -353,6 +354,7 @@ pub fn spawn_user(name: &str, as_root: usize, entry: usize, stack_top: usize) ->
         entry,
         stack_top,
         None,
+        None,
         alloc::vec::Vec::new(),
         alloc::vec::Vec::new(),
         alloc::string::String::from("/"),
@@ -361,11 +363,18 @@ pub fn spawn_user(name: &str, as_root: usize, entry: usize, stack_top: usize) ->
 
 /// Spawn a user-mode thread, optionally pinning its IPC endpoint to the
 /// well-known id `ep` (used for the fixed bootstrap servers).
+///
+/// `fs_base` is the address the newborn's thread pointer (`%fs`) takes, or 0 for
+/// an image with no thread-local storage. It is threaded in rather than left to
+/// be discovered because the loader is the only thing that knows the layout: it
+/// put the thread-control block at that address and the image's thread-local
+/// variables are addressed relative to it.
 pub fn spawn_user_ep(
     name: &str,
     as_root: usize,
     entry: usize,
     stack_top: usize,
+    fs_base: Option<usize>,
     ep: Option<crate::ipc::EndpointId>,
     args: Vec<String>,
     env: Vec<String>,
@@ -374,6 +383,7 @@ pub fn spawn_user_ep(
     let mut s = SCHED.lock();
     let id = s.alloc_id();
     let mut task = Task::new_user(id, name, as_root, entry, stack_top);
+    task.fs_base = fs_base.unwrap_or(0);
     task.args = args;
     task.env = env;
     task.cwd = cwd;
@@ -1050,7 +1060,7 @@ pub fn exit_current(status: i32) -> ! {
     }
     if next_first {
         if let Some(u) = next_user {
-            context::stage_user_entry(u.entry, u.stack_top);
+            context::stage_user_entry(u.entry, u.stack_top, next_fs);
         }
     }
 
@@ -1113,7 +1123,7 @@ pub fn fork_current() -> Result<TaskId, i64> {
         return Err(crate::abi::errno::EPERM);
     }
 
-    let (name, as_root, io, args, env, cwd, pgid, sid) = {
+    let (name, as_root, io, args, env, cwd, pgid, sid, fs_base) = {
         let g = SCHED.lock();
         let t = g.tasks.get(&TaskId(cur)).expect("unknown running task");
         (
@@ -1125,6 +1135,7 @@ pub fn fork_current() -> Result<TaskId, i64> {
             t.cwd.clone(),
             t.pgid,
             t.sid,
+            t.fs_base,
         )
     };
     let cr3 = match as_root {
@@ -1139,6 +1150,14 @@ pub fn fork_current() -> Result<TaskId, i64> {
     task.args = args;
     task.env = env;
     task.cwd = cwd;
+    // The child shares the parent's address space contents, and the thread
+    // pointer is no exception: it points into a thread block that the child's
+    // copy of the parent's pages still holds, so the same address is correct.
+    // Without this the child would come up with `%fs` at zero and its very first
+    // `errno` write -- on any failing call -- would fault. That is the whole of
+    // `fork`'s cost here; nothing else about the block needs duplicating, because
+    // there are no second threads to keep apart.
+    task.fs_base = fs_base;
     // A child stays in the parent's process group and session, which is what
     // makes a foreground job — the shell plus everything it started —
     // interruptible as a unit by ^C.
@@ -1307,11 +1326,11 @@ pub fn exec_current(prog: usize, args: Vec<String>) -> Result<(), i64> {
     let env = task_env(cur);
     if env.is_empty() {
         let cwd = current_cwd();
-        let (cr3, entry, rsp) = crate::user::build_image(prog, &args, &crate::user::default_env(&cwd))?;
-        return exec_finish(cur, cr3, entry, rsp, args, Vec::new());
+        let loaded = crate::user::build_image(prog, &args, &crate::user::default_env(&cwd))?;
+        return exec_finish(cur, loaded, args, Vec::new());
     }
-    let (cr3, entry, rsp) = crate::user::build_image(prog, &args, &env)?;
-    exec_finish(cur, cr3, entry, rsp, args, env)
+    let loaded = crate::user::build_image(prog, &args, &env)?;
+    exec_finish(cur, loaded, args, env)
 }
 
 /// Replace the calling process with the ELF in `image`.
@@ -1337,20 +1356,19 @@ pub fn exec_path(image: Vec<u8>, args: Vec<String>, name: &str) -> Result<(), i6
     } else {
         env
     };
-    let (cr3, entry, rsp) = crate::user::build_image_bytes(&image, name, &args, &env)?;
-    exec_finish(cur, cr3, entry, rsp, args, env)
+    let loaded = crate::user::build_image_bytes(&image, name, &args, &env)?;
+    exec_finish(cur, loaded, args, env)
 }
 
 /// Swap task `cur` onto a freshly loaded image and drop to ring 3. Split out of
 /// [`exec_current`] so the envp-staging decision stays with its caller.
 fn exec_finish(
     cur: usize,
-    cr3: usize,
-    entry: usize,
-    rsp: usize,
+    loaded: crate::elf::Loaded,
     args: Vec<String>,
     env: Vec<String>,
 ) -> Result<(), i64> {
+    let (cr3, entry, rsp) = (loaded.cr3, loaded.entry, loaded.rsp);
     // The new image starts with a clean signal state.
     crate::sig::exec_reset(cur);
 
@@ -1361,6 +1379,11 @@ fn exec_finish(
         let old = t.as_root;
         let new_saved = context::initial_user_saved_rsp(t.kstack_top());
         t.as_root = Some(cr3);
+        // The thread pointer belongs to the new image's thread block, not to the
+        // process: an exec replaces the address space, and the old block went
+        // with it. Carrying the parent's `%fs` across would leave the new libc
+        // reading thread-local storage out of a mapping that no longer exists.
+        t.fs_base = loaded.fs_base;
         // The exec'd image receives the new argv; cwd and envp carry across.
         t.args = args;
         if !env.is_empty() {
@@ -1392,7 +1415,7 @@ fn exec_finish(
         }
         ACTIVE_CR3.store(cr3, Ordering::Release);
     }
-    context::stage_user_entry(entry, rsp);
+    context::stage_user_entry(entry, rsp, loaded.fs_base);
     unsafe {
         context::switch_to_thread(new_saved);
     }
