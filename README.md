@@ -219,12 +219,43 @@ The libc port:
   a program cannot talk it into reading out of bounds by asking for a
   request no driver implements.
 
+Thread blocks:
+  The loader lays one out for every image that has thread-local storage,
+  and the libc constructs it. The split is not a preference: mlibc's
+  Tcb is a C++ type in a library the kernel does not link, so the kernel
+  cannot build one, and the kernel is what replaced mlibc's dynamic
+  loader, so the kernel is the one that knows where the block is. The
+  layout is the one the toolchain assumed - thread-local data at the
+  bottom, the Tcb immediately above it, %fs at the top - because a
+  statically linked image addresses its thread-locals as direct
+  %fs-relative offsets the linker already resolved, and there is nothing
+  left at run time to check that against.
+
+  Worth knowing before touching it: a libc finds its Tcb by reading the
+  thread pointer and treating what it finds there as the block's
+  address, but the first field inside that block is a self-pointer. So
+  the address has to be handed over separately, and the initial stack's
+  auxv (AT_TCB) is where it goes. Also: wrmsr takes its value in
+  EDX:EAX, not RAX, and getting that wrong installs the ring-3 code
+  selector as the high half of the thread pointer.
+
 Smoke test:
   user/chello.c is a C program linked against that sysroot, and it is the
   only non-Rust user image. It checks the things a libc actually needs to
   work - stdio and buffering, the thread pointer, syscalls, directory
   listing, timestamps, entropy, mmap - and the installer runs it with the
   other self-tests. If the libc port is broken, this is what notices.
+
+  A passing suite is not the same as a working machine, and the gap is
+  worth naming because two real failures lived in it. Every one of those
+  tests runs a program that prints to a pipe; none of them types at a
+  terminal and waits for a shell to answer. A shell that could not be
+  exec'd at all passed the whole suite, and so did a terminal that
+  cleared the screen and drew a cursor but no glyphs - both read as "the
+  terminal is dead" from the outside and neither is visible to a test that
+  never renders anything. scripts/run-shelltest.sh drives the keyboard
+  and reads the answers back off the framebuffer, which is the only check
+  here that would have caught either.
 
 BUILDING
 --------

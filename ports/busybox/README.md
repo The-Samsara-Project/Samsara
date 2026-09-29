@@ -23,11 +23,18 @@ one upstream commit, clone into `build/` (gitignored), patch, build with the
 port's own rules, print a fingerprint. No busybox source is vendored.
 
 Deterministic within a pinned commit: the output is a function of the pinned
-SHA, this directory, and the sysroot. `build.sh` verifies that by setting
-`KCONFIG_NOTIMESTAMP`, busybox's own opt-out; without it the version banner
-carries the wall clock and the fingerprint changes on every run.
+SHA, this directory, and the sysroot. Two timestamps had to be kept out of the
+artifact for that to be true, and they are not the same problem:
 
-    68218d3b875b2a4d9bc77e523a4e6168ee29cd611ec44f8e8049ef2844d9fb68
+- busybox's own version banner carries the wall clock. `build.sh` sets
+  `KCONFIG_NOTIMESTAMP`, busybox's opt-out, for that.
+- mlibc's `SAMSARA_BUILD` is compiled into `libc.a`, and busybox links it, so it
+  reaches the fingerprint too. `ports/mlibc/build.sh` takes that stamp from the
+  pinned commit's date rather than the clock.
+
+Either one on its own is enough to make the hash below different on every run.
+
+    c1a8b7d4568e1bda1681cc237a4da7f5e0c72207d1df929120f0439c421e10ef
 
 ## The patches
 
