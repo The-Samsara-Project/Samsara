@@ -208,29 +208,60 @@ wait_for "execve: /bin/sh" 60 || { echo "no /bin/sh exec -- the shell never star
 sleep 5
 shot 05-shell-up
 
-echo "typing into the shell..."
-type_str 'echo hello from the shell
-'
-sleep 4
-shot 06-echo
+# What the shell looks like before anything is typed. The prompt is what a user
+# judges "is this thing alive" by, and every symptom below is measured against it:
+# a missing prompt, a prompt on the wrong line, and a prompt that needs a second
+# Enter all look like the same dead terminal from the outside.
+echo "=== the prompt, before typing anything ==="
+decode "$SHOTS/05-shell-up.ppm" | tail -6
 
-type_str 'ls /bin
-'
+# Type one command, then press Enter exactly once, and look. A shell that needs a
+# second Enter to show a new prompt is a real bug with a specific cause, and it is
+# invisible to a test that sends several newlines in a row -- the extra one hides
+# it. So this sends one and checks what came back.
+echo
+echo "=== typing 'ls /bin' and pressing Enter once ==="
+type_str 'ls /bin'
+sleep 2
+shot 06a-typed
+decode "$SHOTS/06a-typed.ppm" | tail -4
+key ret
 sleep 4
-shot 07-ls
+shot 06b-after-one-enter
+echo "--- after one Enter ---"
+decode "$SHOTS/06b-after-one-enter.ppm" | tail -6
+
+echo
+echo "=== typing 'echo hello from the shell' and pressing Enter once ==="
+type_str 'echo hello from the shell'
+sleep 2
+key ret
+sleep 4
+shot 07-echo
+echo "--- after one Enter ---"
+decode "$SHOTS/07-echo.ppm" | tail -6
+
+# Scrolling. A command whose output is taller than the screen must scroll, and
+# the prompt has to end up on the *last* line. If the screen does not scroll, the
+# prompt ends up somewhere above the bottom of the display and the terminal looks
+# frozen -- which is indistinguishable, from the outside, from one that is merely
+# waiting.
+echo
+echo "=== a command with more output than the screen has rows ==="
+type_str 'ls /bin /bin /bin /bin /bin /bin /bin /bin'
+sleep 8
+shot 08-scroll
+echo "--- every row the terminal still has, top to bottom ---"
+decode "$SHOTS/08-scroll.ppm"
 
 echo
 echo "=== the session, read back out of the framebuffer ==="
-echo "--- after 'echo hello from the shell' ---"
-decode "$SHOTS/06-echo.ppm" | tail -8
-echo
-echo "--- after 'ls /bin' ---"
-decode "$SHOTS/07-ls.ppm" | tail -8
+decode "$SHOTS/07-echo.ppm" | tail -8
 
 # Did the shell actually answer? Decoding the screen is the only way to know, and
 # "the terminal drew something" is not the same as "the terminal is readable" --
 # which is the distinction this whole script exists to make.
-if decode "$SHOTS/07-ls.ppm" | grep -q 'hello from the shell'; then
+if decode "$SHOTS/07-echo.ppm" | grep -q 'hello from the shell'; then
     echo
     echo "the shell ran the command and its output is legible on screen"
 else

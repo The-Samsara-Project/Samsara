@@ -50,6 +50,15 @@ CELL_TOP = 4
 # this is a cell whose bits do not correspond to any glyph at all.
 MAX_DISTANCE = 14
 
+# A mirrored cell still scores 0 against a mirrored glyph, which is the whole
+# problem: matching pixels against a table cannot tell a correct render from a
+# consistently flipped one unless the table is read the same way the renderer
+# wrote it. So the check that matters is not "does this match" but "does this
+# match *and* would it also match mirrored", and a cell that satisfies both is
+# symmetric and tells us nothing. Asymmetric cells are where a flip shows up, and
+# they are common enough in ordinary text to be worth testing for on every run.
+SYMMETRIC_TOLERANCE = 0
+
 # Pixels this much brighter than black count as "ink". fbterm draws text in
 # palette colours on a black background, and the sum of the three channels is used
 # so the test does not care which channel a given colour happens to weight.
@@ -110,12 +119,19 @@ def main():
         return px[o] + px[o + 1] + px[o + 2] > INK_THRESHOLD
 
     def cell_bits(cx, cy):
-        return [sum((0x80 >> c) for c in range(CELL_W) if ink(cx + c, cy + CELL_TOP + r))
+        # Bit 0 is the leftmost pixel, matching the font data and both renderers
+        # that already draw it (kernel/src/console.rs, user/nutcracker-rt/src/fb.rs).
+        return [sum((1 << c) for c in range(CELL_W) if ink(cx + c, cy + CELL_TOP + r))
                 for r in range(GLYPH_H)]
 
     def distance(a, b):
         return sum(bin(x ^ y).count("1") for x, y in zip(a, b))
 
+    def mirror(bits):
+        return [sum(((b >> c) & 1) << (CELL_W - 1 - c) for c in range(CELL_W))
+                for b in bits]
+
+    flipped = 0
     for cy in range(0, height - CELL_H, CELL_H):
         line = ""
         for ci in range(width // CELL_W):
@@ -125,10 +141,30 @@ def main():
                 continue
             best = min(range(95), key=lambda i: distance(bits, font[i]))
             d = distance(bits, font[best])
+            if d < MAX_DISTANCE:
+                # A mirrored cell still scores 0 against a mirrored glyph, which
+                # is the trap this check exists to close: matching pixels against
+                # a table cannot tell a correct render from a consistently
+                # flipped one unless the table is read the way the renderer wrote
+                # it. So the test is whether the cell *also* matches when
+                # mirrored, and whether that match is a different glyph. Both
+                # together mean a horizontal flip -- legible text, correct
+                # spacing, every character backwards, and invisible to every
+                # other check here.
+                mirrored = mirror(bits)
+                mbest = min(range(95), key=lambda i: distance(mirrored, font[i]))
+                if (distance(mirrored, font[mbest]) <= SYMMETRIC_TOLERANCE
+                        and font[best] != font[mbest]):
+                    flipped += 1
             line += chr(0x20 + best) if d < MAX_DISTANCE else "?"
         line = line.rstrip()
         if line:
             print("%3d |%s" % (cy, line))
+
+    if flipped:
+        print()
+        print("warning: %d cell(s) match a mirrored glyph exactly while the real"
+              " glyph differs; the font is being drawn flipped" % flipped)
 
 
 if __name__ == "__main__":

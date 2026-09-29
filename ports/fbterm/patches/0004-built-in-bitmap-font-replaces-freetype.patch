@@ -18,7 +18,7 @@ index 9c994f4..8a3388b 100644
   *   This file is part of FbTerm.
   *
   *   This program is free software; you can redistribute it and/or
-@@ -18,330 +18,293 @@
+@@ -18,330 +18,312 @@
   *
   */
  
@@ -309,7 +309,26 @@ index 9c994f4..8a3388b 100644
 +	for (u32 row = 0; row < GLYPH_H; row++) {
 +		u8 bits = ascii8x8[unicode - 0x20][row];
 +		for (u32 col = 0; col < GLYPH_W; col++) {
-+			g->pixmap[row * GLYPH_W + col] = (bits & (0x80 >> col)) ? 0xff : 0x00;
++			/* Bit 0 is the leftmost pixel.
++			 *
++			 * The font data is a copy of Samsara's own console font
++			 * (user/nutcracker-rt/src/fb.rs, from kernel/src/console.rs), and
++			 * that font is stored least-significant-bit first: both of those
++			 * render a row by testing `1 << cx` with cx counting from the left
++			 * edge. freetype's bitmaps are the other way round, which is what
++			 * made MSB-first look like the natural choice here.
++			 *
++			 * Picking MSB-first mirrors every glyph horizontally. It is a
++			 * completely legible terminal and completely wrong text, which is
++			 * the worst of both: no error, no missing pixels, correct spacing,
++			 * and every character readable as itself. It is only visible on
++			 * asymmetric glyphs -- 'l', 'F', 'P', '2', 'S' -- where a human
++			 * notices immediately and a test that checks "is there ink" does
++			 * not. Hence the reference to the two renderers that already agree
++			 * on this data: a third renderer guessing the convention is how it
++			 * got wrong in the first place.
++			 */
++			g->pixmap[row * GLYPH_W + col] = (bits & (1 << col)) ? 0xff : 0x00;
 +		}
 +	}
 +	return g;
