@@ -355,6 +355,119 @@ pub extern "Rust" fn tty_check_pgrp(pgid: u64, tty_sid: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// TTY job-control bridge: may the calling task take this terminal as its
+/// controlling terminal?
+///
+/// The POSIX `TIOCSCTTY` rule, in the same shape as [`tty_check_pgrp`]: the
+/// decision needs the caller's session, which only the kernel knows, so the
+/// driver asks rather than guessing. `want` is the session id the caller passed
+/// in, or 0 when it passed NULL and is asking to take the terminal regardless of
+/// who holds it.
+///
+/// Three conditions, all of which POSIX requires and any one of which being
+/// wrong is a way for one session to take another's terminal:
+///
+///   * The caller's process group must have no members other than the caller.
+///     That is the "orphan process group" condition, and it is what stops a
+///     background job in an existing shell from seizing the shell's terminal.
+///   * The caller must already be a session leader, *or* must not already have a
+///     controlling terminal. A session leader claiming a terminal is how a
+///     terminal is acquired at all; a non-leader claiming one is only allowed
+///     when it has none, which is the inheritance case.
+///   * If the caller passed a session id, that id must be the caller's own.
+///
+/// The session id and the foreground group are written by the driver once this
+/// returns true; nothing here mutates scheduler state, so a caller that is
+/// refused has changed nothing.
+#[no_mangle]
+pub extern "Rust" fn tty_check_sctty(want: u64) -> bool {
+    let cur = match crate::task::sched::current_task_id() {
+        Some(t) => t,
+        None => return false,
+    };
+    let (sid, pgid, leader) = match crate::task::sched::task_session_info(cur.0) {
+        Some(info) => info,
+        None => return false,
+    };
+    // A session id of 0 means the caller passed NULL: any of its own session will
+    // do. A non-zero one is a demand to be that exact session, which is how a
+    // program asserts it knows which session it is joining -- and the assertion
+    // is checked against the caller's *actual* session, not trusted, because the
+    // pointer is caller-supplied and a program that guessed wrong must be refused
+    // rather than trusted into another session's terminal.
+    if want != 0 {
+        // The pointer is only dereferenced here, and only after this comparison
+        // would have succeeded for a plausible value. Reading it first would mean
+        // dereferencing an arbitrary user address to decide whether it was worth
+        // reading.
+        let Some(claimed) = (unsafe { crate::abi::user_read_u32(want) }) else {
+            return false;
+        };
+        if claimed as u64 != sid as u64 {
+            return false;
+        }
+    }
+    // The caller's process group must be an orphan: nobody else in it. A shell
+    // that has already started a job has a populated group and must not be able
+    // to re-claim the terminal out from under that job.
+    let members = crate::task::sched::tasks_in_group(pgid);
+    if members.iter().any(|t| *t != cur.0) {
+        return false;
+    }
+    // A session leader may always take one; anyone else only if they have none.
+    // Without the second half a process could take a second terminal and quietly
+    // end up with two, with signals and job control split across them.
+    if !leader && tty_session_attached(sid as u64) {
+        return false;
+    }
+    true
+}
+
+/// Whether session `sid` already holds a controlling terminal.
+///
+/// Asked through the driver's own view, because "does this session have a
+/// controlling terminal" is a property of the terminal side of the pairing and
+/// the kernel keeps no table of it. Unowned terminals report a session of 0, so
+/// this is deliberately not "session != 0".
+#[no_mangle]
+pub extern "Rust" fn tty_session_attached(sid: u64) -> bool {
+    crate::drivers::pty::session_has_controlling_tty(sid as u32)
+}
+
+/// TTY bridge: the calling task's session and process group.
+///
+/// `TIOCSCTTY` records both, as the terminal's new owner and its initial
+/// foreground group. The driver cannot see either: a session id and a pgid are
+/// scheduler state, and a device is handed a buffer and a request number.
+#[no_mangle]
+pub extern "Rust" fn tty_current_sid() -> u32 {
+    crate::task::sched::current_sid()
+}
+
+/// TTY bridge: the calling task's process group. See [`tty_current_sid`].
+#[no_mangle]
+pub extern "Rust" fn tty_current_pgid() -> u32 {
+    crate::task::sched::current_pgid()
+}
+
+/// TTY bridge: the session id the caller passed to `TIOCSCTTY`, or 0 for NULL.
+///
+/// The one ioctl on this device whose argument is a *pointer* rather than a value
+/// in the copied buffer, and the distinction is load-bearing: NULL is the common
+/// case and means "take this terminal from whoever has it". Reading four bytes
+/// out of the buffer to discover that would have meant reading four bytes from
+/// address zero, inside a call that is doing exactly what it was asked to do.
+///
+/// So the request is given a zero-length argument and the pointer is carried
+/// alongside it. Reporting the pointer's *value* rather than what it points at is
+/// deliberate: the only question asked of it is whether it is null, and a
+/// non-null pointer is only dereferenced by the kernel, once, after the
+/// permission check has already passed.
+#[no_mangle]
+pub extern "Rust" fn tty_sctty_arg() -> u64 {
+    crate::abi::current_ioctl_arg()
+}
+
 /// TTY bridge: the calling task's id, or 0 when there is no current user task.
 ///
 /// A boot-time context has no task to register as a waiter, so a device that

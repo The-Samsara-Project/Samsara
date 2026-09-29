@@ -560,6 +560,32 @@ impl FdTable {
         self.fds.len() - 1
     }
 
+    /// Whether `fd` currently holds an open description.
+    ///
+    /// A slot past the end of the table counts as free, which is what makes
+    /// "lowest free descriptor at or above N" a bounded walk rather than a
+    /// resizing one.
+    pub fn is_open(&self, fd: usize) -> bool {
+        self.fds.get(fd).and_then(|s| s.as_ref()).is_some()
+    }
+
+    /// Place `handle` at exactly `fd`, which must be free, and return it.
+    ///
+    /// For `fcntl(F_DUPFD)`, where the caller has already established that `fd`
+    /// is unused. Unlike [`FdTable::replace_at`] this refuses to displace: a
+    /// `F_DUPFD` that silently closed something would defeat the entire point of
+    /// the call, which is to move a descriptor somewhere harmless.
+    pub fn install_at(&mut self, fd: usize, handle: FileHandle) -> Result<usize, FsError> {
+        while self.fds.len() <= fd {
+            self.fds.push(None);
+        }
+        if self.fds[fd].is_some() {
+            return Err(FsError::Exists);
+        }
+        self.fds[fd] = Some(handle);
+        Ok(fd)
+    }
+
     /// Place `handle` at exactly `fd`, displacing and returning whatever was
     /// there. For `dup2(2)`.
     pub fn replace_at(&mut self, fd: usize, handle: FileHandle) -> Option<FileHandle> {

@@ -112,6 +112,34 @@ pub fn dup(task: usize, oldfd: usize) -> Result<usize, FsError> {
     Ok(table.install_description(handle))
 }
 
+/// As [`dup`], but onto the lowest free descriptor at or above `floor`, for
+/// `fcntl(F_DUPFD)`.
+///
+/// The floor is the entire point and [`dup`] cannot provide it. A program that
+/// wants a duplicate *out of the way* -- a shell moving `/dev/tty` clear of its
+/// own descriptors 0-2 before rearranging them -- cannot use the lowest free
+/// descriptor, because the lowest free descriptor is the one it is trying to
+/// avoid. `dup2` is not a substitute either: it closes whatever occupies the
+/// slot it is given, so using it to probe for a free one would destroy the very
+/// descriptors being protected.
+pub fn dup_at_least(task: usize, oldfd: usize, floor: usize) -> Result<usize, FsError> {
+    let mut tables = TABLES.lock();
+    let table = tables.get_mut(&task).ok_or(FsError::BadDescriptor)?;
+    let handle = table.description(oldfd)?;
+    // Bounded so a caller cannot make this walk the whole descriptor space. The
+    // limit is well above any real process's needs and is reported as EINVAL
+    // rather than looping: a floor past it is a caller bug, not a full table.
+    const MAX_SCAN: usize = 4096;
+    let mut candidate = floor;
+    while candidate < floor.saturating_add(MAX_SCAN) {
+        if !table.is_open(candidate) {
+            return table.install_at(candidate, handle);
+        }
+        candidate += 1;
+    }
+    Err(FsError::BadDescriptor)
+}
+
 /// As [`dup`], but into a specific slot, for `dup2(2)`.
 ///
 /// `newfd == oldfd` is *not* an error and must not close anything: POSIX

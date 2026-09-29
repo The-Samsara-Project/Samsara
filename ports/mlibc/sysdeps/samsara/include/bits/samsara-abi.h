@@ -69,6 +69,11 @@
 #define SYSCALL_DUP            88
 #define SYSCALL_DUP2           89
 #define SYSCALL_PSELECT6       90
+/* `fcntl(F_DUPFD)`: duplicate onto the lowest free descriptor at or above a
+ * floor. `SYSCALL_DUP` is the same operation without the floor, and it returns
+ * the lowest free descriptor -- normally 0-2, which is exactly what a shell
+ * calling this is trying to move a descriptor away from. */
+#define SYSCALL_DUPFD          95
 /* `symlink(2)`: the link's contents are the target, stored verbatim. Recorded
  * rather than resolved, because a relative target is meaningless without knowing
  * the directory the link sits in -- resolving at creation time produces a link

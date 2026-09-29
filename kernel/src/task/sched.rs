@@ -1491,6 +1491,19 @@ pub fn current_pgid() -> u32 {
         .unwrap_or(0)
 }
 
+/// Task `id`'s session, process group, and whether it leads its session.
+///
+/// One read under one lock, because the `TIOCSCTTY` rule consults all three
+/// together and three separate lookups would let a scheduling decision land
+/// between them -- which is exactly the window in which a shell's group could
+/// change from orphaned to populated and have the check answer about a state
+/// that never existed. Returns `None` for an id that names no live task.
+pub fn task_session_info(id: usize) -> Option<(u32, u32, bool)> {
+    let g = SCHED.lock();
+    let t = g.tasks.get(&TaskId(id))?;
+    Some((t.sid, t.pgid, t.session_leader))
+}
+
 /// The calling process's session id.
 pub fn current_sid() -> u32 {
     let cur = CURRENT_ID.load(Ordering::Relaxed);

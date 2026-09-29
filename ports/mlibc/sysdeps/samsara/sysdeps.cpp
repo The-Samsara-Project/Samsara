@@ -371,6 +371,41 @@ int Sysdeps<Fcntl>::operator()(int fd, int request, va_list args, int *result) {
 	case F_SETFD:
 		(void)args;
 		return 0; // accepted, never honored
+	case F_DUPFD:
+	case F_DUPFD_CLOEXEC: {
+		// `fcntl(fd, F_DUPFD, arg)` -- duplicate `fd` onto the lowest free
+		// descriptor at or above `arg`.
+		//
+		// This is not a corner of the API. A shell cannot turn job control on
+		// without it: ash opens `/dev/tty`, then immediately duplicates it out
+		// of the way of its own descriptors before touching the foreground
+		// process group, and treats a failure here as "there is no terminal" --
+		// printing "can't access tty; job control turned off" and running
+		// without job control for the rest of the session, on a terminal that
+		// works perfectly well.
+		//
+		// `F_DUPFD` is 0 and `F_DUPFD_CLOEXEC` is 1030 on Linux. Both are listed
+		// explicitly because `F_DUPFD` is 0, which is also a value an unrelated
+		// request could plausibly carry; a bare `case 0` here would quietly turn
+		// that into a duplicate.
+		//
+		// The `CLOEXEC` variant is accepted and the flag is not stored, because
+		// this kernel does not track close-on-exec at all -- the same gap
+		// `F_GETFD`/`F_SETFD` above already has.
+		//
+		// A dedicated syscall rather than `DUP` plus a loop, because the floor is
+		// the entire point: `DUP` returns the lowest free descriptor, which is
+		// usually 0-2 and exactly where a shell keeps its own. Picking a free slot
+		// needs to know which slots are in use, and only the kernel's descriptor
+		// table knows that.
+		int floor = va_arg(args, int);
+		auto ret = syscall(SYSCALL_DUPFD, (long)fd, (long)floor);
+		if (ret < 0) {
+			return -ret;
+		}
+		*result = (int)ret;
+		return 0;
+	}
 	default:
 		(void)args;
 		(void)fd;

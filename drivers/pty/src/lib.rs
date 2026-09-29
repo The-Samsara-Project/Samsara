@@ -64,6 +64,33 @@ extern "Rust" {
     fn tty_check_pgrp(pgid: u64, tty_sid: u64) -> bool;
 }
 
+/// Kernel bridge: may the calling task take a terminal as its controlling
+/// terminal? `want` is the session id the caller passed to `TIOCSCTTY`, or 0 for
+/// the NULL case. Enforces the POSIX conditions, which need the caller's session
+/// and process group -- neither of which the driver can see.
+extern "Rust" {
+    fn tty_check_sctty(want: u64) -> bool;
+}
+
+/// Kernel bridge: the calling task's session and process group, which
+/// `TIOCSCTTY` records as the terminal's owner and foreground group.
+extern "Rust" {
+    fn tty_current_sid() -> u32;
+    fn tty_current_pgid() -> u32;
+}
+
+/// Kernel bridge: the raw `TIOCSCTTY` argument, as the value of the `int *` the
+/// caller passed. Zero means NULL.
+///
+/// This has to come from the kernel rather than from the copied `data` buffer.
+/// Every other ioctl on this device takes its argument *by value* in that buffer,
+/// but `TIOCSCTTY` takes a pointer, and the common case is that the pointer is
+/// null. Copying four bytes from address zero to find that out would fault inside
+/// a call that is entirely legitimate.
+extern "Rust" {
+    fn tty_sctty_arg() -> u64;
+}
+
 /// Set of task ids waiting for readiness on one direction of a terminal.
 ///
 /// Samsara blocks threads on task ids rather than on futures, so the pty
@@ -355,6 +382,18 @@ pub mod ioctl {
     pub const TIOCGPTN: u32 = 0x80045430;
     /// Lock/unlock the pty slave (Linux).
     pub const TIOCSPTLCK: u32 = 0x40045431;
+    /// Make this terminal the caller's controlling terminal (BSD).
+    ///
+    /// `TIOCSCTTY`. The argument is an `int *`: NULL means "steal it from
+    /// whoever has it", non-NULL points at a session id that must already be the
+    /// caller's. Linux numbers it 0x540E.
+    ///
+    /// Listed here with the rest of the requests for discoverability, but
+    /// deliberately *not* given an argument length by the kernel: every other
+    /// request on this list copies a value through the descriptor's buffer, and
+    /// this one takes a pointer whose nullness is the whole point. See
+    /// `tty_sctty_arg`.
+    pub const TIOCSCTTY: u32 = 0x540E;
 }
 
 impl PtyMaster {
@@ -607,6 +646,7 @@ impl PtySlave {
                 Ok(())
             }
             ioctl::TIOCGSID => copy_out(data, &self.get_sid()),
+            ioctl::TIOCSCTTY => self.set_controlling_tty(data),
             ioctl::FIONREAD => {
                 let n: u32 = self.ldisc.lock().available() as u32;
                 copy_out(data, &n)
@@ -637,6 +677,47 @@ impl PtySlave {
 
     pub fn set_sid(&self, sid: u32) {
         self.session.store(sid, Ordering::Release);
+    }
+
+    /// `ioctl(TIOCSCTTY)`: claim this terminal for the calling session.
+    ///
+    /// The argument is an `int *`, not an `int`, and the distinction is the whole
+    /// point of the call: NULL means "give it to me, taking it from whoever has
+    /// it", and non-NULL points at a session id the caller asserts is its own.
+    /// That is why this cannot be a `copy_in` of a `u32` like every other request
+    /// here -- a NULL argument is the common case, and reading four bytes from
+    /// address zero would fault in the middle of a legitimate call. `data` is
+    /// sized by the caller, so the pointer's value is what has to be interpreted,
+    /// and the kernel passes the raw argument through for exactly this request.
+    ///
+    /// The POSIX conditions are checked by the kernel, which is the only place
+    /// that knows the caller's session and process group. The driver applies the
+    /// result: the session id, and the caller's own process group as the initial
+    /// foreground group, which is what makes the shell that just took the terminal
+    /// the thing ^C and ^Z are delivered to.
+    fn set_controlling_tty(&self, _data: &mut [u8]) -> DriverResult<()> {
+        // SAFETY: the kernel exports these symbols (kernel/src/lib.rs).
+        let (want, sid, pgid) = unsafe {
+            (
+                tty_sctty_arg(),
+                tty_current_sid(),
+                tty_current_pgid(),
+            )
+        };
+        if !unsafe { tty_check_sctty(want) } {
+            // EPERM, not EINVAL: POSIX specifies this failure, and a shell that
+            // is refused here falls back to running without job control, which is
+            // a much better outcome than one that treats the terminal as broken.
+            return Err(DriverError::PermissionDenied);
+        }
+        self.set_sid(sid);
+        // The acquiring process's group leads the terminal until it says
+        // otherwise with TIOCSPGRP. Setting it unconditionally is right even
+        // when the terminal already had a foreground group: taking the terminal
+        // means taking the foreground with it, and leaving the old group in place
+        // would mean the new owner's first ^C went to the previous owner's job.
+        self.set_pgid(pgid);
+        Ok(())
     }
 
     /// Whether output is currently held by XON/XOFF flow control.
@@ -955,6 +1036,51 @@ pub fn slave_of(master: &Arc<PtyMaster>) -> Arc<PtySlave> {
     master.slave.clone()
 }
 
+/// The terminal session `sid` owns as its controlling terminal, if any.
+///
+/// Backs `/dev/tty`. The lookup is by recorded session rather than by any name,
+/// because `/dev/tty` is defined as "the terminal this session controls" and the
+/// session is the only thing that identifies one. A terminal with no owner
+/// records session 0, which no real session has, so it is never returned.
+///
+/// This returns the slave rather than a VFS node on purpose: the driver crate
+/// cannot see the VFS, and the kernel's open path is what wraps a terminal as a
+/// node -- the same way it wraps the master `open_ptmx` allocates. Doing the
+/// wrapping in two places would risk the two disagreeing about what a node is.
+pub fn controlling_tty(sid: u32) -> Option<Arc<PtySlave>> {
+    if sid == 0 {
+        return None;
+    }
+    let g = PTY_MANAGER.lock();
+    let m = g.as_ref()?;
+    m.slaves
+        .values()
+        .find(|s| s.session.load(Ordering::Acquire) == sid)
+        .cloned()
+}
+
+/// Whether session `sid` already owns some terminal as its controlling terminal.
+///
+/// Asked by the kernel's `TIOCSCTTY` check, and answered from the terminals
+/// rather than from a table of sessions, because the pairing is the terminal's
+/// property: a session's controlling terminal is whichever terminal recorded its
+/// session id, and the kernel keeps no reverse index of that.
+///
+/// The scan is over the live pair table rather than a set of owned sessions,
+/// which is O(terminals) and called once per `TIOCSCTTY` -- once per shell
+/// startup. Building a reverse index to make it O(1) would mean keeping it
+/// correct across every terminal's teardown, for a question asked that rarely.
+pub fn session_has_controlling_tty(sid: u32) -> bool {
+    if sid == 0 {
+        return false;
+    }
+    let g = PTY_MANAGER.lock();
+    match g.as_ref() {
+        Some(m) => m.slaves.values().any(|s| s.session.load(Ordering::Acquire) == sid),
+        None => false,
+    }
+}
+
 /// Register the boot-time pty pair plus the `/dev/ptmx` multiplexer.
 pub fn register_devices() -> DriverResult<()> {
     // Pair 0 is the boot console's terminal, published under a fixed name
@@ -975,6 +1101,11 @@ pub fn register_devices() -> DriverResult<()> {
     }
     register_char_device("ptmx", Arc::new(PtmxDevice))?;
     driver_common::kinfo!("pty: registered ptmx (multiplexer) and pts/0 (boot console)");
+    // `/dev/tty` is deliberately *not* registered here. It cannot be a fixed
+    // entry: it names whichever terminal the calling session controls, so which
+    // node it resolves to is a property of the caller rather than of the device
+    // table. The kernel's open path intercepts it and asks
+    // [`controlling_tty_node`] instead. See `open_ctty` in kernel/src/abi/mod.rs.
     Ok(())
 }
 

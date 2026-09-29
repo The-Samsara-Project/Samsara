@@ -100,6 +100,16 @@ pub mod errno {
     /// the value is duplicated here so that the syscall layer never has to convert
     /// between the two representations.
     pub const ELOOP: i64 = -40;
+    /// No such device or address (POSIX `ENXIO`).
+    ///
+    /// Added for `/dev/tty`, and specifically for the case where the calling
+    /// session has no controlling terminal. That is a fact about the session
+    /// rather than a failure to open a file, and it is the one error a program can
+    /// act on: a shell reaching for `/dev/tty` to find its terminal gets `ENXIO`
+    /// and knows to run without job control, where `ENOENT` would send it looking
+    /// for a missing file and `EACCES` would send it looking for a permission
+    /// problem. Both of those are plausible-sounding and both are wrong.
+    pub const ENXIO: i64 = -6;
     /// A path component is too long (POSIX `ENAMETOOLONG`).
     ///
     /// Separate from `EINVAL` because the remedy is different: the caller shortens
@@ -487,6 +497,23 @@ pub mod nr {
     /// no way to here, and that gap is recorded here rather than left to be
     /// discovered.
     pub const EXECVE: u64 = 94;
+    /// `fcntl(F_DUPFD)`: `(fd, floor) -> newfd`.
+    ///
+    /// Duplicates `fd` onto the lowest free descriptor *at or above* `floor`.
+    /// [`DUP`] is the same operation without the floor, and it cannot stand in
+    /// here: it returns the lowest free descriptor, which is normally 0-2 --
+    /// exactly where a shell keeps its own. Picking a slot that is genuinely free
+    /// needs to know which slots are in use, and only the descriptor table knows
+    /// that, so this is a separate number rather than a loop over `DUP2` in the
+    /// libc. A loop would have to probe for emptiness by attempting a `DUP2`,
+    /// which *closes* whatever it finds there.
+    ///
+    /// Added for `fcntl(2)`. A shell cannot enable job control without it: `ash`
+    /// opens `/dev/tty`, moves the descriptor somewhere out of its own way, and
+    /// reads a failure as "there is no terminal" -- so it printed "can't access
+    /// tty; job control turned off" and stayed that way for the whole session,
+    /// on a terminal that worked.
+    pub const DUPFD: u64 = 95;
     /// First number reserved for out-of-tree/experimental use.
     pub const EXPERIMENTAL_BASE: u64 = 0x8000_0000_0000_0000;
 }
@@ -799,6 +826,7 @@ pub fn register_defaults() {
     register(nr::READLINK, sys_readlink);
     register(nr::LSTAT, sys_lstat);
     register(nr::EXECVE, sys_execve);
+    register(nr::DUPFD, sys_dupfd);
 
     unsafe {
         enable_syscall_instruction();
@@ -829,16 +857,48 @@ pub fn register_defaults() {
 /// space (validated per page against the CR3 currently in use).
 unsafe fn user_bytes(buf: u64, len: u64) -> Option<&'static mut [u8]> {
     let len = len.min(1 << 20) as usize;
+    // A zero-length buffer is a real case -- `ioctl(fd, TIOCSCTTY, 0)` and
+    // `read(fd, buf, 0)` both ask for one -- and it has to be answered without
+    // touching `buf` at all.
+    //
+    // It used to fall through to `from_raw_parts_mut(buf, 0)`, which is instant
+    // undefined behaviour: a null pointer is not a valid `&mut [u8]` even when
+    // the length is zero, and Rust's rules say so for exactly this case. The
+    // observable consequence was worse than "technically UB". LLVM is entitled
+    // to assume the pointer a reference is built from is non-null, so the
+    // optimiser could conclude the `Option` was always `Some` -- and did: the
+    // function returned `Some`, and the caller observed `None`, for the same
+    // call, in the same build. Nothing in the source explains that, which is
+    // what made it expensive to find.
+    //
+    // An empty slice is returned instead, from a literal. It is a valid empty
+    // borrow with no pointer to be wrong about, and it costs one branch that was
+    // already being taken.
+    if len == 0 {
+        return Some(&mut []);
+    }
     let ptr = buf as usize;
     // Validate every page in range through the current address space.
-    if len > 0 {
-        let first = ptr & !0xFFF;
-        let last = (ptr + len - 1) & !0xFFF;
-        for page in (first..=last).step_by(0x1000) {
-            crate::memory::vmm::translate_current(page)?;
-        }
+    let first = ptr & !0xFFF;
+    let last = (ptr + len - 1) & !0xFFF;
+    for page in (first..=last).step_by(0x1000) {
+        crate::memory::vmm::translate_current(page)?;
     }
     Some(core::slice::from_raw_parts_mut(buf as *mut u8, len))
+}
+
+/// Read a `u32` from a user pointer, validating the page it lives on.
+///
+/// Separate from [`user_bytes`] because `TIOCSCTTY` needs to dereference a
+/// caller-supplied pointer at exactly one place, and doing it through the usual
+/// borrow-of-the-whole-buffer path would be a way to make that read look routine
+/// when it is the one read in this syscall that trusts an address nobody has
+/// checked. Returning `None` for an unmapped pointer is the answer a caller wants
+/// anyway: a `TIOCSCTTY` argument pointing at nothing is a failed session
+/// assertion, not a kernel fault.
+pub(crate) fn user_read_u32(ptr: u64) -> Option<u32> {
+    let bytes = unsafe { user_bytes(ptr, 4) }?;
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 fn current_task() -> Result<usize, i64> {
@@ -989,6 +1049,15 @@ fn sys_open(path: u64, path_len: u64, flags: u64, mode: u64, _a5: u64, _a6: u64)
         };
     }
 
+    // `/dev/tty` names the calling session's controlling terminal, so which node
+    // it resolves to depends on *who is asking* -- it cannot be a fixed entry in
+    // the device table the way `/dev/fb0` is. It is intercepted here for the same
+    // reason `/dev/ptmx` is, and for the same reason the answer may be an error:
+    // a session with no controlling terminal has to be told so.
+    if abs == "/dev/tty" {
+        return open_ctty(task, accmode, flags & crate::vfs::F_SETFL_MASK);
+    }
+
     let node = match crate::vfs::resolve_checked(&abs, &cred) {
         Ok(n) => n,
         Err(crate::vfs::FsError::NotFound) if flags & crate::vfs::O_CREAT != 0 => {
@@ -1056,6 +1125,61 @@ fn acquire_controlling_tty(task: usize, node: &crate::vfs::VnodeRef) {
     }
     let sid = crate::task::sched::task_groups(task).sid;
     node.acquire_session(sid);
+}
+
+/// Open the calling session's controlling terminal, for `/dev/tty`.
+///
+/// Which terminal that is depends on the caller, so this cannot be a node in the
+/// device table. The terminal is found by asking the pty driver for the slave
+/// whose recorded session is the caller's -- the same pairing `TIOCSCTTY`
+/// established.
+///
+/// `ENXIO` when the session has no controlling terminal, which is the POSIX
+/// answer and the one a program can act on: `ash` opens `/dev/tty` to find the
+/// terminal it is attached to, and "no controlling terminal" is a fact about the
+/// session rather than a failure to open a file. Returning `ENOENT` here would
+/// be the more common choice and would be wrong, because the file does exist.
+///
+/// A session that has never taken a terminal still gets one here if it is
+/// attached to a terminal another way -- specifically, if the calling task
+/// already has a terminal open on descriptor 0, 1 or 2. That is the case a
+/// `setsid`-ed program lands in, and it is what makes `daemon`-style code work
+/// without it having to guess a `/dev/pts/N`.
+fn open_ctty(task: usize, accmode: u32, status: u32) -> i64 {
+    let sid = crate::task::sched::current_sid();
+    // The session's own terminal first, then the descriptor fallback. The
+    // wrapper is built here rather than in the driver because the driver crate
+    // cannot see the VFS, and because `open_ptmx` already wraps a terminal this
+    // way -- two wrappers for one terminal would make the VFS's node identity
+    // checks disagree with themselves.
+    let node = match crate::drivers::pty::controlling_tty(sid) {
+        Some(slave) => crate::vfs::devfs::anonymous(alloc::sync::Arc::new(
+            crate::drivers::pty::PtySlaveDevice::new(slave),
+        )),
+        None => match terminal_from_standard_fds(task) {
+            Some(n) => n,
+            None => return errno::ENXIO,
+        },
+    };
+    crate::vfs::fdtab::install_full(task, node, accmode, status) as i64
+}
+
+/// The terminal on descriptor 0, 1 or 2 of `task`, if any of them is one.
+///
+/// A fallback for [`open_ctty`], and the reason `/dev/tty` works for a session
+/// that never called `TIOCSCTTY`: the process inherited those descriptors from
+/// whoever started it, and on a system where a terminal is a pty slave that is
+/// exactly the terminal in question. Returns the node so the descriptor sees the
+/// same terminal rather than a copy of its state.
+fn terminal_from_standard_fds(task: usize) -> Option<crate::vfs::VnodeRef> {
+    for fd in 0..3 {
+        if let Ok(node) = crate::vfs::fdtab::get(task, fd) {
+            if node.is_terminal() {
+                return Some(node);
+            }
+        }
+    }
+    None
 }
 
 /// Open the pty multiplexer at `abs`.
@@ -1420,6 +1544,15 @@ mod terminal_ioctl {
     pub const TIOCSWINSZ: u32 = 0x5414;
     pub const FIONREAD: u32 = 0x541B;
     pub const TIOCGSID: u32 = 0x5429;
+    /// Set the controlling terminal of the calling session.
+    ///
+    /// `TIOCSCTTY`. The argument is an `int *` and not an `int`, which is why it
+    /// is the one request that cannot go through the usual argument copy: NULL
+    /// means "take this terminal from whoever holds it", and that is the spelling
+    /// every shell uses. The pointer is carried past the copy instead, and only
+    /// its nullness is ever consulted -- a non-null value is compared against the
+    /// caller's own session id before anything reads through it.
+    pub const TIOCSCTTY: u32 = 0x540E;
     pub const TCGETA: u32 = 0x5405;
     pub const TCSETA: u32 = 0x5406;
     pub const TCSETAW: u32 = 0x5407;
@@ -1448,6 +1581,20 @@ fn ioctl_arg_len(cmd: u32) -> Option<usize> {
         // These all take or return a single `int`/`pid_t`.
         TIOCGPGRP | TIOCSPGRP | TIOCGSID | FIONREAD | TCXONC | TCFLSH | TIOCGPTN => Some(4),
         TCSBRK => Some(4),
+        // `TIOCSCTTY` is the one request whose argument is a *pointer* rather than
+        // a value living in the caller's buffer, and the pointer is null in the
+        // common case: `ioctl(fd, TIOCSCTTY, 0)` is the ordinary spelling and means
+        // "give me this terminal". Copying four bytes through the buffer to find
+        // that out would read address zero inside a legitimate call, so the
+        // request is given a zero-length argument and the raw pointer is carried
+        // past the copy for the driver to ask about separately.
+        //
+        // A zero length is what makes `user_bytes(arg, 0)` succeed for *any*
+        // `arg`, null included, which is the whole requirement. The driver never
+        // dereferences it: it asks the kernel whether the pointer was null, and
+        // the kernel dereferences it only for a non-null pointer whose value
+        // matches the caller's own session, checked before any read.
+        TIOCSCTTY => Some(0),
         FBIOGET_VSCREENINFO => Some(core::mem::size_of::<FbVarScreeninfo>()),
         FBIOGET_FSCREENINFO => Some(core::mem::size_of::<FbFixScreeninfo>()),
         _ => None,
@@ -1468,6 +1615,12 @@ fn sys_ioctl(fd: u64, request: u64, arg: u64, _a4: u64, _a5: u64, _a6: u64) -> i
         Some(len) => len,
         None => return errno::ENOTTY,
     };
+    // Stash the raw argument for `TIOCSCTTY`, the one request that takes a
+    // pointer. It has to be readable from the driver without being copied,
+    // because the pointer is null in the ordinary case and copying would mean
+    // reading address zero. Only `current_ioctl_arg` consults this, and only for
+    // that request; every other request copies its argument as before.
+    IOCTL_ARG.store(arg, core::sync::atomic::Ordering::Relaxed);
     let user = match unsafe { user_bytes(arg, len as u64) } {
         Some(user) => user,
         None => return errno::EINVAL,
@@ -1487,6 +1640,26 @@ fn sys_ioctl(fd: u64, request: u64, arg: u64, _a4: u64, _a5: u64, _a6: u64) -> i
         Err(crate::vfs::FsError::NotSupported) => errno::ENOTTY,
         Err(e) => e.into(),
     }
+}
+
+/// The raw `ioctl` argument of the call in progress, stashed by [`sys_ioctl`].
+///
+/// Exists for exactly one request. `TIOCSCTTY` takes an `int *` rather than an
+/// `int`, and the ordinary spelling passes NULL, so the argument cannot be copied
+/// through the descriptor's user buffer: doing so would read four bytes from
+/// address zero. A driver that needs to know whether the pointer was null asks
+/// here instead.
+///
+/// Storing the pointer's *value* and not its contents is the point. A non-null
+/// `TIOCSCTTY` argument names a session id the caller claims to be in, and the
+/// kernel compares that value against the caller's own session before anything
+/// dereferences it -- so a pointer to nonsense is rejected as a bad session id
+/// rather than read.
+static IOCTL_ARG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The raw argument of the `ioctl` currently being dispatched.
+pub fn current_ioctl_arg() -> u64 {
+    IOCTL_ARG.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 fn sys_pipe(pair: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
@@ -3454,6 +3627,25 @@ fn sys_dup(oldfd: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 
         Err(e) => return e,
     };
     match crate::vfs::fdtab::dup(task, oldfd as usize) {
+        Ok(fd) => fd as i64,
+        Err(e) => e.into(),
+    }
+}
+
+/// `fcntl(F_DUPFD)`: duplicate `oldfd` onto the lowest free descriptor at or
+/// above `floor`.
+fn sys_dupfd(oldfd: u64, floor: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    // A floor this large cannot be a real request and would make the search walk
+    // a table sized to fit it. Refused rather than clamped, so a caller passing
+    // garbage finds out.
+    if floor > 1 << 20 {
+        return errno::EINVAL;
+    }
+    match crate::vfs::fdtab::dup_at_least(task, oldfd as usize, floor as usize) {
         Ok(fd) => fd as i64,
         Err(e) => e.into(),
     }
