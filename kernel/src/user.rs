@@ -259,30 +259,30 @@ pub fn image(index: usize) -> Option<&'static [u8]> {
 }
 
 /// Build a fresh address space for embedded program `index`: the loader maps
-/// and links the ELF, then maps a stack. Returns `(cr3, entry, rsp)`.
-/// Shared with `exec`, which swaps a process onto this image in place.
+/// and links the ELF, then maps a stack and a thread block. Shared with `exec`,
+/// which swaps a process onto this image in place.
 pub(crate) fn build_image(
     index: usize,
     args: &[String],
     env: &[String],
-) -> Result<(usize, usize, usize), i64> {
+) -> Result<crate::elf::Loaded, i64> {
     let p = PROGRAMS
         .get(index)
         .ok_or(crate::abi::errno::ENOENT as i64)?;
     let stack_base = USER_STACK_END - USER_STACK_SIZE;
-    let (cr3, entry, rsp) = crate::elf::load(p.image, stack_base, USER_STACK_END, args, env)?;
+    let loaded = crate::elf::load(p.image, stack_base, USER_STACK_END, args, env, p.name)?;
     crate::log::kdebug!(
-        "user: staged \"{}\" ({} bytes) at {:#x}, cr3={:#x}",
+        "user: staged \"{}\" ({} bytes) at {:#x}, cr3={:#x}, fs={:#x}",
         p.name,
         p.image.len(),
-        entry,
-        cr3
+        loaded.entry,
+        loaded.cr3,
+        loaded.fs_base
     );
-    Ok((cr3, entry, rsp))
+    Ok(loaded)
 }
 
-/// Build a fresh address space for an ELF image held in memory: `(cr3, entry,
-/// rsp)`.
+/// Build a fresh address space for an ELF image held in memory.
 ///
 /// The counterpart to [`build_image`], for a program that came out of the
 /// filesystem rather than out of this table. The split is deliberate: the boot
@@ -298,17 +298,18 @@ pub(crate) fn build_image_bytes(
     name: &str,
     args: &[String],
     env: &[String],
-) -> Result<(usize, usize, usize), i64> {
+) -> Result<crate::elf::Loaded, i64> {
     let stack_base = USER_STACK_END - USER_STACK_SIZE;
-    let (cr3, entry, rsp) = crate::elf::load(image, stack_base, USER_STACK_END, args, env)?;
+    let loaded = crate::elf::load(image, stack_base, USER_STACK_END, args, env, name)?;
     crate::log::kdebug!(
-        "user: staged \"{}\" ({} bytes) at {:#x}, cr3={:#x}",
+        "user: staged \"{}\" ({} bytes) at {:#x}, cr3={:#x}, fs={:#x}",
         name,
         image.len(),
-        entry,
-        cr3
+        loaded.entry,
+        loaded.cr3,
+        loaded.fs_base
     );
-    Ok((cr3, entry, rsp))
+    Ok(loaded)
 }
 
 /// Spawn a process from the embedded program table. Returns its task id.
@@ -351,14 +352,24 @@ pub fn spawn_program_args(
     } else {
         args
     };
-    let (cr3, entry, rsp) = build_image(index, &args, &env).map_err(|e| e as i32)?;
+    let loaded = build_image(index, &args, &env).map_err(|e| e as i32)?;
     let p = &PROGRAMS[index];
     // Whether there is a parent decides the descriptor table, and it has to be
     // read *before* the spawn: `spawn_user_ep` copies the caller's table when
     // there is one, and the question of what to do about descriptors 0-2 is
     // answered differently in the two cases.
     let parent = crate::task::sched::current_task_id();
-    let tid = crate::task::sched::spawn_user_ep(p.name, cr3, entry, rsp, p.endpoint, args, env, cwd);
+    let tid = crate::task::sched::spawn_user_ep(
+        p.name,
+        loaded.cr3,
+        loaded.entry,
+        loaded.rsp,
+        Some(loaded.fs_base),
+        p.endpoint,
+        args,
+        env,
+        cwd,
+    );
     match parent {
         // A user-space spawn inherits the caller's descriptor table, including
         // anything the caller did to it.

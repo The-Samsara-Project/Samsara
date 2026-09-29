@@ -209,12 +209,27 @@ static USER_ENTRY: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static USER_STACK: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+/// The thread pointer (`IA32_FS_BASE`) to install for that same first switch.
+///
+/// Staged alongside the entry point and stack top because it is installed by the
+/// same trampoline, at the same moment, from ring 0 -- and ring 3 has no way to
+/// install it for itself: `wrmsr` is not privileged in the sense that helps here
+/// (it is a ring-0 instruction at all) and `wrfsbase` needs a CR4 bit this kernel
+/// does not set.
+static USER_FS_BASE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
-/// Stage the ring-3 entry point and stack top for a thread about to run for
-/// the first time as a user process.
-pub(crate) fn stage_user_entry(entry: usize, stack_top: usize) {
+/// Stage the ring-3 entry point, stack top and thread pointer for a thread about
+/// to run for the first time as a user process.
+///
+/// `fs_base` is the address the loader put the thread-control block at, or 0 for
+/// an image with no thread-local storage. Zero is the right value there and not
+/// merely a placeholder: it means "no thread pointer", which is a defined state
+/// that a libc can detect, rather than a wild pointer.
+pub(crate) fn stage_user_entry(entry: usize, stack_top: usize, fs_base: usize) {
     USER_ENTRY.store(entry, core::sync::atomic::Ordering::Relaxed);
     USER_STACK.store(stack_top, core::sync::atomic::Ordering::Relaxed);
+    USER_FS_BASE.store(fs_base, core::sync::atomic::Ordering::Relaxed);
 }
 
 global_asm!(
@@ -246,15 +261,33 @@ global_asm!(
     // Load IA32_FS_BASE while still at CPL 0. A ring-3 `wrfsbase` needs
     // CR4.FSGSBASE (which this kernel does not set) and a ring-3 `wrmsr` is not
     // privileged, so a libc that wants a thread pointer has no way to install
-    // one for itself. Zeroing it here means FS starts at a defined, harmless
-    // value rather than whatever the previously-run task left behind.
+    // one for itself. The value is the thread-control block the ELF loader laid
+    // out for this image; 0 for an image with no thread-local storage, which is
+    // a defined "no thread pointer" rather than a wild one.
+    //
+    // `mov fs, rcx` above set the *selector* only. In long mode the segment base
+    // comes from the MSR, so without these instructions a user thread would
+    // inherit whatever thread pointer the previously-run task left behind --
+    // another process's.
+    //
+    // `wrmsr` takes its value in EDX:EAX, *not* in RAX, so the high half has to
+    // be moved across explicitly. Leaving EDX alone looks like it works: EDX
+    // still holds the ring-3 code selector from the load above, so the thread
+    // pointer comes out as `0x23_40710450` -- a wild address that faults on the
+    // first `%fs` access, several instructions into the program and with a
+    // number that points at nothing recognisable. The value is only correct if
+    // the low half happens to look like a plausible address, which is why this
+    // is worth spelling out rather than leaving to the obvious-looking `wrmsr`.
     "mov ecx, 0xc0000100",           // IA32_FS_BASE
-    "xor eax, eax",
+    "mov rax, [rip + {ufsbase}]",
+    "mov rdx, rax",
+    "shr rdx, 32",
     "wrmsr",
     "iretq",
     ".size user_entry_trampoline, . - user_entry_trampoline",
     uentry = sym USER_ENTRY,
     ustack = sym USER_STACK,
+    ufsbase = sym USER_FS_BASE,
     ucs = sym USER_CS_VALUE,
     uss = sym USER_SS_VALUE,
 );
@@ -279,12 +312,15 @@ global_asm!(
     "push rdx",
     "push rax",
     "mov ecx, 0xc0000100",
-    "xor eax, eax",
+    "mov rax, [rip + {ufsbase}]",
+    "mov rdx, rax",
+    "shr rdx, 32",
     "wrmsr",
     "iretq",
     ".size user_entry_trampoline_noif, . - user_entry_trampoline_noif",
     uentry = sym USER_ENTRY,
     ustack = sym USER_STACK,
+    ufsbase = sym USER_FS_BASE,
     ucs = sym USER_CS_VALUE,
     uss = sym USER_SS_VALUE,
 );
