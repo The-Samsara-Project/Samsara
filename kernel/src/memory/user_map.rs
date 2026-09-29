@@ -104,6 +104,26 @@ fn alloc_va(frames: usize) -> Option<usize> {
     Some(va)
 }
 
+/// Reserve `frames` of virtual address space for an image the loader is
+/// building, and return where it starts.
+///
+/// The loader needs this for a process's thread block, and [`map_anon`] cannot
+/// serve it: that maps into the *current* task, and while an image is being
+/// staged the current task is either the kernel or some entirely unrelated
+/// process. The address space being built belongs to nobody yet.
+///
+/// The reservation comes from the same cursor [`map_anon`] draws on, deliberately.
+/// A second, private cursor would hand out addresses that a later anonymous
+/// mapping could also be given, and the two would silently overlap -- which for a
+/// thread block means a libc whose thread-local storage is overwritten by a
+/// `mmap` nobody thought was related.
+pub fn reserve_image_va(frames: usize) -> Option<usize> {
+    if frames == 0 {
+        return None;
+    }
+    alloc_va(frames)
+}
+
 /// Flush the TLB for `frames` pages starting at `va`.
 fn flush(va: usize, frames: usize) {
     for i in 0..frames {
