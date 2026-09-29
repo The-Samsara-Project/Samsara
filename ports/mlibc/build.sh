@@ -97,12 +97,30 @@ cp -r "$PORT/sysdeps/samsara" "$MLIBC_SRC/sysdeps/samsara"
 rm -rf "$MLIBC_BUILD" "$SYSROOT"
 say "meson setup (freestanding clang, static lib)"
 
-# Stamp the build time into the libc as SAMSARA_BUILD, which the port's `uname`
+# Stamp the build into the libc as SAMSARA_BUILD, which the port's `uname`
 # reports in the version field. A bug report that pastes `uname` output then
 # identifies the build it came from, which is the whole reason that field exists.
 # ISO 8601 UTC, so it sorts and parses.
-SAMSARA_BUILD="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-say "build stamp: $SAMSARA_BUILD"
+#
+# The date is the *pinned commit's*, not the wall clock's, and that is not a
+# detail. The stamp is compiled into `libc.a`, so a clock reading makes the
+# library different on every build and the fingerprint printed at the end of this
+# script different with it -- which makes the fingerprint useless for the one
+# thing a fingerprint is for. The claim this script makes is that a fresh clone
+# builds the same bytes, and a timestamp in the artifact is exactly the kind of
+# thing that quietly makes that false.
+#
+# The commit's own date is also the more useful half of the answer to "which build
+# is this?". "When did someone run build.sh" is a property of the machine;
+# "which mlibc" is a property of the bug. The commit is what is pinned, so the
+# date follows from it and needs no separate bookkeeping.
+if ! SAMSARA_BUILD="$(git -C "$MLIBC_SRC" log -1 --format=%cI "$POINT_OF_TRUTH" 2>/dev/null)"; then
+  die "cannot read the commit date of $POINT_OF_TRUTH"
+fi
+# `%cI` is an offset-bearing ISO 8601 date ("2026-09-13T17:43:55+02:00"). Trim it
+# to the UTC `Z` form so it matches what a reader expects from a build stamp.
+SAMSARA_BUILD="$(date -u -d "$SAMSARA_BUILD" +%Y-%m-%dT%H:%M:%SZ)"
+say "build stamp: $SAMSARA_BUILD (from mlibc ${POINT_OF_TRUTH:0:12})"
 
 # The stamp has to survive two layers of shell and meson's argument splitting,
 # and a `:` in a `-D` value is read as a meson key separator, so the value is
