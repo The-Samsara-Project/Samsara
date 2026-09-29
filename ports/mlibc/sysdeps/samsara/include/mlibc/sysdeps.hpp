@@ -129,6 +129,10 @@ struct SamsaraSysdepTags :
 	// openat's resolution becoming a full path walk of its own.
 	Symlink,
 	Readlink,
+	// Interval timers, which this kernel does not have. See
+	// Sysdeps<SetItimer> in sysdeps.cpp: the tag existing is the point, not
+	// the capability, because mlibc aborts on *reaching* a missing sysdep.
+	SetItimer,
 	// Exec by path. See Sysdeps<Execve> in sysdeps.cpp: this is what makes a
 	// file in the filesystem runnable, and therefore what makes /bin a thing
 	// rather than a directory of decoration.

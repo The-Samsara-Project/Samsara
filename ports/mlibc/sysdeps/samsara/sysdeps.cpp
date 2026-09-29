@@ -146,6 +146,37 @@ int Sysdeps<Unlinkat>::operator()(int dirfd, const char *path, int flags) {
 	return 0;
 }
 
+int Sysdeps<SetItimer>::operator()(int which, const struct itimerval *new_value,
+                                   struct itimerval *old_value) {
+	// ENOSYS, deliberately, and the tag existing rather than being absent is the
+	// whole point of this function.
+	//
+	// mlibc reaches an unimplemented sysdep through `sysdep_or_enosys`, which
+	// calls `__ensure_warn` -- and this port builds mlibc with assertions on, so
+	// that warn *aborts*. A program asking for something the kernel cannot do does
+	// not get ENOSYS; it gets killed, silently, in the middle of a call it had no
+	// reason to expect would be fatal.
+	//
+	// fbterm is the caller that found it. Its cursor blink wants an interval
+	// timer, called setitimer(2), which the kernel has no equivalent of: the APIC
+	// timer drives the scheduler's tick and nothing else, and there is no
+	// per-process timer to arm. So the honest answer is that there is none.
+	//
+	// Declaring it here makes that answer reachable. Without the tag, the same
+	// answer is what mlibc would reach anyway -- and would abort on the way, which
+	// took fbterm's whole process down and left the display frozen on whatever it
+	// had last drawn. That is the failure this prevents: a missing optional
+	// feature should cost a cursor blink, not the terminal.
+	//
+	// `old_value` is left alone on the ENOSYS path, matching every other ENOSYS
+	// sysdep here: a caller that gets an error has no basis for the old value, and
+	// writing a plausible one would invite it to use it.
+	(void)which;
+	(void)new_value;
+	(void)old_value;
+	return ENOSYS;
+}
+
 int Sysdeps<Symlink>::operator()(const char *target_path, const char *link_path) {
 	// Recorded verbatim. The kernel does not resolve the target, and must not:
 	// a *relative* target is meaningless without knowing which directory the link
