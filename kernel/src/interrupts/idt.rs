@@ -305,10 +305,11 @@ fn handle_user_fault(frame: InterruptFrame, cr2: usize, error: u64) {
     }
 
     crate::log::kerror!(
-        "#PF in user task: killing pid {} (rip={:#x} cr2={:#x} err={:#x})",
+        "#PF in user task: killing pid {} (rip={:#x} cr2={:#x} fs={:#x} err={:#x})",
         task.0,
         frame.rip,
         cr2,
+        crate::task::context::read_fs_base(),
         error
     );
 
