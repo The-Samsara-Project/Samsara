@@ -18,7 +18,7 @@ index 9c994f4..8a3388b 100644
   *   This file is part of FbTerm.
   *
   *   This program is free software; you can redistribute it and/or
-@@ -18,330 +18,260 @@
+@@ -18,330 +18,293 @@
   *
   */
  
@@ -268,7 +268,13 @@ index 9c994f4..8a3388b 100644
 +	Font::Glyph *g = (Font::Glyph *)malloc(sizeof(Font::Glyph) + GLYPH_W * GLYPH_H);
 +	if (!g) return 0;
 +
-+	g->pitch = 1;
++	/* `pitch` is the stride from one row of the glyph to the next, in *bytes*,
++	 * not pixels and not rows. freetype's `bitmap.pitch` is the same quantity and
++	 * upstream assigns it straight from that, so whatever freetype's convention
++	 * is, this has to match it. The renderer walks the pixmap by it once per
++	 * row, so it is the distance between the first bytes of consecutive rows.
++	 */
++	g->pitch = GLYPH_W;
 +	g->width = GLYPH_W;
 +	g->height = GLYPH_H;
 +	/* A fixed-width bitmap font has no left side bearing and sits at a fixed
@@ -278,7 +284,34 @@ index 9c994f4..8a3388b 100644
 +	g->left = 0;
 +	g->top = CELL_TOP;
 +
-+	memcpy(g->pixmap, ascii8x8[unicode - 0x20], GLYPH_W * GLYPH_H);
++	/* Unpack the glyph, one output byte per pixel.
++	 *
++	 * This is not a copy and it is not a cosmetic change. The renderer reads
++	 * *one byte per pixel*, with three meanings: 0 is background, 0xff is
++	 * foreground, and anything between is a blend of the two at that fraction.
++	 * That is an antialiased 8-bit-per-pixel format, because that is what
++	 * freetype hands it. The font data is 1 bit per pixel -- eight pixels packed
++	 * into a byte, most significant bit leftmost.
++	 *
++	 * So handing the packed bytes over directly is a silent and total failure
++	 * rather than a partial one. Each of a row's 8 bytes is read as one *pixel*
++	 * lit at that byte's fraction of full, which turns a row of text into eight
++	 * vertical smears of grey and shifts every glyph out of shape. Nothing
++	 * reports it: the values are all in range, the cell is the right size, the
++	 * right number of pixels is written, and the terminal is visibly drawing.
++	 * The only symptom is a screen of what looks like static, which reads as a
++	 * broken font or a broken framebuffer and is neither.
++	 *
++	 * Hence the loop. A set bit becomes 0xff, a clear bit becomes 0, and nothing
++	 * in between is produced -- the font is 1-bit, so there is no coverage to
++	 * express and every pixel is either on or off.
++	 */
++	for (u32 row = 0; row < GLYPH_H; row++) {
++		u8 bits = ascii8x8[unicode - 0x20][row];
++		for (u32 col = 0; col < GLYPH_W; col++) {
++			g->pixmap[row * GLYPH_W + col] = (bits & (0x80 >> col)) ? 0xff : 0x00;
++		}
++	}
 +	return g;
  }
  
