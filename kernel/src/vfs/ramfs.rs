@@ -14,8 +14,29 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Per-file size cap (4 MiB) so a bad writer cannot exhaust the heap.
-const MAX_FILE: usize = 4 * 1024 * 1024;
+/// Per-file size cap, so one bad writer cannot exhaust the heap.
+///
+/// Sized against the largest thing this system actually stores, which is a
+/// user program image. busybox -- 106 applets, statically linked -- is about
+/// 1.1 MiB stripped, and an unstripped build of the same binary carrying a symbol
+/// table is about 9 MiB. The old 4 MiB cap sat awkwardly between the two: it
+/// fitted the shipped image with room to spare and silently truncated the
+/// unstripped one.
+///
+/// Truncation is the failure mode worth naming, because it does not look like
+/// truncation. A file written past the cap has its tail dropped and no error is
+/// reported to the writer, so the file exists, has a plausible size, and is
+/// quietly wrong. The next thing that reads it -- `execve` -- gets a truncated
+/// ELF and fails with `EBADF`, which points at the descriptor table and not at
+/// the file. Debugging that costs an afternoon, and it is exactly the sort of
+/// thing that gets mistaken for a kernel bug in the loader.
+///
+/// 16 MiB leaves room for an unstripped image and for debug builds of the
+/// terminal, at a cost of 16 MiB of the 64 MiB kernel heap in the worst case
+/// where a single file is that large. That is a deliberate trade: the heap is
+/// fixed, this is bounded, and a program image is the only thing in this system
+/// that approaches it.
+const MAX_FILE: usize = 16 * 1024 * 1024;
 
 struct RamFile {
     data: Spinlock<Vec<u8>>,
