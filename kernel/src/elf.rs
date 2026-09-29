@@ -50,6 +50,7 @@ const EM_X86_64: u16 = 62;
 // Program header types / flags.
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
+const PT_TLS: u32 = 7;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -78,12 +79,65 @@ const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
 const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
+/// Address of the thread-control block the loader built for this image, or 0 for
+/// an image with no `PT_TLS`.
+///
+/// A Samsara extension, and deliberately above Linux's own auxv range (which tops
+/// out in the low tens) so it cannot collide with a tag added upstream later.
+///
+/// It exists because of a bootstrap cycle. A libc's thread-control block is
+/// normally found by reading the thread pointer and treating it as the block's
+/// address -- but the first field *in* that block is a self-pointer, which has to
+/// already hold the block's address for the read to return anything useful. mlibc
+/// breaks the cycle inside its dynamic loader, which allocates the block and
+/// therefore knows its address. There is no dynamic loader here: the kernel
+/// replaced it, so the kernel is the one that knows, and it has to say so
+/// somewhere. The initial stack's auxv is where a loader says things like this,
+/// and the port reads it before it touches any thread-local variable.
+///
+/// The kernel does *not* also write the self-pointer itself. Filling in a field
+/// of somebody else's C++ object is the port's job, and the offset of that field
+/// is mlibc's business, not the loader's.
+const AT_TCB: u64 = 0x100;
 
 /// Upper bounds on the pointer arrays built for the initial stack. These cap
 /// how much of a pathological argv/env the loader will stage; a program that
 /// passes more is truncated rather than allowed to run the stack down.
 const MAX_ARG: usize = 64;
 const MAX_ENV: usize = 64;
+
+/// Bytes reserved for the thread-control block that the libc constructs in
+/// place, on top of the image's own thread-local storage.
+///
+/// The block is mlibc's `Tcb`, which is a C++ type in a library the kernel does
+/// not link, so the kernel cannot measure it and only reserves room. The
+/// reservation is not a guess, though: the port static-asserts at compile time
+/// that `sizeof(Tcb)` fits inside it, so an mlibc whose `Tcb` outgrew the
+/// reservation would fail to build the port rather than have the kernel
+/// scribble past the end of a thread block. 152 bytes is `sizeof(Tcb)` for this
+/// build; 256 leaves headroom without costing a page.
+const TCB_RESERVE: usize = 256;
+
+/// The alignment `Tcb` itself requires. Part of the thread block's layout for
+/// the same reason as [`TCB_RESERVE`]: the type belongs to the libc, and this is
+/// the architecture's own requirement for an eight-byte-aligned object.
+const TCB_ALIGN: usize = 8;
+
+/// One parsed `PT_TLS`: the image's thread-local storage template.
+///
+/// `file_sz` bytes of initialized data live in the image at `vaddr`; the block
+/// is `mem_sz` bytes in total, so the tail (`mem_sz - file_sz`) is zero
+/// `.tbss`. The image's copy is a *template* -- the loader relocates it into the
+/// thread block rather than running the program against it, because the
+/// thread-control block has to sit immediately above the thread-local data and
+/// the image's `.tbss` is followed by the program's own `.bss`.
+#[derive(Clone, Copy)]
+struct Tls {
+    vaddr: usize,
+    file_sz: usize,
+    mem_sz: usize,
+    align: usize,
+}
 
 /// One parsed `PT_LOAD` (or the synthetic lead-in that maps the ELF headers).
 #[derive(Clone, Copy)]
@@ -166,11 +220,13 @@ fn parse_header(img: &[u8]) -> Option<Header> {
 struct Phdrs {
     segs: Vec<Seg>,
     dynamic_file: Option<usize>,
+    tls: Option<Tls>,
 }
 
 fn parse_phdrs(img: &[u8], h: &Header) -> Option<Phdrs> {
     let mut segs = Vec::new();
     let mut dynamic_file = None;
+    let mut tls = None;
     for i in 0..h.phnum {
         let p = h.phoff + i * h.phentsize;
         let p_type = u32_at(img, p)?;
@@ -179,11 +235,26 @@ fn parse_phdrs(img: &[u8], h: &Header) -> Option<Phdrs> {
         let vaddr = u64_at(img, p + 16)?;
         let file_sz = u64_at(img, p + 32)?;
         let mem_sz = u64_at(img, p + 40)?;
+        let align = u64_at(img, p + 48)?;
         match p_type {
             PT_DYNAMIC => {
                 if file_sz != 0 {
                     dynamic_file = Some(off as usize);
                 }
+            }
+            PT_TLS => {
+                // `p_align` is a promise about `p_vaddr`, and an image is free to
+                // make it 0 or 1 to say "unaligned". Nothing downstream needs
+                // more than 8 for the block itself, and the tail is zero-filled
+                // either way, so a smaller claim is simply raised to the
+                // architecture's floor rather than rejected.
+                let a = (align as usize).max(TCB_ALIGN);
+                tls = Some(Tls {
+                    vaddr: vaddr as usize,
+                    file_sz: file_sz as usize,
+                    mem_sz: mem_sz as usize,
+                    align: a,
+                });
             }
             PT_LOAD => {
                 let (off, vaddr, file_sz, mem_sz) =
@@ -221,7 +292,11 @@ fn parse_phdrs(img: &[u8], h: &Header) -> Option<Phdrs> {
     if segs.is_empty() {
         return None;
     }
-    Some(Phdrs { segs, dynamic_file })
+    Some(Phdrs {
+        segs,
+        dynamic_file,
+        tls,
+    })
 }
 
 /// Map one loaded segment (with its `mem_sz - file_sz` zero fill) into
@@ -456,16 +531,18 @@ fn write_entry_stack(
     phdr_vaddr: usize,
     phnum: usize,
     entry: usize,
+    tcb: usize,
     args: &[String],
     env: &[String],
 ) -> usize {
-    let auxv: [(u64, u64); 6] = [
+    let auxv: [(u64, u64); 7] = [
         (AT_PHDR, phdr_vaddr as u64),
         (AT_PHENT, 56),
         (AT_PHNUM, phnum as u64),
         (AT_PAGESZ, PAGE as u64),
         (AT_BASE, 0),
         (AT_ENTRY, entry as u64),
+        (AT_TCB, tcb as u64),
     ];
     // One byte at a time downward, so strings need no alignment care.
     let mut cur = stack_end;
@@ -613,6 +690,135 @@ fn write_entry_stack(
     cur
 }
 
+/// What the loader produced for one process image.
+///
+/// A struct rather than a tuple because these four values travel together
+/// through `load` -> `user::build_image` -> the scheduler, and a tuple that
+/// grows a fourth element is exactly the kind of thing that gets destructured in
+/// the wrong order at a call site nobody re-reads.
+pub struct Loaded {
+    /// The new address space's page-table root.
+    pub cr3: usize,
+    /// `e_entry`, the first instruction to run.
+    pub entry: usize,
+    /// The initial `%rsp`: the word holding `argc`.
+    pub rsp: usize,
+    /// The address the thread pointer (`%fs`) starts at, or 0 for an image with
+    /// no `PT_TLS`.
+    pub fs_base: usize,
+}
+
+/// Round `v` up to a multiple of `a`. Not a bitmask, because `PT_TLS`'s
+/// `p_align` is only *promised* to be a power of two and a malformed image
+/// should not turn an alignment into a wild pointer.
+fn align_up(v: usize, a: usize) -> usize {
+    if a == 0 {
+        return v;
+    }
+    v.div_ceil(a) * a
+}
+
+/// Lay out a thread block for `tls` and return the address of its thread-control
+/// block, which is also the value `%fs` takes.
+///
+/// The shape is fixed by the toolchain, not chosen here. A statically linked
+/// image addresses its `__thread` variables as *local-exec*: `mov %fs:offset`,
+/// with a negative offset measured from the thread pointer, which the linker
+/// computed assuming the thread pointer sits at the top of the thread-local
+/// block. So the block must be laid out with its data at the bottom and the
+/// thread-control block immediately above, and `%fs` must point at the top --
+/// `tls_base + mem_sz == fs_base` exactly. mlibc's own dynamic loader builds
+/// the same shape in `allocateTcb`, and mlibc's `get_current_tcb` is a bare
+/// `mov %fs:0`, so there is no second opinion available at run time.
+///
+/// That is also why the image's own `.tbss` is not used in place. It is the
+/// right size, but it sits at the bottom of the image's writable segment with
+/// the program's own `.bss` directly above it, so a thread-control block placed
+/// there would overwrite the program's data. The block is therefore relocated
+/// into fresh pages, with the image's initialized `.tdata` copied in.
+///
+/// Returns 0 when the image has no `PT_TLS` at all. That is not a failure: an
+/// image with no thread-local variables has no thread pointer, and leaving `%fs`
+/// at zero says so. mlibc's `this_tid` copes with it by refusing to read a
+/// thread-control block it knows is not there.
+fn map_thread_block(
+    aspace: &mut vmm::AddressSpace,
+    tls: &Tls,
+    image_name: &str,
+) -> Result<usize, i64> {
+    // One alignment to satisfy both, so the block's data starts aligned *and* the
+    // thread-control block above it is aligned. mlibc's `allocateTcb` does the
+    // same thing and calls it `alignOverhead`.
+    let overhead = TCB_ALIGN.max(tls.align);
+    let total = tls
+        .mem_sz
+        .checked_add(TCB_RESERVE)
+        .and_then(|v| v.checked_add(overhead))
+        .ok_or(ENOMEM)?;
+    let frames = total.div_ceil(PAGE);
+
+    let va = crate::memory::user_map::reserve_image_va(frames).ok_or(ENOMEM)?;
+    for i in 0..frames {
+        let phys = match pmm::alloc_frame() {
+            Some(p) => p,
+            None => {
+                crate::log::kwarn!(
+                    "elf: no frame for {image_name}'s thread block (page {i}/{frames})"
+                );
+                return Err(ENOMEM);
+            }
+        };
+        // SAFETY: the region is reserved for this image alone and was never
+        // reachable, so zeroing the frame before it is mapped is what makes the
+        // `.tbss` tail and the thread-control block read as zero.
+        unsafe {
+            core::ptr::write_bytes(phys_to_virt(phys) as *mut u8, 0, PAGE);
+            aspace.map_page(
+                va + i * PAGE,
+                phys,
+                vmm::USER_ACCESSIBLE | vmm::WRITABLE | vmm::NO_EXECUTE,
+            );
+        }
+    }
+
+    // The invariant: thread-local data ends exactly where the thread-control
+    // block begins. Everything else in this layout follows from it.
+    let fs_base = align_up(va + tls.mem_sz, overhead);
+    let tls_base = fs_base - tls.mem_sz;
+
+    // Copy the image's initialized thread-local data into place. Read through
+    // the address space rather than the file buffer: the loader has already
+    // mapped and relocated the image, and a `PT_TLS` segment's `p_offset` is not
+    // tracked here. The copy is byte-at-a-time, which is not the shape one would
+    // choose for a hot path but is the shape that cannot be wrong about page
+    // boundaries -- and it runs once per process spawn over a block that is
+    // usually well under a kilobyte.
+    for i in 0..tls.file_sz {
+        let src = tls.vaddr + i;
+        let Some((phys, _)) = aspace.translate(src) else {
+            crate::log::kwarn!(
+                "elf: {image_name}'s PT_TLS initial data at {src:#x} is not mapped; \
+                 thread-local variables start zeroed"
+            );
+            break;
+        };
+        // SAFETY: `src` translated, and the destination is the freshly mapped,
+        // zeroed thread block this function owns.
+        unsafe {
+            let byte = (phys_to_virt(phys) as *const u8).read();
+            ((tls_base + i) as *mut u8).write(byte);
+        }
+    }
+
+    crate::log::kdebug!(
+        "elf: {image_name} thread block: tls {tls_base:#x}+{:#x} .. fs {fs_base:#x} \
+         (tcb reserved {TCB_RESERVE:#x}, tls align {:#x})",
+        tls.mem_sz,
+        tls.align
+    );
+    Ok(fs_base)
+}
+
 /// Load embedded ELF `img` into a fresh address space, ready to jump to
 /// `e_entry` with `%rsp` pointing at the staged `argc`. Returns
 /// `(cr3, entry, rsp)`.
@@ -625,7 +831,8 @@ pub fn load(
     stack_end: usize,
     args: &[String],
     env: &[String],
-) -> Result<(usize, usize, usize), i64> {
+    image_name: &str,
+) -> Result<Loaded, i64> {
     let h = parse_header(img).ok_or(ENOEXEC)?;
     let mut phdrs = parse_phdrs(img, &h).ok_or(ENOEXEC)?;
 
@@ -646,6 +853,7 @@ pub fn load(
         );
     }
     let segs = phdrs.segs;
+    let tls = phdrs.tls;
 
     // Reject overlapping page ranges between loads (each is mapped as its own
     // set of fresh frames).
@@ -683,6 +891,14 @@ pub fn load(
         return Err(ENOEXEC);
     }
     let nrel = relocate(&aspace, img, &segs, dyn_file)?;
+
+    // Thread block, before the stack: an image with thread-local variables needs
+    // `%fs` pointing at a real block from its very first instruction, and the
+    // libc's entry code reads it before it has allocated anything for itself.
+    let fs_base = match tls {
+        Some(t) => map_thread_block(&mut aspace, &t, image_name)?,
+        None => 0,
+    };
 
     // User stack: read/write, non-executable.
     let stack_pages = (stack_end - stack_base) / PAGE;
@@ -729,6 +945,7 @@ pub fn load(
         ph_vaddr,
         h.phnum,
         h.entry,
+        fs_base,
         args,
         env,
     );
@@ -741,5 +958,10 @@ pub fn load(
         h.entry,
         aspace.root()
     );
-    Ok((aspace.root(), h.entry, rsp))
+    Ok(Loaded {
+        cr3: aspace.root(),
+        entry: h.entry,
+        rsp,
+        fs_base,
+    })
 }
