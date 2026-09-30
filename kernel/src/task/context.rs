@@ -363,8 +363,13 @@ global_asm!(
     ".globl fork_return_trampoline",
     ".type fork_return_trampoline, @function",
     "fork_return_trampoline:",
-    // rsp = copy of the parent's syscall frame (rax slot already zeroed).
-    "mov rsp, [rip + {fentry}]",
+    // The base of this child's own copy of the parent's syscall frame sits in
+    // the switch-context slot below the return address that brought us here;
+    // rbx carries it because the user's own rbx is restored from the frame
+    // below, so nothing of the parent's is lost. See set_child_fork_frame().
+    "mov rbx, [rsp]",
+    "add rsp, 8",
+    "mov rsp, rbx",
     "pop rax",       // result: 0 in the child
     "pop rcx",
     "pop rdx",
@@ -386,13 +391,32 @@ global_asm!(
     "pop rsp",       // back to the user stack
     "sysretq",
     ".size fork_return_trampoline, . - fork_return_trampoline",
-    fentry = sym USER_ENTRY,
 );
 
 /// Build an initial saved-rsp for a freshly forked child thread. Above the
 /// 7-word switch context the caller copy the 160-byte parent syscall frame at
 /// `stack_end - 160`; the child's first resume returns to ring 3 through that
 /// frame with `rax = 0`.
+/// Record which copied syscall frame a forked child replays on its first
+/// resume. `fork_frame` must be `stack_end - SYSCALL_FRAME_SIZE` for the same
+/// child, and must be written before the child is first switched to.
+///
+/// # Safety
+/// `saved_rsp` must come from [`initial_fork_saved_rsp`] and the child must not
+/// yet have run.
+pub unsafe fn set_child_fork_frame(saved_rsp: SavedRsp, fork_frame: usize) {
+    // CTX_WORDS - 1 holds the trampoline address that brought us here, so the
+    // frame base goes in the slot beneath it.
+    let slot = (saved_rsp as *mut usize).add(CTX_WORDS - 2);
+    unsafe { slot.write(fork_frame) };
+}
+
+/// Build an initial saved-rsp for a freshly forked child thread. Above the
+/// switch context the caller copies this child's 160-byte copy of the parent's
+/// syscall frame at `stack_end - 160`; the child's first resume returns to ring
+/// 3 through that frame with `rax = 0`, which is what makes `fork()` observe
+/// zero in the child. See [`set_child_fork_frame`] for the slot that says which
+/// frame that is.
 pub fn initial_fork_saved_rsp(stack_end: usize) -> usize {
     let sp = stack_end - SYSCALL_FRAME_SIZE - CTX_WORDS * 8;
     unsafe {

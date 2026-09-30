@@ -1178,6 +1178,18 @@ pub fn fork_current() -> Result<TaskId, i64> {
         core::ptr::copy_nonoverlapping(src as *const u8, frame as *mut u8, context::SYSCALL_FRAME_SIZE);
         *(frame as *mut usize) = 0;
     }
+    // Point the child at the frame just copied. The context slot is written
+    // after the copy because the copy lands where the child will read from, and
+    // the two must agree.
+    //
+    // This is the whole fix for "fork stops working after a while". The child
+    // resumes by replaying this frame, and it used to find the base of that
+    // frame in a single global that the *next* fork would overwrite -- the
+    // parent does not yield here, so two forks are routinely in flight at once.
+    // The earlier child then replayed the later one's frame, took its `rax`, and
+    // so saw `fork()` return a pid instead of zero: it ran the parent's path,
+    // forking again on every iteration, and the parent sat in `waitpid` for a
+    // pid that was never coming.
     crate::log::kdebug!(
         "fork: child frame @{:#x} rip={:#x} rsp={:#x} rax={} r0..3={:x} {:x} {:x} {:x}",
         frame,
