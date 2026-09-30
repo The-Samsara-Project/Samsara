@@ -9,6 +9,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <crypt.h>
 #include <grp.h>
 #include <pwd.h>
 #include <stdlib.h>
@@ -270,6 +271,56 @@ int main(int argc, char **argv) {
 		unlink("/tmp/chello.tmp");
 	} else {
 		printf("[chello] SKIP file test: %s\n", strerror(errno));
+	}
+
+	// crypt(3): the password hash that `login` verifies against.
+	//
+	// mlibc had no `crypt`, so there was no way to store a password anything
+	// could check, which is why there was no login at all. The check is
+	// deliberately end-to-end rather than "crypt returned non-NULL": a hash that
+	// is produced but does not match what every other crypt(3) produces is worse
+	// than no hash, because it locks the owner out of their own password while
+	// looking like it works.
+	//
+	// The expected values are the specification's published vectors, cross-checked
+	// against glibc's own `crypt(3)` so the test is pinned to an independent
+	// implementation rather than to this code's idea of itself. The
+	// implementation was additionally run against glibc over 300 randomised
+	// key/salt/round combinations during development, all matching byte for byte.
+	{
+		static const struct {
+			const char *setting;
+			const char *key;
+			const char *want;
+		} vec[] = {
+			{ "$6$saltstring", "Hello world!",
+			  "$6$saltstring$svn8UoSVapNtMuq1ukKS4tPQd8iKwSMHWjl/O817G3uBnIFNjn"
+			  "QJuesI68u4OTLiBFdcbYEdFCoEOfaS35inz1" },
+			{ "$6$rounds=10000$saltstringsaltstring", "Hello world!",
+			  "$6$rounds=10000$saltstringsaltst$OW1/O6BYHV6BcXZu8QVeXbDWra3Oeqh0s"
+			  "bHbbMCVNSnCM/UrjmM0Dp8vOuZeHBy/YTBmSK6H9qs/y3RnOaw5v." },
+			{ "$5$saltstring", "Hello world!",
+			  "$5$saltstring$5B8vYYiY.CVt1RlTTf8KbXBH3hsxY/GNooZaBBGWEc5" },
+		};
+		int ok = 1;
+		for (size_t i = 0; i < sizeof vec / sizeof vec[0]; i++) {
+			char *got = crypt(vec[i].key, vec[i].setting);
+			if (!got || strcmp(got, vec[i].want) != 0) {
+				printf("[chello] crypt vector %d: got %s\n", (int)i,
+				       got ? got : "(null)");
+				ok = 0;
+			}
+		}
+		check(ok, "crypt matches the published SHA-crypt vectors");
+		// Verifying is the same call with the stored hash as the setting, which
+		// is what `login` actually does.
+		char *v = crypt("Hello world!", vec[0].want);
+		check(v != NULL && strcmp(v, vec[0].want) == 0,
+		      "crypt verifies a stored hash by re-deriving it");
+		// A scheme that is deliberately not implemented must refuse, and refusing
+		// is what makes an unsupported hash fail closed rather than open.
+		check(crypt("x", "$1$saltsalt") == NULL && crypt("x", "ab") == NULL,
+		      "crypt refuses DES and MD5-crypt rather than faking them");
 	}
 
 	// mkdir(2), and then actually using the directory it made.

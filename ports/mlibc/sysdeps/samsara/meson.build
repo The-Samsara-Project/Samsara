@@ -89,6 +89,19 @@ libc_sources += files(
 	'getopt.cpp',
 )
 
+# `crypt(3)` and `crypt_r(3)`, plus the `<crypt.h>` that declares them. mlibc
+# has no `crypt`, and it is not optional: busybox's `login` verifies a password
+# by calling `crypt(3)` and comparing the result against the hash in the passwd
+# database, so with no `crypt` there is no way to store a password anything can
+# check, and no way to log in at all.
+#
+# SHA-512-crypt (`$6$`) is produced and SHA-256-crypt (`$5$`) is verified. The
+# file also carries SHA-256 and SHA-512 themselves, whose round constants are
+# computed rather than transcribed -- see the comment at the top of crypt.cpp.
+libc_sources += files(
+	'crypt.cpp',
+)
+
 if not no_headers
 	install_headers(
 		'include/abi-bits/access.h',
@@ -159,6 +172,12 @@ if not no_headers
 	# and every program that takes `--long-options` needs to declare it.
 	install_headers(
 		'include/getopt.h',
+		follow_symlinks: true
+	)
+	# <crypt.h>, for the same reason again: `crypt` is implemented and busybox's
+	# `login` needs to declare it in order to call it.
+	install_headers(
+		'include/crypt.h',
 		follow_symlinks: true
 	)
 endif
