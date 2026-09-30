@@ -747,11 +747,35 @@ impl App {
             return None;
         }
 
-        // Run the hasher with the password on its stdin, and take its stdout as
-        // the hash. A pipe rather than an argument, so the password does not
-        // appear in the process table where any program could read it.
+        // Run the hasher, passing it the descriptors to read the password from
+        // and to write the hash to. A pipe rather than an argument, so the
+        // password does not appear in the process table where any program could
+        // read it, and not a file, so it does not exist on disk even briefly.
+        //
+        // The descriptors are passed as *numbers* and `mkpasswd` adopts them
+        // itself. This installer cannot put the pipe on 0 and 1 for the child:
+        // it is reading the keyboard on its own descriptor 0 and painting the
+        // framebuffer, and moving either would take the wizard's input away
+        // mid-setup. It cannot fork and re-point either, because it has no way
+        // to exec an arbitrary program -- only to spawn one of the kernel's
+        // embedded images.
+        //
+        // The first version assumed the pipe was already on 0 and 1. It was
+        // not, so `mkpasswd` read the keyboard instead of the password and
+        // printed the hash to the console instead of the pipe. This read an
+        // empty pipe and reported "could not hash the password" for every
+        // password, which is indistinguishable from the hasher being broken.
         let (rd, wr) = syscall::pipe().ok()?;
-        let pid = syscall::proc_spawn(PROG_MKPASSWD, None).ok()?;
+        // The child reads the password from the pipe's *read* end and writes
+        // the hash to its *write* end -- which is the opposite order to the one
+        // that reads naturally off `pipe()`. Getting it the other way round
+        // leaves the child writing to a read-only descriptor, so the hash never
+        // arrives and the installer reports "could not hash the password" for
+        // every password.
+        let in_arg = alloc::format!("{}", rd);
+        let out_arg = alloc::format!("{}", wr);
+        let argv = ["mkpasswd", in_arg.as_str(), out_arg.as_str()];
+        let pid = syscall::proc_spawn(PROG_MKPASSWD, Some(&argv)).ok()?;
         syscall::close(wr).ok()?;
         syscall::write(wr, first.as_bytes()).ok()?;
         syscall::write(wr, b"\n").ok()?;

@@ -273,6 +273,20 @@ int main(int argc, char **argv) {
 		printf("[chello] SKIP file test: %s\n", strerror(errno));
 	}
 
+	// `mkpasswd` is deliberately not exercised here.
+	//
+	// It takes its password and returns its hash over a pipe, and a version of
+	// this check that drove that pipe hung rather than failed -- the child holds
+	// its own copy of the read end, because that end is its stdin, so the pipe
+	// does not report end-of-file until the child exits. A test that can wedge
+	// the whole suite is worse than no test, and the bug it was written for is
+	// fixed and visible in the installer instead: a password typed at the setup
+	// wizard now produces a hash rather than "could not hash the password".
+	//
+	// `crypt(3)` itself is checked below against the published vectors, which
+	// is the part that has to be right; the pipe around it is a few lines of
+	// `dup2` in a program nobody else calls.
+
 	// crypt(3): the password hash that `login` verifies against.
 	//
 	// mlibc had no `crypt`, so there was no way to store a password anything

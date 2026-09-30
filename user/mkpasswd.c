@@ -16,13 +16,16 @@
  * stays in user space, in a program that can be checked against a reference
  * implementation.
  *
- * Input: the password on stdin, terminated by a newline. The newline is not
- * part of the password, which is why it is read as a line rather than as
- * "everything until end of file" -- a password may legitimately contain
- * spaces, and one that ended in a space would otherwise be silently altered.
+ * Input: the descriptors to read the password from and to write the hash to, as
+ * two arguments. See `main` for why they are passed rather than assumed to be 0
+ * and 1. The password on that descriptor is one line, terminated by a newline.
+ * The newline is not part of the password, which is why it is read as a line
+ * rather than as "everything until end of file" -- a password may legitimately
+ * contain spaces, and one that ended in a space would otherwise be silently
+ * altered.
  *
  * Output: one line, the hash, ready to be a `pw_passwd` field. Nothing else is
- * printed, so the installer can take the whole of stdout as the hash. Any
+ * printed, so the installer can take the whole of the output as the hash. Any
  * diagnostic goes to stderr.
  *
  * The salt is generated here rather than supplied, from `getrandom(3)`, and is
@@ -35,6 +38,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <crypt.h>
 #include <sys/random.h>
 
@@ -47,7 +51,7 @@
 static const char B64[] =
     "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-int main(void)
+int main(int argc, char **argv)
 {
 	char password[MAX_PASSWORD];
 	char setting[32];
@@ -56,9 +60,48 @@ int main(void)
 	size_t len = 0;
 	int c;
 
-	/* Read one line, dropping the newline. A NUL cannot appear here: stdin is
-	 * a pipe carrying exactly what the installer wrote, and the installer does
-	 * not put one in. */
+	/* The descriptors arrive as arguments and are re-pointed here rather than
+	 * being arranged by the caller.
+	 *
+	 * The obvious arrangement -- have the installer put the pipe on descriptors
+	 * 0 and 1 before spawning -- is not available to it: the installer is
+	 * reading the keyboard on its own descriptor 0 and painting the framebuffer,
+	 * and moving either would take the wizard's own input away mid-setup. It
+	 * cannot fork-and-re-point either, because it has no way to exec an
+	 * arbitrary program; it can only spawn one of the kernel's embedded images.
+	 *
+	 * So it passes the descriptor *numbers* and this program adopts them. That
+	 * also keeps the password off the command line, where every process on the
+	 * system could read it, and off the filesystem.
+	 *
+	 * This is what the first version got wrong: it assumed the pipe was already
+	 * on 0 and 1, so it read the keyboard instead of the password and printed
+	 * the hash to the console instead of the pipe. The installer then read an
+	 * empty pipe, and reported "could not hash the password" -- which is what
+	 * every password, including a perfectly good one, produced.
+	 */
+	if (argc < 3) {
+		fprintf(stderr, "usage: mkpasswd <password-fd> <output-fd>\n");
+		return 2;
+	}
+	int in_fd = atoi(argv[1]);
+	int out_fd = atoi(argv[2]);
+	if (in_fd < 0 || out_fd < 0) {
+		fprintf(stderr, "mkpasswd: bad descriptor arguments\n");
+		return 2;
+	}
+	if (in_fd != 0 && dup2(in_fd, 0) < 0) {
+		fprintf(stderr, "mkpasswd: could not adopt the password descriptor\n");
+		return 1;
+	}
+	if (out_fd != 1 && dup2(out_fd, 1) < 0) {
+		fprintf(stderr, "mkpasswd: could not adopt the output descriptor\n");
+		return 1;
+	}
+
+	/* Read one line, dropping the newline. A NUL cannot appear here: the pipe
+	 * carries exactly what the installer wrote, and the installer does not put
+	 * one in. */
 	while (len < sizeof password - 1) {
 		c = getchar();
 		if (c == EOF || c == '\n')

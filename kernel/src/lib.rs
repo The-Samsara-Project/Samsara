@@ -254,6 +254,20 @@ fn seed_userland() {
         Err(e) => log::kwarn!("userland: could not create /bin/busybox: {:?}", e),
     }
 
+    // `/bin/mkpasswd`, for the same reason and because something needs it by
+    // path before the installer has populated `/bin`: the installer spawns it
+    // from the program table, but a test of the pipe protocol cannot, and a
+    // program that only exists inside the kernel is one nobody can run twice or
+    // inspect.
+    let mkpasswd = crate::user::PROGRAMS[crate::user::PROG_MKPASSWD].image;
+    if let Ok(node) = vfs::create_as("/bin/mkpasswd", vfs::NodeKind::File, 0, 0, 0o755) {
+        if let Err(e) = node.write_at(0, mkpasswd) {
+            log::kwarn!("userland: /bin/mkpasswd write failed: {:?}", e);
+        } else {
+            log::kdebug!("userland: /bin/mkpasswd seeded, {} bytes", mkpasswd.len());
+        }
+    }
+
     // `/bin/getty` is this system's own login program rather than a busybox
     // applet, so it is seeded as a real image for the same reason busybox is.
     //
