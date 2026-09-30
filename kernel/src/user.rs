@@ -56,19 +56,28 @@ pub const PROG_FBTERM: usize = 14;
 /// One image; the applet is chosen by `argv[0]`, which is why every name under
 /// `/bin` is a symlink to it rather than a copy.
 pub const PROG_BUSYBOX: usize = 15;
+/// Index of `mkpasswd`, the helper that turns a password into a `crypt(3)` hash.
+///
+/// A separate program rather than part of the installer because the installer is
+/// Rust and the Rust programs here do not link mlibc, so it cannot call `crypt(3)`
+/// itself. Hashing stays in user space, in a program that can be checked against
+/// a reference implementation, rather than in the kernel.
+pub const PROG_MKPASSWD: usize = 16;
+/// Index of `getty`, the program that fronts a terminal and runs a login.
+pub const PROG_GETTY: usize = 17;
 
 /// A boot-time user-space program.
-struct Program {
+pub(crate) struct Program {
     name: &'static str,
     /// Endpoint pinned for boot servers (spawned dynamically for the rest).
     endpoint: Option<crate::ipc::EndpointId>,
     /// Spawn with the root identity instead of the default user.
     root: bool,
     /// Embedded static-PIE ELF image.
-    image: &'static [u8],
+    pub(crate) image: &'static [u8],
 }
 
-const PROGRAMS: [Program; 16] = [
+pub(crate) const PROGRAMS: [Program; 18] = [
     Program {
         name: "hello",
         endpoint: None,
@@ -186,6 +195,23 @@ const PROGRAMS: [Program; 16] = [
     // unconditionally, which is what makes `make` fail loudly rather than boot a
     // kernel whose userland is missing.
     Program {
+        name: "mkpasswd",
+        endpoint: None,
+        // Run as root: it is fed a password and asked for a hash, and there is
+        // no reason for it to hold the session user's identity while it does.
+        root: true,
+        image: include_bytes!("../../target/user-mkpasswd.elf"),
+    },
+    Program {
+        name: "getty",
+        endpoint: None,
+        // Root, because a getty has to be able to become any user it admits:
+        // it reads the passwd database, authenticates, and drops privileges with
+        // setuid. A getty that started unprivileged could never log anyone in.
+        root: true,
+        image: include_bytes!("../../target/user-getty.elf"),
+    },
+    Program {
         name: "busybox",
         endpoint: None,
         root: false,
@@ -212,14 +238,25 @@ pub const DEFAULT_PATH: &str = "/bin:/usr/bin";
 pub fn default_env(cwd: &str) -> Vec<String> {
     vec![
         String::from("PATH=") + DEFAULT_PATH,
-        String::from("HOME=/root"),
         String::from("PWD=") + cwd,
-        String::from("SHELL=/bin/sh"),
         String::from("TERM=xterm-256color"),
-        String::from("USER=root"),
-        String::from("LOGNAME=root"),
         String::from("LANG=C"),
         String::from("SHLVL=1"),
+        // HOME, USER, LOGNAME and SHELL are deliberately absent.
+        //
+        // They were here, and set to root's values, which is three separate
+        // problems. They are per-user facts: the kernel does not know who is
+        // logging in, so it was asserting an identity for every process it
+        // started. And `SHELL=/bin/sh` in particular was *load-bearing* in the
+        // wrong direction -- a terminal emulator consults `$SHELL` before the
+        // passwd database when it picks a login shell, so this one line is what
+        // made every session a bare shell no matter what the passwd database
+        // said, and the login prompt never appeared.
+        //
+        // Whoever knows the user sets them: the getty from the passwd entry it
+        // authenticated, and fbterm likewise. A program that starts before
+        // either of those has no user yet, and inventing one for it is how a
+        // program ends up writing to root's home directory.
     ]
 }
 
