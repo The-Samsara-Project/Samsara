@@ -212,6 +212,9 @@ struct App {
     keymap: String,
     run_tests: bool,
     launch_term: bool,
+    /// A live session: nothing is written to disk, and the terminal is handed
+    /// straight to a login prompt with a known root credential.
+    live_boot: bool,
     results: Vec<TestResult>,
     msg: Option<String>,
 }
@@ -224,15 +227,16 @@ const LAYOUT_DESC: [&str; 4] = [
     "US Dvorak",
 ];
 
-const MAIN_ITEMS: [(u8, &str); 8] = [
+const MAIN_ITEMS: [(u8, &str); 9] = [
     (b'1', "System overview"),
     (b'2', "Keyboard layout"),
     (b'3', "Hostname"),
     (b'4', "Startup services"),
     (b'5', "Storage & disks"),
     (b'6', "Diagnostics"),
-    (b'7', "About Samsara"),
-    (b'8', "Finish installation"),
+    (b'7', "Live boot (try it without installing)"),
+    (b'8', "About Samsara"),
+    (b'9', "Finish installation"),
 ];
 
 const TESTS: [(&str, u64); 7] = [
@@ -275,6 +279,7 @@ impl App {
             keymap,
             run_tests: true,
             launch_term: true,
+        live_boot: false,
             results: Vec::new(),
             msg: None,
         })
@@ -323,9 +328,10 @@ impl App {
     /// both toggles are honoured live by this wizard).
     fn save_services(&mut self) {
         let data = format!(
-            "run-tests={}\nlaunch-term={}\n",
+            "run-tests={}\nlaunch-term={}\nlive-boot={}\n",
             if self.run_tests { "yes" } else { "no" },
-            if self.launch_term { "yes" } else { "no" }
+            if self.launch_term { "yes" } else { "no" },
+            if self.live_boot { "yes" } else { "no" }
         );
         if let Err(e) = write_file(INIT_CONF, data.as_bytes()) {
             self.msg = Some(format!("services: cannot write {}: {}", INIT_CONF, e));
@@ -634,6 +640,42 @@ impl App {
         println!("[installer] user '{}' created, home {}", NAME, home);
     }
 
+    /// Write `/etc/passwd` for a live session.
+    ///
+    /// The root account gets a real hash of a *known* password, so a person at
+    /// the keyboard can get in and drive the machine. This is what every
+    /// distribution live image does, and it is the same trade each of them
+    /// makes: there is no secret to protect when the session is not written to
+    /// disk and disappears on reboot, and being unable to log in at all would
+    /// make the image useless for the thing it is for.
+    ///
+    /// It is still worth saying plainly, because the hash is readable by
+    /// anything running on the machine and the account is uid 0. Nothing outside
+    /// this session is reachable: the filesystem is ramfs and is gone at reboot.
+    /// An installed system never gets this -- `write_passwd` below is the path
+    /// an installation takes, and it locks the account instead.
+    fn write_passwd_live(&self, root_hash: &str) {
+        let group = String::from("root:x:0:\nnogroup:x:65534:\n");
+        let _ = write_file("/etc/group", group.as_bytes());
+        // Root's login shell is `/bin/sh`, NOT `/bin/getty`.
+        //
+        // The login shell of the account you log in as is what the getty execs
+        // once it has authenticated you. Pointing root at the getty made the
+        // getty exec itself: an endless loop of login prompts, forever, with no
+        // shell and no error. Only the *session* account is given the getty,
+        // because that is the account fbterm runs as and it is the one whose
+        // shell decides what a terminal comes up with.
+        let entries = format!(
+            "root:{hash}:0:0:root:/root:/bin/sh\n\
+             nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n\
+             samsara:!:1000:1000:Samsara user:/home/samsara:/bin/getty\n",
+            hash = root_hash
+        );
+        if let Err(e) = write_file("/etc/passwd", entries.as_bytes()) {
+            println!("[installer] could not write /etc/passwd for the live session: {}", e);
+        }
+    }
+
     /// Write `/etc/passwd`.
     ///
     /// `hash` is the session user's `crypt(3)` hash, or `None` to write the
@@ -653,7 +695,10 @@ impl App {
             None => String::from("!"),
         };
         let entries = format!(
-            "root:x:0:0:root:/root:/bin/getty\n\
+            // `/bin/sh`, not the getty: this is the shell the getty execs after
+            // authenticating root, and naming the getty here would make it exec
+            // itself forever.
+            "root:x:0:0:root:/root:/bin/sh\n\
              nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n\
              {name}:{field}:{uid}:{gid}:Samsara user:{home}:/bin/getty\n",
             name = NAME, field = field, uid = UID, gid = GID, home = home
@@ -728,6 +773,36 @@ impl App {
         }
     }
 
+    /// Hash a password the installer already knows, without asking for it.
+    ///
+    /// Used for the live session's root credential. It goes through `mkpasswd`
+    /// like any other password, so the stored value is a real `crypt(3)` hash
+    /// and the getty's comparison is a real comparison -- rather than a constant
+    /// pasted into the passwd database, which would look like a working login
+    /// and be a special case in the one program that must not have any.
+    fn hash_known(&mut self, password: &str) -> Option<String> {
+        let (rd, wr) = syscall::pipe().ok()?;
+        let in_arg = alloc::format!("{}", rd);
+        let out_arg = alloc::format!("{}", wr);
+        let argv = ["mkpasswd", in_arg.as_str(), out_arg.as_str()];
+        let pid = syscall::proc_spawn(PROG_MKPASSWD, Some(&argv)).ok()?;
+        if syscall::write(wr, password.as_bytes()).is_err() {
+            syscall::close(wr).ok()?;
+            let _ = syscall::waitpid(pid, &mut 0);
+            return None;
+        }
+        let _ = syscall::write(wr, b"\n");
+        syscall::close(wr).ok()?;
+        let hash = read_hash(rd);
+        syscall::close(rd).ok()?;
+        let _ = syscall::waitpid(pid, &mut 0);
+        if hash.len() > 3 && hash.starts_with("$6$") {
+            Some(hash)
+        } else {
+            None
+        }
+    }
+
     /// Ask for a password and turn it into a `crypt(3)` hash with `mkpasswd`.
     ///
     /// Returns `None` if no password was entered, which leaves the account
@@ -791,17 +866,7 @@ impl App {
         // Closed now, so the child sees end-of-file once it has the password.
         syscall::close(wr).ok()?;
 
-        let mut hash = String::new();
-        let mut buf = [0u8; 256];
-        loop {
-            let n = syscall::read(rd, &mut buf).unwrap_or(0);
-            if n <= 0 {
-                break;
-            }
-            if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-                hash.push_str(s);
-            }
-        }
+        let hash = read_hash(rd);
         syscall::close(rd).ok()?;
         let _ = syscall::waitpid(pid, &mut 0);
 
@@ -983,7 +1048,21 @@ impl App {
         // Before the framebuffer changes hands. Once fbterm is running it owns the
         // display and anything written to the console afterwards is invisible, so
         // a step that reports itself has to report itself first.
-        self.install_userland();
+        //
+        // A live session skips the userland install. Populating `/bin` from
+        // `busybox --list` is the act of *installing*: it is what writes a
+        // userland onto the machine. A live boot installs nothing, and running
+        // it here spent the whole boot on a step whose result the session throws
+        // away -- and when the applet list came back empty the install reported
+        // failure and the terminal was never started, so a live boot ended in a
+        // black screen.
+        //
+        // The kernel has already seeded `/bin/busybox` itself, so the commands
+        // are present. What is skipped is the symlink farm, which is the part
+        // that makes a machine installed rather than merely running.
+        if !self.live_boot {
+            self.install_userland();
+        }
         // 1. The child reads keys from the pty, so give it the pty on stdin.
         let pts = self.pts;
         if syscall::dup2(pts as u64, 0).is_err() {
@@ -995,7 +1074,34 @@ impl App {
             println!("[installer] could not release the framebuffer");
         }
 
-        // 3. Start the terminal.
+        // 3. A live session hands over to a login prompt with a known root
+        // credential, and says so on the console *and* on the screen, because a
+        // person who cannot tell what to type is sitting in front of a login
+        // prompt that will not answer to anything they guess.
+        if self.live_boot {
+            // Nothing is written to disk, so there is no installed-system state
+            // to protect and a known password is the whole point. The hash is
+            // produced the same way as any other password, through `mkpasswd`,
+            // rather than by pasting a constant in -- so what lands in the passwd
+            // database is a real `crypt(3)` hash of the word below, and the
+            // getty's comparison is a real comparison.
+            match self.hash_known("root") {
+                Some(hash) => {
+                    self.write_passwd_live(&hash);
+                    println!("[installer] live session: log in as 'root', password 'root'");
+                }
+                None => {
+                    // Without a working hash there is no account anyone can get
+                    // into, which would leave a live image that boots to a login
+                    // prompt and goes no further. Say so rather than leaving it
+                    // to be discovered.
+                    println!("[installer] live session: could not set a root password");
+                    println!("[installer] the login prompt will not accept any credential");
+                }
+            }
+        }
+
+        // 4. Start the terminal.
         if self.launch_term {
             println!("[installer] handing the display to fbterm");
             let _ = syscall::proc_spawn(PROG_FBTERM, None);
@@ -1006,6 +1112,34 @@ impl App {
         );
         syscall::proc_exit_code(0);
     }
+}
+
+/// Read a line of output from a child, bounded.
+///
+/// Reading to end-of-file does not work here. The child keeps both ends of the
+/// pipe open -- the write end is its stdout, the read end its stdin -- so the
+/// pipe does not report end-of-file until it exits, and a read that waits for
+/// that waits for the very thing whose output it is waiting for. `mkpasswd`
+/// writes one line and then exits, so the line is simply read as it arrives and
+/// then the child is reaped separately.
+fn read_hash(fd: usize) -> String {
+    let mut out = String::new();
+    let mut buf = [0u8; 256];
+    // Bounded so a child that produced nothing cannot wedge the wizard: the
+    // password screen would stop responding and look like a hung machine.
+    for _ in 0..64 {
+        let n = syscall::read(fd, &mut buf).unwrap_or(0);
+        if n <= 0 {
+            break;
+        }
+        if let Ok(s) = core::str::from_utf8(&buf[..n]) {
+            out.push_str(s);
+            if out.contains('\n') {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Create a directory and hand it to `uid`:`gid`.
@@ -1192,10 +1326,23 @@ fn screen_main(app: &mut App) -> Nav {
         let r1 = rows / 2 + 11;
         app.fb.menu(c0, r0, c1, r1, "What would you like to do?", &items, sel, "Esc/q = skip to finish");
         match app.wait_key() {
-            Key::Up => sel = (sel + 7) % 8,
-            Key::Down => sel = (sel + 1) % 8,
-            Key::Char(c) if (b'1'..=b'8').contains(&c) => {
+            Key::Up => sel = (sel + 8) % 9,
+            Key::Down => sel = (sel + 1) % 9,
+            Key::Char(c) if (b'1'..=b'9').contains(&c) => {
                 sel = (c - b'1') as usize;
+                // Live boot is chosen from the main menu rather than buried in
+                // the startup services screen, because it is a decision about
+                // the whole machine rather than a setting: nothing is installed,
+                // the filesystem is not written, and the session is gone at
+                // reboot. It belongs next to "Finish installation", which is the
+                // other way of ending setup.
+                if sel == 6 {
+                    app.live_boot = true;
+                    // A live session exists to be used. The self-test pass is
+                    // minutes of delay before the thing you asked for.
+                    app.run_tests = false;
+                    return Nav::Next(Screen::Finish);
+                }
                 return Nav::Next(match sel {
                     0 => Screen::Overview,
                     1 => Screen::Layout,
@@ -1203,7 +1350,7 @@ fn screen_main(app: &mut App) -> Nav {
                     3 => Screen::Services,
                     4 => Screen::Storage,
                     5 => Screen::DiagMenu,
-                    6 => Screen::About,
+                    7 => Screen::About,
                     // Finishing goes through the password screen first. The
                     // account has to have a password before a terminal can ask
                     // anyone to log in, and this is the last point at which that
@@ -1212,6 +1359,19 @@ fn screen_main(app: &mut App) -> Nav {
                 });
             }
             Key::Enter => {
+                // Live boot is chosen from the main menu rather than buried in
+                // the startup services screen, because it is a decision about
+                // the whole machine rather than a setting: nothing is installed,
+                // the filesystem is not written, and the session is gone at
+                // reboot. It belongs next to "Finish installation", which is the
+                // other way of ending setup.
+                if sel == 6 {
+                    app.live_boot = true;
+                    // A live session exists to be used. The self-test pass is
+                    // minutes of delay before the thing you asked for.
+                    app.run_tests = false;
+                    return Nav::Next(Screen::Finish);
+                }
                 return Nav::Next(match sel {
                     0 => Screen::Overview,
                     1 => Screen::Layout,
@@ -1219,7 +1379,7 @@ fn screen_main(app: &mut App) -> Nav {
                     3 => Screen::Services,
                     4 => Screen::Storage,
                     5 => Screen::DiagMenu,
-                    6 => Screen::About,
+                    7 => Screen::About,
                     // Finishing goes through the password screen first. The
                     // account has to have a password before a terminal can ask
                     // anyone to log in, and this is the last point at which that
@@ -1398,21 +1558,34 @@ fn screen_services(app: &mut App) -> Nav {
                 String::from("hand the display to fbterm"),
                 String::from(if app.launch_term { "[x]" } else { "[ ]" }),
             ),
+            (
+                0,
+                String::from("live boot (root / root)"),
+                String::from(if app.live_boot { "[x]" } else { "[ ]" }),
+            ),
         ];
         let items = menu_refs(&owned);
         let c0 = cols / 2 - 24;
         let c1 = cols / 2 + 24;
-        let r0 = rows / 2 - 3;
-        let r1 = rows / 2 + 5;
+        let r0 = rows / 2 - 4;
+        let r1 = rows / 2 + 6;
         app.fb.menu(c0, r0, c1, r1, "What happens on Finish?", &items, sel, "settings land in /etc/init.conf");
         match app.wait_key() {
-            Key::Up => sel = (sel + 1) % 2,
-            Key::Down => sel = (sel + 1) % 2,
+            Key::Up => sel = (sel + 1) % 3,
+            Key::Down => sel = (sel + 1) % 3,
             Key::Enter | Key::Char(b' ') => {
                 if sel == 0 {
                     app.run_tests = !app.run_tests;
-                } else {
+                } else if sel == 1 {
                     app.launch_term = !app.launch_term;
+                } else {
+                    app.live_boot = !app.live_boot;
+                    // A live session has one job: reach a login prompt. Nothing
+                    // else is worth asking for, so the two settings that only
+                    // get in the way of that are turned off with it.
+                    if app.live_boot {
+                        app.run_tests = false;
+                    }
                 }
                 dirty = true;
             }
