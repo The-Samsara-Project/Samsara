@@ -9,6 +9,8 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <grp.h>
+#include <pwd.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -174,6 +176,28 @@ int main(int argc, char **argv) {
 	} else {
 		check(0, "uname");
 	}
+
+	// The passwd database has to describe the id this process actually runs as.
+	//
+	// These two used to disagree: the database listed uid 0 while every process
+	// ran as uid 1000. The result was `whoami` printing "unknown uid 1000" and
+	// a shell that could not find a login shell for itself -- neither of which
+	// points at a passwd file, which is why they read as two unrelated bugs.
+	//
+	// Checking it here means the disagreement is caught by a test rather than by
+	// someone typing `whoami`.
+	struct passwd *pw = getpwuid(getuid());
+	if (pw && pw->pw_name) {
+		printf("[chello] uid %u is %s\n", (unsigned)getuid(), pw->pw_name);
+		check(pw->pw_name[0] != '\0', "the passwd database names this uid");
+	} else {
+		check(0, "the passwd database names this uid");
+	}
+	// `id` and `groups` read the group database the same way, and a group entry
+	// that is missing produces the same class of failure.
+	struct group *gr = getgrgid(getgid());
+	check(gr != NULL && gr->gr_name != NULL && gr->gr_name[0] != '\0',
+	      "the group database names this gid");
 
 	// The wall clock. This is the check that matters for anything user-facing:
 	// CLOCK_REALTIME used to be "milliseconds since boot", so every program

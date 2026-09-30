@@ -254,20 +254,33 @@ fn seed_userland() {
 /// to report -- mlibc's `getpwnam` returning "not found" is not a thing a program
 /// checks for, so the failure is a panic rather than a message.
 ///
+/// The entries have to describe the ids processes actually run as, which is the
+/// point of this change: they used to describe uid 0 while every process ran as
+/// [`crate::cred::DEFAULT_UID`] (1000). Nothing looked up uid 0, so `whoami`
+/// reported "unknown uid 1000", and fbterm's shell, which asks the passwd
+/// database for the login shell, silently fell through to its `/bin/sh`
+/// fallback. Both were symptoms of one wrong file, not two separate bugs.
+///
 /// The entries answer "who is calling", which is the only question anything here
-/// asks. There is no password field worth having: one user, always uid 0, and a
-/// hash would be a credential for a system that has no way to log in. `nobody` is
-/// present because a program that drops privileges looks itself up afterwards and
+/// asks. There is no password field worth having, and a hash would be a
+/// credential for a system that has no way to log in. `nobody` is present
+/// because a program that drops privileges looks itself up afterwards and
 /// deserves a name to find.
 fn seed_passwd() {
+    let user = crate::cred::DEFAULT_UID;
+    let group = crate::cred::DEFAULT_GID;
+    let passwd = alloc::format!(
+        "root:x:0:0:root:/root:/bin/sh\n\
+         nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n\
+         samsara:x:{}:{}:Samsara user:/root:/bin/sh\n",
+        user, group
+    );
     if let Ok(pw) = vfs::create("/etc/passwd", vfs::NodeKind::File) {
-        let _ = pw.write_at(
-            0,
-            b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/bin/false\n",
-        );
+        let _ = pw.write_at(0, passwd.as_bytes());
     }
+    let groups = alloc::format!("root:x:0:\nnogroup:x:65534:\nsamsara:x:{}:\n", group);
     if let Ok(gr) = vfs::create("/etc/group", vfs::NodeKind::File) {
-        let _ = gr.write_at(0, b"root:x:0:\nnogroup:x:65534:\n");
+        let _ = gr.write_at(0, groups.as_bytes());
     }
 }
 
