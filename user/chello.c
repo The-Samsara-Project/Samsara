@@ -1271,6 +1271,7 @@ int main(int argc, char **argv) {
 
 
 
+
 	// fork(2) under repeated use. The first fork succeeding proves very little:
 	// the failure this catches only appears once a process has been created and
 	// reaped enough times for the scheduler's bookkeeping to drift, so a
@@ -1350,6 +1351,119 @@ int main(int argc, char **argv) {
 	if (failures) {
 		printf("[chello] %d CHECK(S) FAILED\n", failures);
 		return 1;
+	}
+
+	// More output than the pty's buffer holds, with the reader in a *different*
+	// process. This is the shape of the thing that actually broke: any real
+	// command emits more than the buffer in one go, and a terminal emulator does
+	// not read as fast as the shell produces.
+	//
+	// The writer has to be a child. A single process cannot write more than
+	// the buffer holds and then read it back -- it would be stuck waiting for
+	// itself, and so would any real system, which is not a bug: a full pty
+	// buffer means the writer waits, and the wait ends when someone else reads.
+	// A real terminal and a real command are two processes, so this is two
+	// processes too.
+	//
+	// The child writes 32 KiB in one call and exits. It used to succeed having
+	// written only the first buffer's worth, because a short write to a terminal
+	// is not an error anything checks: the command exits 0, and the screen shows
+	// a truncated listing with nothing to indicate anything was missing.
+	{
+		int mx = open("/dev/ptmx", O_RDWR, 0);
+		int sl = -1;
+		if (mx >= 0) {
+			int n = 0;
+			char ptn[16];
+			if (ioctl(mx, TIOCGPTN, &n) == 0) {
+				snprintf(ptn, sizeof ptn, "/dev/pts/%d", n);
+				sl = open(ptn, O_RDWR, 0);
+			}
+		}
+		int big_ok = 0;
+		if (mx >= 0 && sl >= 0) {
+			const size_t HUGE = 32 * 1024;
+			pid_t pid = fork();
+			if (pid < 0) {
+				big_ok = 0;
+			} else if (pid == 0) {
+				/* Child: write it all in one call, then leave. */
+				char *src = malloc(HUGE);
+				int code = 1;
+				if (src) {
+					for (size_t i = 0; i < HUGE; i++)
+						src[i] = (char)('a' + (i % 26));
+					code = (write(sl, src, HUGE) == (ssize_t)HUGE) ? 0 : 1;
+					free(src);
+				}
+				_exit(code);
+			} else {
+				/* Parent: drain, and check every byte arrived in order. */
+				char *dst = malloc(HUGE);
+				int ok = dst != NULL;
+				size_t got = 0;
+				int reaped = 0, child_status = 0;
+				/* A read of the master that finds nothing returns 0 rather
+				 * than waiting -- a terminal emulator polls first and only
+				 * reads what is there, and this check does the same. An
+				 * empty read is not a failure; only a read that returns
+				 * bytes out of order, or never returns at all, is. */
+				int stalls = 0;
+				while (ok && got < HUGE) {
+					ssize_t r = read(mx, dst + got, HUGE - got);
+					if (r < 0) {
+						ok = 0;
+						break;
+					}
+					got += (size_t)r;
+					if (r > 0) {
+						stalls = 0;
+						continue;
+					}
+					/* Nothing queued. Wait for more rather than spinning
+					 * on an empty buffer: `poll` is what a real terminal
+					 * emulator does here, and it is what lets the child's
+					 * full-buffer write and this read alternate instead of
+					 * deadlocking against each other. */
+					struct pollfd pfd = { mx, POLLIN, 0 };
+					if (poll(&pfd, 1, 100) < 0) {
+						ok = 0;
+						break;
+					}
+					/* A child that has exited can never supply the rest,
+					 * and the exit is what tells us so. Bounding the
+					 * stalls means a driver that loses the tail reports
+					 * a failure instead of hanging the check forever. */
+					if (++stalls > 50) {
+						int st = 0;
+						if (waitpid(pid, &st, WNOHANG) == pid) {
+							reaped = 1;
+							child_status = st;
+						}
+						break;
+					}
+				}
+				if (ok) {
+					for (size_t i = 0; i < HUGE && ok; i++)
+						ok = dst[i] == (char)('a' + (i % 26));
+				}
+				free(dst);
+				/* The child must have completed the whole write, not just the
+				 * part that fitted. It reports the count it managed to
+				 * write, and it has to be the whole thing. */
+				int st = child_status;
+				if (!reaped && waitpid(pid, &st, 0) != pid)
+					ok = 0;
+				else
+					ok = ok && (WIFEXITED(st) && WEXITSTATUS(st) == 0);
+				big_ok = ok;
+			}
+		}
+		if (mx >= 0)
+			close(mx);
+		if (sl >= 0)
+			close(sl);
+		check(big_ok, "pty carries 32 KiB from a writer that outruns the reader");
 	}
 	printf("[chello] ALL PASS\n");
 	return 0;

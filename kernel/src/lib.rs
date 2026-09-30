@@ -488,6 +488,27 @@ pub extern "Rust" fn tty_wake(task: u32) {
     }
 }
 
+/// TTY bridge: park the current task until it is woken, or until `deadline`/// ticks have passed (zero meaning no deadline).
+///
+/// This is how a pty writer waits for room. The task that will make the room
+/// is the terminal reading, so the writer has to sleep rather than spin: a spin
+/// would consume the CPU the reader needs and turn a terminal that is merely
+/// behind into one that has stopped.
+#[no_mangle]
+pub extern "Rust" fn tty_park(deadline: u64) {
+    crate::task::sched::block_until(if deadline == 0 { None } else { Some(deadline) });
+}
+
+/// TTY bridge: the kernel's tick counter.
+///
+/// Drivers cannot see the kernel's clock, and a park deadline is meaningless
+/// without one, so the counter the scheduler measures deadlines against is read
+/// through here.
+#[no_mangle]
+pub extern "Rust" fn tty_ticks() -> u64 {
+    crate::time::ticks()
+}
+
 /// Free DMA pages previously allocated with [`alloc_dma_pages`].
 #[no_mangle]
 pub extern "Rust" fn free_dma_pages(phys: u64, pages: usize) {

@@ -55,6 +55,30 @@ extern "Rust" {
     fn tty_wake(task: u32);
 }
 
+/// Kernel bridge: park the current task until something wakes it, or until
+/// `deadline` in ticks (zero meaning no deadline).
+///
+/// This is the writer's counterpart to the parking a `read` already does. It
+/// exists because waiting for room in a pty buffer is not a spin and not a
+/// yield: the task that will make room is a different one, and the only way to
+/// find out that it has is to be woken by it.
+///
+/// # Safety
+/// Must be called from a schedulable user task, which is every path that
+/// reaches the pty write methods.
+extern "Rust" {
+    fn tty_park(deadline: u64);
+}
+
+/// Kernel bridge: the kernel's tick counter, the clock every park deadline is
+/// measured against.
+///
+/// # Safety
+/// Safe to call from any context; it only reads a counter.
+extern "Rust" {
+    fn tty_ticks() -> u64;
+}
+
 /// Kernel bridge: may the calling task hand its terminal's foreground role to
 /// process group `pgid`? Enforces the POSIX rule that the caller and the target
 /// group must both belong to the *terminal's* session -- which is why `tty_sid`
@@ -162,6 +186,10 @@ pub struct PtyMaster {
     /// Tasks parked waiting for the master to become readable (the slave side
     /// produced output). Registered by `poll_park` on the master device.
     read_waiters: Waiters,
+    /// Tasks parked because the master's buffer is full and they are waiting
+    /// for the terminal to read it. Woken by `PtyMaster::read`, which is the
+    /// only thing that makes room.
+    write_waiters: Waiters,
 }
 
 /// PTY slave device - behaves like a real terminal
@@ -293,6 +321,7 @@ impl PtyManager {
             packet_mode: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             read_waiters: Waiters::new(),
+            write_waiters: Waiters::new(),
         });
         
         *slave.master.lock() = Some(master.clone());
@@ -423,6 +452,14 @@ impl PtyMaster {
                 break;
             }
         }
+        drop(input);
+        // Whatever was just taken is room a blocked writer can use. Waking them
+        // here -- rather than on the write side, which cannot know when the
+        // terminal has caught up -- is what lets a command emitting more than
+        // the buffer holds finish instead of losing its tail.
+        if n > 0 {
+            self.write_waiters.wake_all();
+        }
         n
     }
     
@@ -456,11 +493,36 @@ impl PtyMaster {
         }
 
         if !echo.is_empty() {
-            let mut master_input = self.input_buffer.lock();
-            for &b in &echo {
-                if master_input.len() < BUFFER_SIZE {
-                    master_input.push_back(b);
-                } else {
+            // Same rule as the slave's output path, for the same reason: a full
+            // buffer must make the writer wait, not make it throw the bytes
+            // away. This one matters for fast typing and for pastes, where the
+            // echo of what was sent can outrun the terminal drawing it.
+            const ECHO_TIMEOUT_TICKS: u64 = 200;
+            let deadline = unsafe { tty_ticks() } + ECHO_TIMEOUT_TICKS;
+            let mut n = 0;
+            while n < echo.len() {
+                {
+                    let mut master_input = self.input_buffer.lock();
+                    while n < echo.len() && master_input.len() < BUFFER_SIZE {
+                        master_input.push_back(echo[n]);
+                        n += 1;
+                    }
+                }
+                if n == echo.len() || self.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                // SAFETY: reached only from a user task writing to the pty.
+                let me = unsafe { tty_current_task() };
+                self.write_waiters.register(me);
+                if self.input_buffer.lock().len() < BUFFER_SIZE {
+                    // Drained between the push attempt and here.
+                    self.write_waiters.unregister(me);
+                    continue;
+                }
+                // SAFETY: as above -- a user task, and `me` is this task.
+                unsafe { tty_park(deadline) };
+                self.write_waiters.unregister(me);
+                if unsafe { tty_ticks() } >= deadline {
                     break;
                 }
             }
@@ -543,17 +605,63 @@ impl PtySlave {
         
         let master_opt = self.master.lock();
         if let Some(master) = master_opt.as_ref() {
-            let mut master_input = master.input_buffer.lock();
+            // Every byte goes in, waiting for the terminal to read when the
+            // buffer fills.
+            //
+            // This used to stop at whatever fitted and report a short count,
+            // which silently ate output. A short write to a terminal is not an
+            // error anything checks, so a command emitting more than the buffer
+            // holds -- any real listing -- kept the first 4 KiB and exited
+            // cleanly, and the screen showed a truncated command with nothing
+            // to indicate anything was missing.
+            //
+            // Waiting is what a pty is for, and it has to be a park rather than
+            // a spin. The reader is a different task, so a spin would burn the
+            // CPU that task needs and turn a slow terminal into a hung one: two
+            // million yields is minutes of nothing. The writer registers with
+            // the master, re-checks that there is still no room (so a reader
+            // that drained in between is not waited for), and then sleeps until
+            // `PtyMaster::read` wakes it.
+            //
+            // The deadline is the escape hatch. A terminal nobody is reading
+            // must not hang a writer forever, and a process stuck in `write`
+            // looks worse than one that lost some output, because nothing about
+            // it is recoverable.
+            const WRITE_TIMEOUT_TICKS: u64 = 200;
+            let deadline = unsafe { tty_ticks() } + WRITE_TIMEOUT_TICKS;
             let mut n = 0;
-            for &byte in &out {
-                if master_input.len() < BUFFER_SIZE {
-                    master_input.push_back(byte);
-                    n += 1;
-                } else {
+            while n < out.len() {
+                {
+                    let mut master_input = master.input_buffer.lock();
+                    while n < out.len() && master_input.len() < BUFFER_SIZE {
+                        master_input.push_back(out[n]);
+                        n += 1;
+                    }
+                }
+                if n == out.len() {
+                    break;
+                }
+                if self.closed.load(Ordering::Acquire) || master.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                // SAFETY: reached only from a user task writing to the pty.
+                let me = unsafe { tty_current_task() };
+                master.write_waiters.register(me);
+                {
+                    let master_input = master.input_buffer.lock();
+                    if master_input.len() < BUFFER_SIZE {
+                        // Drained between the push attempt and here.
+                        master.write_waiters.unregister(me);
+                        continue;
+                    }
+                }
+                // SAFETY: as above -- a user task, and `me` is this task.
+                unsafe { tty_park(deadline) };
+                master.write_waiters.unregister(me);
+                if unsafe { tty_ticks() } >= deadline {
                     break;
                 }
             }
-            drop(master_input);
             // A terminal emulator blocked reading the master (waiting to draw
             // what we just wrote) can run now.
             master.read_waiters.wake_all();
@@ -832,7 +940,8 @@ impl CharDevice for PtyMasterDevice {
     fn read(&self, buf: &mut [u8]) -> usize {
         self.master.read(buf)
     }
-    
+
+
     fn write(&self, buf: &[u8]) -> usize {
         self.master.write(buf)
     }

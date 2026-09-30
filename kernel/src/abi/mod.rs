@@ -1262,6 +1262,12 @@ fn sys_write(fd: u64, buf: u64, len: u64, _a3: u64, _a4: u64, _a5: u64) -> i64 {
         Some(m) => m,
         None => return crate::abi::errno::EINVAL,
     };
+    // Nothing here loops on a short count, and for a terminal that is correct:
+    // the pty driver completes the write itself, parking the writer when its
+    // buffer is full until the terminal reads. It used to report a short count
+    // instead, and since nobody checks a terminal write's count for anything
+    // but an error, a command emitting more than the buffer held -- any real
+    // listing -- silently lost its tail and exited 0.
     loop {
         match crate::vfs::fdtab::write(task, fd as usize, mem) {
             Ok(n) => return n as i64,
