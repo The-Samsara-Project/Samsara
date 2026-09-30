@@ -116,6 +116,44 @@ int main(int argc, char **argv) {
 		check(0, "opendir(\"/\")");
 	}
 
+	// What ls(1) actually emits, byte for byte. `ls` lays a directory out in
+	// columns whose width comes from the terminal size, and the padding between
+	// columns is a printf("%*s", n, "") with n derived by subtraction -- so a
+	// directory listing is the shortest thing in the system that exercises a
+	// printf width, and the shell test cannot tell a broken ls from a broken
+	// terminal.
+	// The same, over a directory whose entries are symlinks. `/` holds only
+	// real directories, so a test on it never exercises the case that matters:
+	// `ls /bin` prints the directory's own name and then nothing, because every
+	// entry there is a symlink and the stat that follows each readdir is what
+	// decides whether the name is listed. A directory full of symlinks is the
+	// normal shape of a populated /bin, so it is worth reading on its own.
+	DIR *bd = opendir("/bin");
+	if (bd) {
+		int n = 0, links = 0, statable = 0;
+		struct dirent *e;
+		while ((e = readdir(bd))) {
+			if (e->d_name[0] == '.')
+				continue;
+			n++;
+			struct stat st;
+			char full[256];
+			snprintf(full, sizeof full, "/bin/%s", e->d_name);
+			struct stat lst;
+			if (lstat(full, &lst) == 0) {
+				links++;
+				if (stat(full, &st) == 0)
+					statable++;
+			}
+		}
+		closedir(bd);
+		check(n > 0, "readdir lists /bin");
+		check(links == n, "lstat follows every /bin entry");
+		check(links == 0 || statable == links, "stat resolves every /bin entry");
+	} else {
+		check(0, "opendir(\"/bin\")");
+	}
+
 	// getcwd(3) round-trip: the kernel's two-call GETCWD protocol.
 	char cwd[256];
 	check(getcwd(cwd, sizeof(cwd)) != NULL, "getcwd");
@@ -1307,6 +1345,7 @@ int main(int argc, char **argv) {
 	if (vf > 0)
 		waitpid(vf, NULL, 0);
 	printf("%-34s %s\n", "vfork", vf > 0 ? "ok" : (vf < 0 ? "unsupported" : "FAIL"));
+
 
 	if (failures) {
 		printf("[chello] %d CHECK(S) FAILED\n", failures);
