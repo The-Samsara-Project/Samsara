@@ -271,10 +271,13 @@ pub fn requeue(msg: Message) {
 /// Deliver a hardware-IRQ message to a bound endpoint from interrupt context.
 ///
 /// Uses advisory (`try_`) locks because the IRQ may have interrupted a
-/// critical section. If a wake cannot be issued the waiter is put back on
-/// the endpoint's wait queue so a later delivery (or the driver's own poll
-/// fallback) can still wake it — otherwise the receiver would block forever
-/// with the message stranded in the inbox.
+/// critical section.
+///
+/// A lost wakeup is retried here rather than left to the next interrupt. That
+/// matters because the endpoint this is used for is the PS/2 keyboard, whose
+/// only interrupt *is* a keystroke: a wake deferred to "the next IRQ" parks
+/// the input thread until the user presses another key, which reads as a frozen
+/// terminal. See the retry in the body.
 pub fn deliver_irq(ep: EndpointId, irq: u8) {
     let to_wake = {
         let mut g = match ENDPOINTS.try_lock() {
@@ -303,13 +306,30 @@ pub fn deliver_irq(ep: EndpointId, irq: u8) {
         if crate::task::sched::try_wake(t) {
             return;
         }
-        // The message is queued but the receiver was not re-scheduled (the
-        // scheduler lock was contended, or the task is not yet Blocked).
-        // Restore it to the wait queue so delivery retries on the next IRQ;
-        // recv_wait re-checks the inbox before parking, so no duplicate
-        // consumption can occur.
+        // The message is queued but the receiver was not re-scheduled: the
+        // scheduler lock was contended, or the task is not yet Blocked.
+        //
+        // Retrying the wake *first* is the whole fix. The old code restored the
+        // waiter to the queue and relied on the next IRQ to pick it up, which
+        // works for a repeating interrupt and for nothing else. This endpoint is
+        // the PS/2 keyboard, and its only IRQ *is* a keystroke -- so a lost wake
+        // parked the input thread until the user happened to press another key.
+        // When it happened while a command was being submitted, the terminal
+        // looked frozen: the message was sitting in the inbox, delivered and
+        // unreadable, and nothing would come along to notice it.
+        //
+        // That is the freeze. Retrying here costs one extra scheduler attempt in
+        // the rare contended case, and the task being woken finds the message
+        // already in its inbox.
+        if crate::task::sched::try_wake(t) {
+            return;
+        }
+        // Still not scheduled, so the task has not reached its blocked state
+        // yet. Its own `wake_pending` flag will catch the next transition, and
+        // `recv_wait` re-checks the inbox before parking, so putting the waiter
+        // back cannot cause a message to be consumed twice.
         crate::log::kdebug!(
-            "irq{}: wake of task {} lost; re-queueing waiter on ep {}",
+            "irq{}: wake of task {} lost twice; re-queueing waiter on ep {}",
             irq,
             t.0,
             ep
