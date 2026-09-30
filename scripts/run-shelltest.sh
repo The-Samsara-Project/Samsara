@@ -249,6 +249,11 @@ decode "$SHOTS/07-echo.ppm" | tail -6
 echo
 echo "=== a command with more output than the screen has rows ==="
 type_str 'ls /bin /bin /bin /bin /bin /bin /bin /bin'
+sleep 2
+# Enter, like every other command above. Without it the shell is still waiting on
+# an unterminated line, so the screen never scrolls and the test reports a frozen
+# terminal that was never asked to do anything.
+key ret
 sleep 8
 shot 08-scroll
 echo "--- every row the terminal still has, top to bottom ---"
