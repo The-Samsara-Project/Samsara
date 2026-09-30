@@ -3079,7 +3079,15 @@ fn sys_waitpid(pid: u64, status_ptr: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64
                     None => return errno::EINVAL,
                 };
                 bytes[..4].copy_from_slice(&(status).to_le_bytes());
-                return 0;
+                // The reaped pid goes in the return register, not a bare success
+                // code. Returning 0 tells a shell it reaped "pid 0" -- a process
+                // that does not exist -- so its next waitpid(0) looks for a child
+                // that was never forked and reports ENOENT. That is the whole of
+                // "fork works, then becomes unavailable": the first command
+                // runs, every later one is told its child is missing, and a
+                // program that gives up on the second ENOENT stops issuing
+                // commands at all.
+                return pid as i64;
             }
             // We were blocked; the child died while we slept. Retry to reap.
             crate::task::sched::WaitResult::Wait => continue,
