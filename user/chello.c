@@ -1168,6 +1168,69 @@ int main(int argc, char **argv) {
 	unlink("/tmp/ln-dangle");
 	unlink("/tmp/ln-target");
 
+	// A pty must carry more than its own buffer. A terminal is the case where
+	// this matters most and is hardest to see: a directory listing is several
+	// times the buffer, and a slave that drops whatever does not fit loses the
+	// rest of the listing silently -- no error to the writer, because a short
+	// write to a terminal is not one anybody checks.
+	//
+	// The reader is deliberately slower than the writer here, which is what
+	// forces the buffer to fill. Writing it all in one call would pass even
+	// against a driver that truncates, because the write would simply be short.
+	int mx = open("/dev/ptmx", O_RDWR, 0);
+	int sl = -1;
+	if (mx >= 0) {
+		int n = 0;
+		char ptn[16];
+		if (ioctl(mx, TIOCGPTN, &n) == 0) {
+			snprintf(ptn, sizeof ptn, "/dev/pts/%d", n);
+			sl = open(ptn, O_RDWR, 0);
+		}
+	}
+	int pty_big_ok = 0;
+	if (mx >= 0 && sl >= 0) {
+		/* Distinct bytes, so a lost tail is detectable and not just a shorter
+		 * count. */
+		static const size_t BIG = 8 * 1024;
+		char *src = malloc(BIG);
+		char *dst = malloc(BIG);
+		int ok = src && dst;
+		size_t done = 0;
+		if (ok) {
+			for (size_t i = 0; i < BIG; i++)
+				src[i] = (char)('A' + (i % 26));
+			for (size_t off = 0; ok && off < BIG; off += 512) {
+				ssize_t w = write(sl, src + off, 512);
+				if (w != 512) {
+					ok = 0;
+					break;
+				}
+				/* Drain as we go, so the check is that every byte arrives
+				 * rather than that the driver can hold 8 KiB at once. */
+				size_t got = 0;
+				while (got < 512) {
+					ssize_t r = read(mx, dst + off + got, 512 - got);
+					if (r <= 0) {
+						ok = 0;
+						break;
+					}
+					got += (size_t)r;
+				}
+				done += got;
+			}
+		}
+		if (ok)
+			ok = (done == BIG) && memcmp(src, dst, BIG) == 0;
+		pty_big_ok = ok;
+		free(src);
+		free(dst);
+	}
+	if (mx >= 0)
+		close(mx);
+	if (sl >= 0)
+		close(sl);
+	check(pty_big_ok, "pty carries 8 KiB in 512B writes");
+
 	// fork(2) under repeated use. The first fork succeeding proves very little:
 	// the failure this catches only appears once a process has been created and
 	// reaped enough times for the scheduler's bookkeeping to drift, so a
