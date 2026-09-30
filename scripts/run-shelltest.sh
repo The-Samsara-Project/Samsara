@@ -241,8 +241,30 @@ shot 07-echo
 echo "--- after one Enter ---"
 decode "$SHOTS/07-echo.ppm" | tail -6
 
-# Scrolling. A command whose output is taller than the screen must scroll, and
-# the prompt has to end up on the *last* line. If the screen does not scroll, the
+# A dash has to be visible.
+#
+# '-' and '_' are single rows of pixels in an 8x8 font. Nothing else in this
+# script's output contains one -- prompts, `ls` and `echo` are all dash-free --
+# so a terminal that drew them as nothing at all would pass every other check
+# here and still be unusable for reading a command line back.
+echo
+echo "=== a command containing dashes ==="
+type_str 'echo aa-bb_cc'
+sleep 2
+key ret
+sleep 6
+shot 07b-dashes
+decode "$SHOTS/07b-dashes.ppm" | tail -6
+if decode "$SHOTS/07b-dashes.ppm" | grep -q 'aa-bb_cc'; then
+    echo
+    echo "the dash and underscore are legible on screen"
+else
+    echo
+    echo "=== the dash is not legible on screen ==="
+    exit 1
+fi
+
+# Scrolling. A command whose output is taller than the screen must scroll, and# the prompt has to end up on the *last* line. If the screen does not scroll, the
 # prompt ends up somewhere above the bottom of the display and the terminal looks
 # frozen -- which is indistinguishable, from the outside, from one that is merely
 # waiting.
