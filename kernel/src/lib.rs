@@ -522,6 +522,19 @@ pub extern "Rust" fn tty_ticks() -> u64 {
     crate::time::ticks()
 }
 
+/// TTY bridge: drop the current task's pending timeout-sleeper entry.
+///
+/// A pty writer parks with a deadline so a terminal nobody is reading cannot
+/// hang it for ever. If the writer is woken early -- which is the normal case,
+/// because the terminal is draining -- the deadline entry has to go, or the
+/// timer wakes that writer on every later tick for the rest of the system's
+/// life. A write that completes instantly would leave behind a recurring
+/// wakeup, which reads as the machine getting slower for no reason.
+#[no_mangle]
+pub extern "Rust" fn tty_clear_timeout() {
+    crate::task::sched::clear_timeout();
+}
+
 /// Free DMA pages previously allocated with [`alloc_dma_pages`].
 #[no_mangle]
 pub extern "Rust" fn free_dma_pages(phys: u64, pages: usize) {

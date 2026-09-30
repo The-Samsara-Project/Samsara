@@ -79,6 +79,19 @@ extern "Rust" {
     fn tty_ticks() -> u64;
 }
 
+/// Kernel bridge: drop this task's pending timeout-sleeper entry.
+///
+/// A park with a deadline records one, and the timer re-wakes every entry whose
+/// deadline has passed. A task that was woken early still has its entry, so
+/// without this the timer keeps waking a thread that has long since finished
+/// waiting. Every park bracketed by a deadline needs this on both sides.
+///
+/// # Safety
+/// Must be called from a schedulable user task.
+extern "Rust" {
+    fn tty_clear_timeout();
+}
+
 /// Kernel bridge: may the calling task hand its terminal's foreground role to
 /// process group `pgid`? Enforces the POSIX rule that the caller and the target
 /// group must both belong to the *terminal's* session -- which is why `tty_sid`
@@ -520,7 +533,18 @@ impl PtyMaster {
                     continue;
                 }
                 // SAFETY: as above -- a user task, and `me` is this task.
+                //
+                // The clear/park/clear bracketing is not optional. A park with a
+                // deadline leaves the task in the sleepers list, and the timer
+                // re-wakes every entry whose deadline has passed. A writer that
+                // was woken early -- which is the normal case, because the
+                // terminal is draining -- would otherwise be woken again by the
+                // timer on every later tick, for ever, long after it stopped
+                // writing. That is a background stream of pointless wakeups that
+                // looks like the machine getting slower for no reason.
+                unsafe { tty_clear_timeout() };
                 unsafe { tty_park(deadline) };
+                unsafe { tty_clear_timeout() };
                 self.write_waiters.unregister(me);
                 if unsafe { tty_ticks() } >= deadline {
                     break;
@@ -656,7 +680,12 @@ impl PtySlave {
                     }
                 }
                 // SAFETY: as above -- a user task, and `me` is this task.
+                // Bracketed by clear_timeout for the reason given at the echo
+                // site: a deadline left in the sleepers list is re-woken by the
+                // timer even after the writer has gone away.
+                unsafe { tty_clear_timeout() };
                 unsafe { tty_park(deadline) };
+                unsafe { tty_clear_timeout() };
                 master.write_waiters.unregister(me);
                 if unsafe { tty_ticks() } >= deadline {
                     break;
