@@ -272,6 +272,48 @@ int main(int argc, char **argv) {
 		printf("[chello] SKIP file test: %s\n", strerror(errno));
 	}
 
+	// mkdir(2), and then actually using the directory it made.
+	//
+	// The kernel implemented `mkdir` and the libc never called it, so every
+	// `mkdir` reported ENOSYS. Creating a directory appeared to work in the
+	// sense that nothing crashed, and then nothing the program did next
+	// existed.
+	//
+	// A file is created inside it and read back, because "the call returned 0"
+	// is the part that was already true when this was broken.
+	{
+		int ok = 0;
+		if (mkdir("/tmp/chello-dir", 0755) == 0) {
+			int fd = open("/tmp/chello-dir/inside", O_WRONLY | O_CREAT, 0644);
+			if (fd >= 0) {
+				ssize_t w = write(fd, "in\n", 3);
+				close(fd);
+				int rfd = open("/tmp/chello-dir/inside", O_RDONLY, 0);
+				char dbuf[8] = {0};
+				int n = rfd >= 0 ? read(rfd, dbuf, sizeof(dbuf) - 1) : -1;
+				if (rfd >= 0)
+					close(rfd);
+				struct stat st;
+				ok = (w == 3) && (n == 3) && (strcmp(dbuf, "in\n") == 0) &&
+				     (stat("/tmp/chello-dir", &st) == 0) && S_ISDIR(st.st_mode);
+				unlink("/tmp/chello-dir/inside");
+			}
+		}
+		check(ok, "mkdir makes a usable directory");
+		// The mode has to survive the umask, or a program that asks for 0755
+		// and gets 0755-minus-something cannot tell whether it was the kernel
+		// or its own umask.
+		struct stat dst;
+		check(mkdir("/tmp/chello-mode", 0755) == 0, "mkdir with a mode");
+		ok = (stat("/tmp/chello-mode", &dst) == 0) && S_ISDIR(dst.st_mode) &&
+		     ((dst.st_mode & 0777) != 0);
+		check(ok, "the new directory has its requested mode");
+		// And creating the same directory twice must fail, because a program
+		// creating a directory it just made is asking a question.
+		check(mkdir("/tmp/chello-mode", 0755) == -1 && errno == EEXIST,
+		      "mkdir on an existing directory is EEXIST");
+	}
+
 	// lseek(2) on a real file, and the ESPIPE contract on a stream. Both matter
 	// to stdio: it calls lseek to decide whether a stream can be repositioned
 	// and picks its buffering strategy from the answer, so a wrong answer here

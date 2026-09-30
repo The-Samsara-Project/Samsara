@@ -50,6 +50,8 @@ struct SamsaraSysdepTags :
 	// Directories.
 	OpenDir,
 	ReadEntries,
+	Mkdir,
+	Mkdirat,
 	// Time.
 	ClockGet,
 	ClockSet,

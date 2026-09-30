@@ -130,11 +130,50 @@ int Sysdeps<Open>::operator()(const char *pathname, int flags, mode_t mode, int 
 	return 0;
 }
 
+int Sysdeps<Mkdir>::operator()(const char *path, mode_t mode) {
+	// The kernel has had `mkdir` all along (SYSCALL_MKDIR); nothing called it,
+	// so every `mkdir(2)` reached `sysdep_or_enosys` and reported ENOSYS. That
+	// is why creating a directory "did not really work": the syscall existed,
+	// was correct, and was unreachable.
+	//
+	// The path is passed with an explicit length for the same reason
+	// `symlink` does -- it lets the kernel reject an embedded NUL instead of
+	// silently creating a directory somewhere other than where the caller
+	// believes.
+	if (!path)
+		return EFAULT;
+	auto result = syscall(SYSCALL_MKDIR, (long)path, (long)strlen(path),
+	                      (long)mode);
+	if (result < 0) {
+		return -result;
+	}
+	return 0;
+}
+
+int Sysdeps<Mkdirat>::operator()(int dirfd, const char *path, mode_t mode) {
+	// AT_FDCWD is the only `dirfd` the kernel can resolve, which is what every
+	// caller in the libc passes. See `Unlinkat` for the same documented gap.
+	(void)dirfd;
+	if (!path)
+		return EFAULT;
+	auto result = syscall(SYSCALL_MKDIR, (long)path, (long)strlen(path),
+	                      (long)mode);
+	if (result < 0) {
+		return -result;
+	}
+	return 0;
+}
+
 int Sysdeps<Unlinkat>::operator()(int dirfd, const char *path, int flags) {
 	// AT_FDCWD (-100) is the "resolve against my working directory" sentinel,
 	// which is what every caller in the libc passes. The kernel has no
 	// directory-relative resolution, so a real `dirfd` is not honored -- the
 	// same documented gap as `openat`.
+	//
+	// `flags` is discarded, and that is a real gap rather than a formality:
+	// `AT_REMOVEDIR` is how `rmdir(2)` is expressed, so a caller asking to
+	// remove a directory gets ENOTEMPTY from `unlink` instead. Directories
+	// cannot be removed on this system yet.
 	(void)flags;
 	if (!path)
 		return EFAULT;
