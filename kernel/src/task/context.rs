@@ -363,13 +363,20 @@ global_asm!(
     ".globl fork_return_trampoline",
     ".type fork_return_trampoline, @function",
     "fork_return_trampoline:",
-    // The base of this child's own copy of the parent's syscall frame sits in
-    // the switch-context slot below the return address that brought us here;
-    // rbx carries it because the user's own rbx is restored from the frame
-    // below, so nothing of the parent's is lost. See set_child_fork_frame().
-    "mov rbx, [rsp]",
-    "add rsp, 8",
-    "mov rsp, rbx",
+    // rsp already points at this child's own copy of the parent's syscall
+    // frame. switch_raw pops the six context words and then `ret`s, and `ret`
+    // consumes the trampoline address that sits immediately below the frame --
+    // so on arrival here rsp is the frame base, per child, by construction.
+    //
+    // The frame base used to be loaded from a global instead, and that was the
+    // whole bug: two forks routinely complete before either child is first
+    // switched to (the parent does not yield at `fork`), so the second staging
+    // overwrote the first and the earlier child replayed the later child's
+    // frame. It then returned that child's `rax` -- a pid rather than zero --
+    // so a program branching on `fork() == 0` took the parent's path, forking
+    // again on every iteration of a loop, while the real parent waited in
+    // waitpid for a pid that was never coming. Nothing was ever refused, which
+    // is why it presents as fork becoming unavailable rather than as a crash.
     "pop rax",       // result: 0 in the child
     "pop rcx",
     "pop rdx",
@@ -394,29 +401,12 @@ global_asm!(
 );
 
 /// Build an initial saved-rsp for a freshly forked child thread. Above the
-/// 7-word switch context the caller copy the 160-byte parent syscall frame at
-/// `stack_end - 160`; the child's first resume returns to ring 3 through that
-/// frame with `rax = 0`.
-/// Record which copied syscall frame a forked child replays on its first
-/// resume. `fork_frame` must be `stack_end - SYSCALL_FRAME_SIZE` for the same
-/// child, and must be written before the child is first switched to.
-///
-/// # Safety
-/// `saved_rsp` must come from [`initial_fork_saved_rsp`] and the child must not
-/// yet have run.
-pub unsafe fn set_child_fork_frame(saved_rsp: SavedRsp, fork_frame: usize) {
-    // CTX_WORDS - 1 holds the trampoline address that brought us here, so the
-    // frame base goes in the slot beneath it.
-    let slot = (saved_rsp as *mut usize).add(CTX_WORDS - 2);
-    unsafe { slot.write(fork_frame) };
-}
-
-/// Build an initial saved-rsp for a freshly forked child thread. Above the
 /// switch context the caller copies this child's 160-byte copy of the parent's
 /// syscall frame at `stack_end - 160`; the child's first resume returns to ring
 /// 3 through that frame with `rax = 0`, which is what makes `fork()` observe
-/// zero in the child. See [`set_child_fork_frame`] for the slot that says which
-/// frame that is.
+/// zero in the child. The frame base needs no separate record: `switch_raw`
+/// pops the context words and then `ret`s, so the trampoline is entered with
+/// `rsp` already on that frame.
 pub fn initial_fork_saved_rsp(stack_end: usize) -> usize {
     let sp = stack_end - SYSCALL_FRAME_SIZE - CTX_WORDS * 8;
     unsafe {

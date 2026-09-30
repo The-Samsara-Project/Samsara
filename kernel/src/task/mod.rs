@@ -206,22 +206,6 @@ impl Task {
         let kstack = vec![0u8; KSTACK_SIZE].into_boxed_slice();
         let stack_end = kstack.as_ptr().addr() + KSTACK_SIZE;
         let saved_rsp = context::initial_fork_saved_rsp(stack_end);
-        // Tell the child's resume trampoline which copied syscall frame to
-        // replay: the one directly above its switch context.
-        //
-        // This is the whole fix for a fork that works once and then stops
-        // reporting ENOSYS. The trampoline used to find that base in a single
-        // global, and two forks routinely complete before either child is first
-        // switched to -- the parent does not yield at `fork` -- so the second
-        // one overwrote the first. The earlier child then replayed the later
-        // child's frame and returned *its* `rax` from `fork`, which is not zero,
-        // so it ran the parent's path: forking again on every iteration of a
-        // loop, while the real parent waited for a pid that was never coming.
-        // SAFETY: the context was just built by `initial_fork_saved_rsp` above
-        // and this task has not been queued yet, so nothing can have run on it.
-        unsafe {
-            context::set_child_fork_frame(saved_rsp, stack_end - context::SYSCALL_FRAME_SIZE);
-        }
         Task {
             id,
             name: String::from(name),
