@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -1166,6 +1167,68 @@ int main(int argc, char **argv) {
 	unlink("/tmp/ln-self");
 	unlink("/tmp/ln-dangle");
 	unlink("/tmp/ln-target");
+
+	// fork(2) under repeated use. The first fork succeeding proves very little:
+	// the failure this catches only appears once a process has been created and
+	// reaped enough times for the scheduler's bookkeeping to drift, so a
+	// single-shot check passes on a kernel that is about to start returning
+	// ENOSYS to a shell that is running perfectly ordinary commands.
+	//
+	// The loop is deliberately shallow per iteration and long overall, which is
+	// the shape of the real workload: a shell running a hundred short commands
+	// one after another, not one command that forks a hundred children at once.
+	// It also reaps every child, because an unreaped child is a zombie that
+	// still holds its slot, and accumulating those would turn this into a
+	// different test than the one intended.
+	int fork_ok = 1;
+	int first_errno = 0;
+	int child_saw_self = 1;
+	for (int i = 0; i < 64; i++) {
+		pid_t pid = fork();
+		if (pid < 0) {
+			fork_ok = 0;
+			if (!first_errno)
+				first_errno = errno;
+			break;
+		}
+		if (pid == 0) {
+			/* The child must observe its own identity as zero from fork(2)
+			 * and then report it differently, which is the only proof that the
+			 * two really are separate processes. A child that sees non-zero
+			 * here runs the *parent's* path: it loops, forking on every
+			 * iteration, and the parent waits for a pid that will never be
+			 * the one it asked for. */
+			if (getpid() == 0)
+				child_saw_self = 0;
+			_exit(child_saw_self ? 0 : 1);
+		}
+		int st = 0;
+		if (waitpid(pid, &st, 0) != pid || !(WIFEXITED(st) && WEXITSTATUS(st) == 0))
+			fork_ok = 0;
+	}
+	check(fork_ok, first_errno ? "fork x64 (ENOSYS?)" : "fork x64");
+	check(child_saw_self, "fork child has its own pid");
+
+	// fork must still work after the children have been reaped, and after a
+	// failed one has been observed. A kernel that leaks task slots on the
+	// failure path passes the first loop and fails here, which is why this is
+	// a separate check rather than more iterations of the same one.
+	pid_t after = fork();
+	if (after > 0)
+		waitpid(after, NULL, 0);
+	check(after > 0, "fork after 64 reaps");
+
+	// vfork(3) is not the same call and must not be reported as working.
+	// busybox reaches for it in several places, so a kernel that answers
+	// ENOSYS here is a real limitation worth naming in a test rather than
+	// discovering in a shell.
+	errno = 0;
+	pid_t vf = vfork();
+	if (vf == 0)
+		_exit(0);
+	if (vf > 0)
+		waitpid(vf, NULL, 0);
+	printf("%-34s %s\n", "vfork", vf > 0 ? "ok" : (vf < 0 ? "unsupported" : "FAIL"));
 
 	if (failures) {
 		printf("[chello] %d CHECK(S) FAILED\n", failures);
