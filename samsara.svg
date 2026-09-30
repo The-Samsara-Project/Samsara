@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!--
+  Samsara logo.
+
+  A wheel: a ring, eight spokes turning about a hub, and a gap of ground showing
+  between them. Samsara is the wheel that turns, and it is also a micro-kernel
+  the ring is the boundary everything else runs inside, and the hub is the one
+  point the whole machine agrees on.
+
+  Two constraints shaped the drawing, both learned the hard way:
+
+  Filled geometry only. No strokes, no gradients, no filters, no masks. A stroke
+  is centred on its radius, so its apparent weight depends on how a renderer
+  rounds the cap, and at 24px that is the difference between a ring and a smudge.
+  Every renderer from librsvg to a browser shows the same silhouette, which is
+  the only reason a mark like this survives being scaled from a README heading
+  back up to a wall.
+
+  A ground, not a disc. A disc on a transparent field disappears against a dark
+  background, and most of the places a logo ends up are dark. The square is
+  deliberate.
+
+  All the coordinates below were computed, not eyeballed: the spoke is a quad from
+  a narrow base at the hub to a wider tip, and the eight are one element rotated
+  in 45-degree steps, so the wheel has real eightfold symmetry instead of eight
+  similar things.
+-->
+<svg
+   xmlns="http://www.w3.org/2000/svg"
+   width="210mm"
+   height="210mm"
+   viewBox="0 0 210 210"
+   version="1.1"
+   id="samsara-logo">
+  <title id="samsara-logo-title">Samsara</title>
+  <desc id="samsara-logo-desc">A wheel of eight spokes turning about a hub, inside a ring, on an indigo field.</desc>
+
+  <defs id="samsara-logo-defs">
+    <!--
+      One spoke, pointing up, from r=17 at the hub to r=74 at the tip. Narrow at
+      the base and wider at the tip on purpose: a spoke that tapers toward the
+      centre reads as a ray leaving a point, which is the whole idea of a hub.
+      Drawn once and reused, so retuning the wheel is a change to one path.
+    -->
+    <path
+       id="samsara-spoke"
+       d="M 121.948,103.666
+          L 176.955,87.725
+          A 74,74 0 0 1 176.955,122.275
+          L 121.948,106.334
+          Z" />
+  </defs>
+
+  <!-- The field the mark sits on. See the note above on why this is a square. -->
+  <rect
+     id="samsara-ground"
+     x="0" y="0" width="210" height="210"
+     fill="#241a4d" />
+
+  <!--
+    The rim, as a filled annulus. Two circles in one path under evenodd: the
+    inner one punches the middle out. Using the fill rule rather than a second
+    shape in the ground colour means the ring stays a ring even if the mark is
+    ever recoloured by overriding one fill.
+  -->
+  <path
+     id="samsara-rim"
+     fill="#ffffff"
+     fill-rule="evenodd"
+     d="M 105,105
+        m -96,0
+        a 96,96 0 1,0 192,0
+        a 96,96 0 1,0 -192,0
+        Z
+        M 105,105
+        m -85,0
+        a 85,85 0 1,0 170,0
+        a 85,85 0 1,0 -170,0
+        Z" />
+
+  <!--
+    The eight spokes. Rotated in 45-degree steps about the centre, so the wheel
+    divides evenly. The count is arbitrary; the regularity is not, and a wheel
+    that does not divide evenly reads as a mistake rather than a design.
+  -->
+  <g id="samsara-spokes" fill="#ffffff">
+    <use href="#samsara-spoke" />
+    <use href="#samsara-spoke" transform="rotate(45 105 105)" />
+    <use href="#samsara-spoke" transform="rotate(90 105 105)" />
+    <use href="#samsara-spoke" transform="rotate(135 105 105)" />
+    <use href="#samsara-spoke" transform="rotate(180 105 105)" />
+    <use href="#samsara-spoke" transform="rotate(225 105 105)" />
+    <use href="#samsara-spoke" transform="rotate(270 105 105)" />
+    <use href="#samsara-spoke" transform="rotate(315 105 105)" />
+  </g>
+
+  <!--
+    The hub: one solid disc at the centre, everything else arranged around it.
+    Slightly larger than the spokes' base so it reads as the centre rather than
+    as a gap between them.
+  -->
+  <circle
+     id="samsara-hub"
+     cx="105" cy="105" r="19"
+     fill="#ffffff" />
+</svg>
