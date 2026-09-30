@@ -983,7 +983,6 @@ int Sysdeps<Waitpid>::operator()(pid_t pid, int *status, int flags, struct rusag
 	// cannot be honored and `ru` is never filled. Refusing WNOHANG is better
 	// than blocking a caller that asked not to block.
 	(void)ru;
-	(void)ret_pid;
 	if (flags & 1 /* WNOHANG */) {
 		return ENOSYS;
 	}
@@ -991,7 +990,15 @@ int Sysdeps<Waitpid>::operator()(pid_t pid, int *status, int flags, struct rusag
 	if (ret < 0) {
 		return -ret;
 	}
-	return (int)ret;
+	// The reaped pid goes out through `ret_pid`, not the return value: mlibc's
+	// `waitpid` wrapper does `if (sysdep_or_enosys<Waitpid>(...)) ... else
+	// return *ret_pid`, so a wrapper that returns the pid itself leaves the
+	// caller reading an uninitialized stack slot. That is not a small
+	// inaccuracy -- it hands a shell a pid it did not wait for, so its next
+	// `waitpid` looks for a child that does not exist, and it reports the
+	// failure as ENOENT. Which is exactly how "fork works, then stops" looks.
+	*ret_pid = (pid_t)ret;
+	return 0;
 }
 
 int Sysdeps<Fork>::operator()(pid_t *child) {
@@ -1002,6 +1009,7 @@ int Sysdeps<Fork>::operator()(pid_t *child) {
 	*child = (pid_t)ret;
 	return 0;
 }
+
 
 // --- process groups and sessions -----------------------------------------
 
