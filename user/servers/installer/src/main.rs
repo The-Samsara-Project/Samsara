@@ -23,7 +23,7 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -46,6 +46,7 @@ const PROG_BUSYBOX: u64 = 15;
 /// `chello`, the C program linked against the mlibc port. The only non-Rust
 /// user image, so it is what shows the libc port runs and not merely links.
 const PROG_CHELLO: u64 = 13;
+const PROG_MKPASSWD: u64 = 16;
 /// `fbterm`, the ported Linux terminal emulator. The installer hands it the
 /// display when setup finishes; see the `handoff` method.
 const PROG_FBTERM: u64 = 14;
@@ -184,6 +185,7 @@ enum Screen {
     Storage,
     DiagMenu,
     About,
+    Password,
     Finish,
 }
 
@@ -617,29 +619,168 @@ impl App {
             return;
         }
 
-        // `x` in the password field means "look elsewhere", and there is nowhere
-        // to look: this system has no password store, so there is no credential
-        // here to protect and inventing a hash would be theatre. The consequence
-        // is stated rather than hidden -- see the login flow -- because a
-        // passwd file is exactly where someone would look to find out.
-        let passwd = format!(
-            "root:x:0:0:root:/root:/bin/sh\n\
-             nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n\
-             {name}:x:{uid}:{gid}:Samsara user:{home}:/bin/sh\n",
-            name = NAME,
-            uid = UID,
-            gid = GID,
-            home = home,
-        );
-        if let Err(e) = write_file("/etc/passwd", passwd.as_bytes()) {
-            println!("[installer] could not write /etc/passwd: {}", e);
-            return;
-        }
+        // The password field starts as `x` and is filled in by the wizard's
+        // password screen, which is where the question can actually be asked --
+        // it needs a drawn screen to ask on. A locked account is written if the
+        // wizard is never reached, so an account is never left open.
+        self.write_passwd(None);
         let group = format!("root:x:0:\nnogroup:x:65534:\n{name}:x:{gid}:\n", name = NAME, gid = GID);
         if let Err(e) = write_file("/etc/group", group.as_bytes()) {
             println!("[installer] could not write /etc/group: {}", e);
         }
+        // `/bin/getty` is the session's login shell, so a terminal comes up
+        // asking who you are rather than dropping straight into a shell. It is
+        // copied by `install_userland`, which runs after this.
         println!("[installer] user '{}' created, home {}", NAME, home);
+    }
+
+    /// Write `/etc/passwd`.
+    ///
+    /// `hash` is the session user's `crypt(3)` hash, or `None` to write the
+    /// account *locked*.
+    ///
+    /// Locked matters. An account whose password field is empty means "no
+    /// password required" to `login(1)`, so writing one by accident admits
+    /// anyone at the keyboard as that user. A locked account is a state a person
+    /// can see and fix; an open one is not.
+    fn write_passwd(&self, hash: Option<&str>) {
+        const UID: u32 = 1000;
+        const GID: u32 = 1000;
+        const NAME: &str = "samsara";
+        let home = format!("/home/{}", NAME);
+        let field = match hash {
+            Some(h) => String::from(h),
+            None => String::from("!"),
+        };
+        let entries = format!(
+            "root:x:0:0:root:/root:/bin/getty\n\
+             nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n\
+             {name}:{field}:{uid}:{gid}:Samsara user:{home}:/bin/getty\n",
+            name = NAME, field = field, uid = UID, gid = GID, home = home
+        );
+        if let Err(e) = write_file("/etc/passwd", entries.as_bytes()) {
+            println!("[installer] could not write /etc/passwd: {}", e);
+        }
+    }
+
+    /// Read one line of typed input, echoing what is typed.
+    ///
+    /// Echoed rather than hidden: this runs during setup, where the person
+    /// setting the password is already trusted and is looking at a framebuffer
+    /// wizard rather than a terminal, and a field that silently swallows
+    /// keystrokes is indistinguishable from one that is not working. The
+    /// password is not being entered to defend against someone watching the
+    /// screen -- nothing here is a secure terminal yet, and pretending otherwise
+    /// would be the dishonest half-measure.
+    fn read_line_typed(&mut self) -> String {
+        let mut out = String::new();
+        loop {
+            match self.wait_key() {
+                Key::Enter => {
+                    println!();
+                    return out;
+                }
+                Key::Backspace => {
+                    out.pop();
+                }
+                Key::Char(c) if c == 0x7F || c == 0x08 => {
+                    out.pop();
+                }
+                Key::Char(c) if c >= 0x20 => {
+                    out.push(c as char);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Read a line with echo off, drawing `*` as it goes, starting on the row
+    /// below `label`.
+    ///
+    /// The asterisks are deliberate: a field that shows nothing at all is
+    /// indistinguishable from one that has stopped reading the keyboard, and the
+    /// first of those is what a person would report as a broken setup.
+    fn read_secret(&mut self, c0: usize, label_row: usize, label: &str) -> String {
+        let row = label_row + 1;
+        let c1 = self.fb.cols() - 4;
+        let mut out = String::new();
+        let mut col = c0;
+        loop {
+            match self.wait_key() {
+                Key::Enter => return out,
+                Key::Backspace | Key::Char(0x7F) | Key::Char(0x08) => {
+                    if out.pop().is_some() && col > c0 {
+                        col -= 1;
+                        self.fb.blank(col, row, 1, BLACK);
+                    }
+                }
+                Key::Char(c) if c >= 0x20 && c < 0x7F => {
+                    if col < c1 {
+                        out.push(c as char);
+                        // Overwrite the cell rather than appending, so the
+                        // field cannot run past its box.
+                        self.fb.put_char(col, row, b'*', LGREEN, BLACK);
+                        col += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Ask for a password and turn it into a `crypt(3)` hash with `mkpasswd`.
+    ///
+    /// Returns `None` if no password was entered, which leaves the account
+    /// locked rather than open. The confirmation is deliberate: a mistyped
+    /// password that is accepted silently is discovered at the next login, by
+    /// which point the person has forgotten it and there is no way in.
+    fn hash_password(&mut self, user: &str) -> Option<String> {
+        self.msg = Some(format!("Set a password for {} (blank to leave locked):", user));
+        let first = self.read_line_typed();
+        if first.is_empty() {
+            return None;
+        }
+        self.msg = Some(String::from("Confirm the password:"));
+        let second = self.read_line_typed();
+        if first != second {
+            self.msg = Some(String::from("Passwords did not match; leaving the account locked."));
+            return None;
+        }
+
+        // Run the hasher with the password on its stdin, and take its stdout as
+        // the hash. A pipe rather than an argument, so the password does not
+        // appear in the process table where any program could read it.
+        let (rd, wr) = syscall::pipe().ok()?;
+        let pid = syscall::proc_spawn(PROG_MKPASSWD, None).ok()?;
+        syscall::close(wr).ok()?;
+        syscall::write(wr, first.as_bytes()).ok()?;
+        syscall::write(wr, b"\n").ok()?;
+        syscall::close(wr).ok()?;
+
+        let mut hash = String::new();
+        let mut buf = [0u8; 256];
+        loop {
+            let n = syscall::read(rd, &mut buf).unwrap_or(0);
+            if n <= 0 {
+                break;
+            }
+            if let Ok(s) = core::str::from_utf8(&buf[..n]) {
+                hash.push_str(s);
+            }
+        }
+        syscall::close(rd).ok()?;
+        let _ = syscall::waitpid(pid, &mut 0);
+
+        let hash = hash.trim().to_string();
+        // A hash from `crypt(3)` always starts with `$<id>$`. Anything else means
+        // the hasher failed, and writing that into the passwd database would lock
+        // the user out of a system they cannot then log into to repair.
+        if hash.len() > 3 && hash.starts_with("$6$") {
+            Some(hash)
+        } else {
+            self.msg = Some(String::from("could not hash the password; account left locked"));
+            None
+        }
     }
 
     fn install_userland(&mut self) {
@@ -710,6 +851,14 @@ impl App {
         let mut failed = 0usize;
         for name in &names {
             let path = format!("/bin/{}", name);
+            // `getty` is this system's own program, not a busybox applet, so it
+            // is skipped here and written out in full below. Making it a link to
+            // busybox would produce a file that exists, is executable, and runs
+            // an applet that is not compiled in -- which looks like a broken
+            // login rather than a missing one.
+            if name == "getty" {
+                continue;
+            }
             match syscall::symlink("/bin/busybox", &path) {
                 // EEXIST is success in effect: the name is already reachable by
                 // this path, which is the only thing the link was for.
@@ -731,6 +880,18 @@ impl App {
             Ok(()) | Err(-17) => made += 1,
             Err(_) => failed += 1,
         }
+        // `/bin/getty` is skipped above and is already a real file: the kernel
+        // seeds it alongside `/bin/busybox`, for the same reason. It is counted
+        // here so the summary describes what is actually in `/bin`.
+        if syscall::stat("/bin/getty", &mut syscall::Stat {
+            mode: 0, uid: 0, gid: 0, kind: 0, size: 0,
+        }).is_ok() {
+            made += 1;
+        } else {
+            println!("[installer] /bin/getty is missing; no terminal will be able to log in");
+            failed += 1;
+        }
+
         println!(
             "[installer] /bin populated: {} links, {} failed",
             made, failed
@@ -1009,7 +1170,11 @@ fn screen_main(app: &mut App) -> Nav {
                     4 => Screen::Storage,
                     5 => Screen::DiagMenu,
                     6 => Screen::About,
-                    _ => Screen::Finish,
+                    // Finishing goes through the password screen first. The
+                    // account has to have a password before a terminal can ask
+                    // anyone to log in, and this is the last point at which that
+                    // can be asked as part of setting the machine up.
+                    _ => Screen::Password,
                 });
             }
             Key::Enter => {
@@ -1021,10 +1186,14 @@ fn screen_main(app: &mut App) -> Nav {
                     4 => Screen::Storage,
                     5 => Screen::DiagMenu,
                     6 => Screen::About,
-                    _ => Screen::Finish,
+                    // Finishing goes through the password screen first. The
+                    // account has to have a password before a terminal can ask
+                    // anyone to log in, and this is the last point at which that
+                    // can be asked as part of setting the machine up.
+                    _ => Screen::Password,
                 });
             }
-            Key::Esc | Key::Char(b'q') => return Nav::Next(Screen::Finish),
+            Key::Esc | Key::Char(b'q') => return Nav::Next(Screen::Password),
             _ => {}
         }
     }
@@ -1319,6 +1488,77 @@ fn screen_about(app: &mut App) -> Nav {
 }
 
 /// Finish: summary, optional final test pass, then hand the display back.
+/// Ask for the session user's password and store its hash.
+///
+/// This has to happen here, in the wizard, and not from `passwd(1)` afterwards.
+/// `passwd` is a program you run *after* logging in, and on this system you
+/// cannot log in until a password exists -- so leaving the account without one
+/// and expecting the first login to set it is a lockout loop: the account can
+/// neither be used nor be given a password.
+///
+/// A blank entry leaves the account locked rather than open. An account with an
+/// empty password field means "no password required" to `login(1)`, which would
+/// let anyone at the keyboard become this user.
+fn screen_password(app: &mut App) -> Nav {
+    let cols = app.fb.cols();
+    let rows = app.fb.rows();
+    app.frame("Password", "Enter accepts, ESC = back");
+    let mut lines = Vec::new();
+    lines.push(String::from("Set a password for the session user 'samsara'."));
+    lines.push(String::new());
+    lines.push(String::from(
+        "The terminal asks for this before it gives you a shell.",
+    ));
+    lines.push(String::from(
+        "Leave it blank to leave the account locked -- you can still use the",
+    ));
+    lines.push(String::from(
+        "machine, but nobody will be able to log in until a password is set.",
+    ));
+    let c0 = cols / 2 - 35;
+    let c1 = cols / 2 + 35;
+    let r0 = rows / 2 - 6;
+    let r1 = rows / 2 + 1;
+    app.fb.text_block(c0, r0, c1, r1, "Password", &lines);
+
+    let r = rows / 2 + 3;
+    app.fb.put_text(c0, r, "New password:", WHITE, BLACK);
+
+    // Read the password with echo off, the way `login(1)` does.
+    //
+    // Echo is off here for the same reason it is off there: a password is typed
+    // into a field that will be visible on the display for as long as the
+    // session lasts, and this screen is the one place the person setting it is
+    // definitely not being shoulder-surfed. The installer is not a secure
+    // terminal and does not pretend to be -- it is a setup wizard, not a login.
+    let first = app.read_secret(c0, r, "New password:");
+    if first.is_empty() {
+        app.msg = Some(String::from("password left blank; the account is locked"));
+        return Nav::Next(Screen::Finish);
+    }
+
+    app.fb.put_text(c0, r + 2, "Confirm password:", WHITE, BLACK);
+    let second = app.read_secret(c0, r + 2, "Confirm password:");
+    if first != second {
+        // A mistyped password accepted silently is discovered at the next
+        // login, by which point the person has forgotten it and there is no way
+        // in. Refusing here is the only point at which it is still cheap.
+        app.msg = Some(String::from("passwords did not match; the account is locked"));
+        return Nav::Next(Screen::Finish);
+    }
+
+    match app.hash_password(&first) {
+        Some(hash) => {
+            app.write_passwd(Some(&hash));
+            app.msg = Some(String::from("password set"));
+        }
+        None => {
+            app.msg = Some(String::from("could not hash the password; the account is locked"));
+        }
+    }
+    Nav::Next(Screen::Finish)
+}
+
 fn screen_finish(app: &mut App) -> Nav {
     let cols = app.fb.cols();
     let rows = app.fb.rows();
@@ -1437,6 +1677,7 @@ pub extern "C" fn _start() -> ! {
             Screen::Storage => screen_storage(&mut app),
             Screen::DiagMenu => screen_diag_menu(&mut app),
             Screen::About => screen_about(&mut app),
+            Screen::Password => screen_password(&mut app),
             Screen::Finish => screen_finish(&mut app),
         };
         cur = match nav {

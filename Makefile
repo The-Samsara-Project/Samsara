@@ -25,15 +25,18 @@ export PATH := $(HOME)/.cargo/bin:$(PATH)
 #     The kernel launches these during boot; each links its own linker script.
 #   * the utility multi-call binary — user/samutils/ (the real commands the
 #     shell runs); spawned on demand with an argv.
-#   * example programs — crates under user/nutcracker-rt/examples/ (self-tests,
-#     the shell, the terminal, the installer).
+#   * system programs — crates under user/servers/ (the console server, the
+#     keyboard driver, the installer, the getty that fronts a terminal).
+#   * example programs — crates under user/nutcracker-rt/examples/ (self-tests
+#     and the shell). Nothing here is needed to boot or to be usable: they exist
+#     to be run and checked, not to set the system up.
 # All are static-position-independent ELFs embedded in the kernel, which acts
 # as their dynamic linker (mapping PT_LOADs + resolving .rela). Their flags
 # live in user/.cargo/config.toml (built from `user/`); the kernel's
 # code-model=kernel config is scoped to kernel/.cargo/config.toml.
-USER_SERVERS   := consoled inputd
+USER_SERVERS   := consoled inputd installer
 USER_UTILS     := samutils
-USER_EXAMPLES  := hello forkx exectst pipetest credtst signaltst polltest termiostst sh installer
+USER_EXAMPLES  := hello forkx exectst pipetest credtst signaltst polltest termiostst sh
 
 .PHONY: all kernel iso run run-fbterm debug clean user-bins fbterm-run
 .PHONY: mlibc fbterm busybox
@@ -125,7 +128,14 @@ user-bins: build/.mlibc.stamp build/.fbterm.stamp build/.busybox.stamp
 	    target/user/x86_64-unknown-none/release/$$b target/user-$$b.elf; done
 	@for b in $(USER_UTILS); do cp \
 	    target/user/x86_64-unknown-none/release/$$b target/user-$$b.elf; done
+	@# Programs linked against mlibc rather than built by cargo, because they need
+	@# the C library: the self-test, the password hasher and the getty. They are
+	@# not cargo targets and so are not in any of the copy loops above; each build
+	@# script writes target/user-<name>.elf directly. The Rust programs cannot be
+	@# written this way because they do not link mlibc at all.
 	@sh user/build-chhello.sh
+	@sh user/build-mkpasswd.sh
+	@sh user/build-getty.sh
 	@# fbterm is a ported C++ program built by ports/fbterm/build.sh against the
 	@# mlibc sysroot, not a cargo target, so it is copied into place here. The
 	@# kernel embeds it unconditionally as the system terminal.

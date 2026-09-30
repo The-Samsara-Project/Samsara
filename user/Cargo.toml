@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["nutcracker-rt", "servers/consoled", "servers/inputd", "samutils"]
+members = [
+    "nutcracker-rt",
+    "servers/consoled",
+    "servers/inputd",
+    "servers/installer",
+    "samutils",
+]
 
 [profile.release]
 panic = "abort"
