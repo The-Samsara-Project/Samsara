@@ -55,16 +55,16 @@ pub const PROG_FBTERM: usize = 14;
 /// Index of `busybox`, the ported multi-call binary and the system userland.
 /// One image; the applet is chosen by `argv[0]`, which is why every name under
 /// `/bin` is a symlink to it rather than a copy.
-pub const PROG_BUSYBOX: usize = 15;
+pub const PROG_BUSYBOX: usize = 17;
 /// Index of `mkpasswd`, the helper that turns a password into a `crypt(3)` hash.
 ///
 /// A separate program rather than part of the installer because the installer is
 /// Rust and the Rust programs here do not link mlibc, so it cannot call `crypt(3)`
 /// itself. Hashing stays in user space, in a program that can be checked against
 /// a reference implementation, rather than in the kernel.
-pub const PROG_MKPASSWD: usize = 16;
+pub const PROG_MKPASSWD: usize = 15;
 /// Index of `getty`, the program that fronts a terminal and runs a login.
-pub const PROG_GETTY: usize = 17;
+pub const PROG_GETTY: usize = 16;
 
 /// A boot-time user-space program.
 pub(crate) struct Program {
@@ -218,6 +218,71 @@ pub(crate) const PROGRAMS: [Program; 18] = [
         image: include_bytes!("../../target/user-busybox.elf"),
     },
 ];
+
+/// Check that every `PROG_*` constant is the index of the entry it names.
+///
+/// These constants are plain integers indexing a plain array, and nothing in the
+/// type system connects an index to the entry it refers to. Two programs were
+/// once added to the table ahead of `busybox` rather than after it, and every
+/// index from there on silently pointed one or two entries off. The symptoms
+/// were two unrelated-looking failures with nothing in common: `/bin/getty` was
+/// seeded with the busybox image, so a terminal reported "applet not found", and
+/// spawning `mkpasswd` ran the getty image instead, which read the keyboard
+/// where the password should have been and so reported that no password could be
+/// hashed at all. Neither pointed at an index.
+///
+/// This is the check that turns that class of mistake into a compile error.
+const _: () = {
+    // Compared as bytes rather than as `&str`: matching on a string is not
+    // const-stable, and a const `PartialEq` on `str` is not either. The
+    // table's names are literals, so this is comparing constant data to
+    // constant data and the compiler folds all of it away.
+    macro_rules! same {
+        ($name:expr, $s:literal) => {{
+            let a = $name.as_bytes();
+            let b = $s.as_bytes();
+            a.len() == b.len() && {
+                let mut k = 0;
+                let mut eq = true;
+                while k < a.len() {
+                    if a[k] != b[k] {
+                        eq = false;
+                    }
+                    k += 1;
+                }
+                eq
+            }
+        }};
+    }
+    let mut i = 0;
+    while i < PROGRAMS.len() {
+        let n = PROGRAMS[i].name;
+        let expected = if same!(n, "hello") { PROG_HELLO }
+        else if same!(n, "consoled") { PROG_CONSOLED }
+        else if same!(n, "inputd") { PROG_INPUTD }
+        else if same!(n, "forkx") { PROG_FORKX }
+        else if same!(n, "pipetest") { PROG_PIPETEST }
+        else if same!(n, "credtst") { PROG_CREDTST }
+        else if same!(n, "signaltst") { PROG_SIGNALTST }
+        else if same!(n, "termiostst") { PROG_TERMIOS_TST }
+        else if same!(n, "polltest") { PROG_POLLTEST }
+        else if same!(n, "sh") { PROG_SHELL }
+        else if same!(n, "installer") { PROG_INSTALLER }
+        else if same!(n, "exectst") { PROG_EXECTST }
+        else if same!(n, "samutils") { PROG_SAMUTILS }
+        else if same!(n, "chello") { PROG_CHELLO }
+        else if same!(n, "fbterm") { PROG_FBTERM }
+        else if same!(n, "mkpasswd") { PROG_MKPASSWD }
+        else if same!(n, "getty") { PROG_GETTY }
+        else if same!(n, "busybox") { PROG_BUSYBOX }
+        else { i };
+        assert!(
+            i == expected,
+            "a PROG_* constant does not match its entry in PROGRAMS"
+        );
+        i += 1;
+    }
+};
 
 /// Default search path for spawned programs. `samutils` lives in `/bin`, and
 /// a shell in `/bin` as well; `/usr/bin` is included so a

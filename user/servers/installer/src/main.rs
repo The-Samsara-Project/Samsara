@@ -776,9 +776,19 @@ impl App {
         let out_arg = alloc::format!("{}", wr);
         let argv = ["mkpasswd", in_arg.as_str(), out_arg.as_str()];
         let pid = syscall::proc_spawn(PROG_MKPASSWD, Some(&argv)).ok()?;
-        syscall::close(wr).ok()?;
-        syscall::write(wr, first.as_bytes()).ok()?;
-        syscall::write(wr, b"\n").ok()?;
+        // The password goes through this end, so it stays open until it has been
+        // written. Closing it first -- which this did -- means the two writes
+        // below go to a closed descriptor, the child never sees a line, and it
+        // blocks on a read that will never return. The parent then waits for a
+        // hash that cannot exist.
+        if syscall::write(wr, first.as_bytes()).is_err() {
+            syscall::close(wr).ok()?;
+            let _ = syscall::waitpid(pid, &mut 0);
+            self.msg = Some(String::from("could not hand the password to the hasher"));
+            return None;
+        }
+        let _ = syscall::write(wr, b"\n");
+        // Closed now, so the child sees end-of-file once it has the password.
         syscall::close(wr).ok()?;
 
         let mut hash = String::new();
