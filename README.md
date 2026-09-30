@@ -1,5 +1,8 @@
 SAMSARA / NUTCRACKER
 --------------------
+<div align="center">
+  <img src="samsara.svg" width="200" height="200" style="border-radius: 50%; object-fit: cover;">
+</div>
 
 A 64-bit micro-kernel written in Rust. Copyright (C) 2026 Harsh Nikarsa.
 Licensed under the GNU GPL v3 or later, see LICENSE.
@@ -351,8 +354,7 @@ WHAT WE ASK INSTEAD
 
 HOW WE CHECK
 
-We don't run this on trust alone. Patches that read as AI-generated -
-by style, by structure, by the kind of mistakes they make - will be
+We don't run this on trust alone. Patches cost us review time while being shaky and possibly subtly wrong will be
 asked to be resubmitted with an explanation, or rejected outright.
 Repeated violations get you blocked from the project.
 
@@ -366,3 +368,5 @@ Samsara is free software: you can redistribute it and/or modify it
 under the terms of the GNU General Public License as published by the
 Free Software Foundation, either version 3 of the License, or (at your
 option) any later version. See LICENSE for the full text.
+
+Developed By Harsh Nikarsa & Senna De Jong
