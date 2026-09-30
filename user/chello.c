@@ -1203,17 +1203,30 @@ int main(int argc, char **argv) {
 			_exit(child_saw_self ? 0 : 1);
 		}
 		int st = 0;
-		if (waitpid(pid, &st, 0) != pid || !(WIFEXITED(st) && WEXITSTATUS(st) == 0))
+		errno = 0;
+		pid_t w = waitpid(pid, &st, 0);
+		if (w != pid || !(WIFEXITED(st) && WEXITSTATUS(st) == 0)) {
 			fork_ok = 0;
+			if (!first_errno)
+				first_errno = (w == pid) ? -WEXITSTATUS(st) : -errno;
+		}
 	}
-	check(fork_ok, first_errno ? "fork x64 (ENOSYS?)" : "fork x64");
+	check(fork_ok, "fork x64");
 	check(child_saw_self, "fork child has its own pid");
 
 	// fork must still work after the children have been reaped, and after a
 	// failed one has been observed. A kernel that leaks task slots on the
 	// failure path passes the first loop and fails here, which is why this is
 	// a separate check rather than more iterations of the same one.
+	errno = 0;
 	pid_t after = fork();
+	if (after == 0) {
+		/* The child must leave here, or it runs the rest of the program as a
+		 * second copy of the parent -- forking again, and reporting on the
+		 * checks its parent is still running. That is a bug in the test, and it
+		 * looks exactly like the kernel bug it is checking for. */
+		_exit(0);
+	}
 	if (after > 0)
 		waitpid(after, NULL, 0);
 	check(after > 0, "fork after 64 reaps");
