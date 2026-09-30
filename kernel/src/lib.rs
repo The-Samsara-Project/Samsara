@@ -159,7 +159,6 @@ pub extern "C" fn kmain(magic: u32, mbi_phys: u64) -> ! {
 
     // ---- the userland ------------------------------------------------------
     seed_userland();
-    seed_passwd();
 
     // ---- block devices (NVMe, AHCI/SATA) ------------------------------------
     drivers::nvme::init();
@@ -229,6 +228,17 @@ fn seed_userland() {
     // directory that was never there.
     let _ = vfs::create_as("/usr/bin", vfs::NodeKind::Dir, 0, 0, 0o755);
     let _ = vfs::create_as("/root", vfs::NodeKind::Dir, 0, 0, 0o700);
+    // `/home` and `/etc` are created empty here and populated by the installer.
+    //
+    // The passwd database, the group database and the session user's home
+    // directory are system *configuration*, not kernel constants. Seeding them
+    // at boot meant the kernel carried a hardcoded user list that no one could
+    // change without rebuilding it, and `getpwuid` answered from a file the
+    // system had never actually set up. The installer owns them now: it runs as
+    // root, it is the first thing a user sees, and it is already the thing that
+    // decides hostname and keymap.
+    let _ = vfs::create_as("/home", vfs::NodeKind::Dir, 0, 0, 0o755);
+    let _ = vfs::create_as("/etc", vfs::NodeKind::Dir, 0, 0, 0o755);
     match vfs::create_as("/bin/busybox", vfs::NodeKind::File, 0, 0, 0o755) {
         Ok(node) => {
             // One `write_at`, not a loop: ramfs grows the file to fit, so this is
@@ -242,45 +252,6 @@ fn seed_userland() {
             }
         }
         Err(e) => log::kwarn!("userland: could not create /bin/busybox: {:?}", e),
-    }
-}
-
-/// Seed `/etc/passwd` and `/etc/group`.
-///
-/// Present because `id`, `whoami`, `groups` and the shell's own idea of where
-/// `$HOME` is all resolve the caller's name through the passwd database, and this
-/// port's mlibc reads that database out of this file. Without it those three
-/// applets abort on their first call rather than reporting that they have no name
-/// to report -- mlibc's `getpwnam` returning "not found" is not a thing a program
-/// checks for, so the failure is a panic rather than a message.
-///
-/// The entries have to describe the ids processes actually run as, which is the
-/// point of this change: they used to describe uid 0 while every process ran as
-/// [`crate::cred::DEFAULT_UID`] (1000). Nothing looked up uid 0, so `whoami`
-/// reported "unknown uid 1000", and fbterm's shell, which asks the passwd
-/// database for the login shell, silently fell through to its `/bin/sh`
-/// fallback. Both were symptoms of one wrong file, not two separate bugs.
-///
-/// The entries answer "who is calling", which is the only question anything here
-/// asks. There is no password field worth having, and a hash would be a
-/// credential for a system that has no way to log in. `nobody` is present
-/// because a program that drops privileges looks itself up afterwards and
-/// deserves a name to find.
-fn seed_passwd() {
-    let user = crate::cred::DEFAULT_UID;
-    let group = crate::cred::DEFAULT_GID;
-    let passwd = alloc::format!(
-        "root:x:0:0:root:/root:/bin/sh\n\
-         nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n\
-         samsara:x:{}:{}:Samsara user:/root:/bin/sh\n",
-        user, group
-    );
-    if let Ok(pw) = vfs::create("/etc/passwd", vfs::NodeKind::File) {
-        let _ = pw.write_at(0, passwd.as_bytes());
-    }
-    let groups = alloc::format!("root:x:0:\nnogroup:x:65534:\nsamsara:x:{}:\n", group);
-    if let Ok(gr) = vfs::create("/etc/group", vfs::NodeKind::File) {
-        let _ = gr.write_at(0, groups.as_bytes());
     }
 }
 

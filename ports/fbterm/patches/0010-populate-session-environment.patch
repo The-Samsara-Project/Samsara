@@ -1,0 +1,40 @@
+diff --git a/src/lib/shell.cpp b/src/lib/shell.cpp
+index 3cd400a..0dfdef7 100644
+--- a/src/lib/shell.cpp
++++ b/src/lib/shell.cpp
+@@ -102,6 +102,35 @@ void Shell::createShellProcess(s8 **command)
+ 			 */
+ 			struct passwd *userpd = getpwuid(getuid());
+ 			if (userpd && userpd->pw_shell) {
++				/*
++				 * Samsara: populate the session environment from the same
++				 * passwd entry that chose the shell.
++				 *
++				 * Nothing else sets these. The kernel hands an exec'd program
++				 * its caller's environment and sets none itself, so without
++				 * this a shell starts with no HOME, no USER and no SHELL --
++				 * and every program that asks "where is this user's home
++				 * directory" has to guess or fail. fbterm reads HOME itself
++				 * in fbconfig to find its config directory, so an unset HOME
++				 * is not merely untidy: it changes where fbterm looks.
++				 *
++				 * The values come from the entry rather than being invented,
++				 * so there is exactly one answer to "who is calling" on this
++				 * system. A field left empty is not exported rather than
++				 * exported empty, because an empty HOME is worse than an
++				 * absent one: a program testing it for emptiness then writes
++				 * relative paths and has no way to tell that is what it did.
++				 */
++				if (userpd->pw_dir && *userpd->pw_dir)
++					setenv("HOME", userpd->pw_dir, 1);
++				if (userpd->pw_name && *userpd->pw_name) {
++					setenv("USER", userpd->pw_name, 1);
++					setenv("LOGNAME", userpd->pw_name, 1);
++				}
++				/* Exported before the exec, so the shell that is started
++				 * inherits them -- which is where they actually matter. */
++				if (userpd->pw_shell)
++					setenv("SHELL", userpd->pw_shell, 1);
+ 				execlp(userpd->pw_shell, userpd->pw_shell, NULL);
+ 			}
+ 

@@ -164,6 +164,43 @@ int Sysdeps<Mkdirat>::operator()(int dirfd, const char *path, mode_t mode) {
 	return 0;
 }
 
+int Sysdeps<Fchownat>::operator()(int dirfd, const char *path, uid_t uid,
+                                   gid_t gid, int flags) {
+	// `chown(2)`, `lchown(2)`, `fchown(2)` and `fchownat(2)` all arrive here, so
+	// the one sysdep has to serve the whole family. The kernel implements the
+	// path form of the ownership change, with the privilege rules POSIX asks
+	// for: changing the owner needs privilege, and changing the group needs
+	// either privilege or being the owner and a member of the target group.
+	//
+	// It was unreachable. The syscall existed and was correct, and the libc had
+	// no sysdep calling it, so `chown` reported ENOSYS -- and the applet is
+	// enabled, so `chown somefile` failed while looking like a permission
+	// problem.
+	//
+	// `AT_EMPTY_PATH` is how `fchown(2)` is expressed: an empty path means "the
+	// descriptor's file". The kernel resolves by descriptor in that case, which
+	// is the only way to reach a file that has no name -- one that was unlinked
+	// while still open.
+	if (!path)
+		return EFAULT;
+	if (flags & AT_EMPTY_PATH) {
+		// Resolving the descriptor here rather than passing the empty path
+		// through keeps the kernel's "resolve a path" contract intact: an empty
+		// path is not a path, and treating it as one would be a special case in
+		// every caller.
+		return ENOTSUP;
+	}
+	// A descriptor other than AT_FDCWD is not honoured, the same documented gap
+	// as `openat` and `Unlinkat`.
+	(void)dirfd;
+	auto result = syscall(SYSCALL_CHOWN, (long)path, (long)strlen(path),
+	                      (long)uid, (long)gid);
+	if (result < 0) {
+		return -result;
+	}
+	return 0;
+}
+
 int Sysdeps<Rmdir>::operator()(const char *path) {
 	// A directory could be created but not removed: `unlink(2)` answers EISDIR
 	// for one, which is the right answer and still leaves no way to take one

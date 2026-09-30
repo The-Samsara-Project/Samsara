@@ -45,6 +45,10 @@ struct SamsaraSysdepTags :
 	Umask,
 	Chmod,
 	Fchmod,
+	// Ownership. See Sysdeps<Fchownat> in sysdeps.cpp: the kernel has always
+	// implemented the ownership change with the POSIX privilege rules, and
+	// nothing called it, so `chown` reported ENOSYS.
+	Fchownat,
 	Truncate,
 	Ftruncate,
 	// Directories.

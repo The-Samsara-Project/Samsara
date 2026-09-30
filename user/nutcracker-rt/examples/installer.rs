@@ -590,6 +590,58 @@ impl App {
     /// kernel rather than a forgotten edit.
     ///
     /// So: run busybox with stdout on a pipe, read the names, link each one.
+    /// Create the system's users: `/etc/passwd`, `/etc/group`, and a home
+    /// directory the session user actually owns.
+    ///
+    /// This was a kernel constant until now. The kernel seeded a passwd file at
+    /// boot, which made the user list something you could only change by
+    /// rebuilding the kernel, and left `getpwuid` answering from a database the
+    /// system had never actually been set up with. The kernel now creates
+    /// `/etc` and `/home` and leaves them empty.
+    ///
+    /// The installer is the right owner: it runs as root, it is the first thing
+    /// a person sees, and it is already what decides the hostname and keymap.
+    fn install_users(&mut self) {
+        const UID: u32 = 1000;
+        const GID: u32 = 1000;
+        const NAME: &str = "samsara";
+        let home = format!("/home/{}", NAME);
+
+        // The home directory is created before the passwd entry that names it,
+        // and owned by the user rather than by root. Pointing `$HOME` at a
+        // directory the session user cannot enter is worse than leaving it
+        // unset: every program that writes there fails in a way that looks like
+        // a full disk.
+        if let Err(e) = make_dir(&home, UID, GID, 0o755) {
+            println!("[installer] could not create {}: {}", home, e);
+            return;
+        }
+
+        // `x` in the password field means "look elsewhere", and there is nowhere
+        // to look: this system has no password store, so there is no credential
+        // here to protect and inventing a hash would be theatre. The consequence
+        // is stated rather than hidden -- see the login flow -- because a
+        // passwd file is exactly where someone would look to find out.
+        let passwd = format!(
+            "root:x:0:0:root:/root:/bin/sh\n\
+             nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n\
+             {name}:x:{uid}:{gid}:Samsara user:{home}:/bin/sh\n",
+            name = NAME,
+            uid = UID,
+            gid = GID,
+            home = home,
+        );
+        if let Err(e) = write_file("/etc/passwd", passwd.as_bytes()) {
+            println!("[installer] could not write /etc/passwd: {}", e);
+            return;
+        }
+        let group = format!("root:x:0:\nnogroup:x:65534:\n{name}:x:{gid}:\n", name = NAME, gid = GID);
+        if let Err(e) = write_file("/etc/group", group.as_bytes()) {
+            println!("[installer] could not write /etc/group: {}", e);
+        }
+        println!("[installer] user '{}' created, home {}", NAME, home);
+    }
+
     fn install_userland(&mut self) {
         let (rd, wr) = match syscall::pipe() {
             Ok(p) => p,
@@ -759,6 +811,22 @@ impl App {
         );
         syscall::proc_exit_code(0);
     }
+}
+
+/// Create a directory and hand it to `uid`:`gid`.
+///
+/// The ownership is set explicitly rather than inherited, because the caller
+/// runs as root and root's own id is not the one the directory is for.
+fn make_dir(path: &str, uid: u32, gid: u32, mode: u32) -> Result<(), String> {
+    // An existing directory is success, not failure: the installer may run more
+    // than once, and a second run should converge rather than complain.
+    if let Err(e) = syscall::mkdir(path, mode) {
+        if e != -17 {
+            // EEXIST
+            return Err(format!("mkdir {}: {}", path, e));
+        }
+    }
+    syscall::chown(path, uid, gid).map_err(|e| format!("chown {}: {}", path, e))
 }
 
 /// Read a pipe to end-of-file and return its non-empty lines.
@@ -1342,6 +1410,14 @@ pub extern "C" fn _start() -> ! {
         "[installer] framebuffer {}x{} @{}bpp, keys via {}",
         app.fb.width, app.fb.height, app.fb.pxsize * 8, KEY_SLAVE
     );
+    // Users exist from here on, not at the handoff.
+    //
+    // Creating them at the handoff was too late by exactly as much as it
+    // mattered: the self-tests are menu entries, so they run during setup, long
+    // before the display changes hands, and `whoami` failed for the whole of
+    // the session a user spends in the wizard. A system has its users before
+    // anyone starts using it.
+    app.install_users();
     // Own the display before painting anything.
     let _ = syscall::console_detach();
     app.fb.clear(app.fb.packed(BLACK));
