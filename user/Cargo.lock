@@ -17,6 +17,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "installer"
+version = "0.1.0"
+dependencies = [
+ "nutcracker-rt",
+]
+
+[[package]]
 name = "nutcracker-rt"
 version = "0.1.0"
 

@@ -4,7 +4,7 @@ SAMSARA / NUTCRACKER
   <img src="samsara.svg" width="200" height="200" style="border-radius: 50%; object-fit: cover;">
 </div>
 
-A 64-bit micro-kernel written in Rust. Copyright (C) 2026 Harsh Nikarsa.
+A 64-bit micro-kernel-based operating system and kernel written in Rust. Copyright (C) 2026 Harsh Nikarsa.
 Licensed under the GNU GPL v3 or later, see LICENSE.
 
 * Samsara is the kernel: the micro-kernel described throughout this file.

@@ -253,6 +253,23 @@ fn seed_userland() {
         }
         Err(e) => log::kwarn!("userland: could not create /bin/busybox: {:?}", e),
     }
+
+    // `/bin/getty` is this system's own login program rather than a busybox
+    // applet, so it is seeded as a real image for the same reason busybox is.
+    //
+    // It has to be a real file rather than a link into busybox: the session's
+    // login shell *is* `/bin/getty` -- that is what the passwd database names --
+    // so a link would make every terminal run an applet that is not compiled in.
+    // The symptom would be a terminal that comes up and then does nothing, which
+    // reads as a broken login rather than a missing one.
+    let getty = crate::user::PROGRAMS[crate::user::PROG_GETTY].image;
+    if let Ok(node) = vfs::create_as("/bin/getty", vfs::NodeKind::File, 0, 0, 0o755) {
+        if let Err(e) = node.write_at(0, getty) {
+            log::kwarn!("userland: /bin/getty write failed: {:?}", e);
+        } else {
+            log::kdebug!("userland: /bin/getty seeded, {} bytes", getty.len());
+        }
+    }
 }
 
 /// Log the active framebuffer console's grid size, if one is up.
