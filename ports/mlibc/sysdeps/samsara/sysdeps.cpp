@@ -164,16 +164,111 @@ int Sysdeps<Mkdirat>::operator()(int dirfd, const char *path, mode_t mode) {
 	return 0;
 }
 
+int Sysdeps<Rmdir>::operator()(const char *path) {
+	// A directory could be created but not removed: `unlink(2)` answers EISDIR
+	// for one, which is the right answer and still leaves no way to take one
+	// away. `mkdtemp(3)` is built on `rmdir`, so every program wanting a
+	// scratch directory had none.
+	//
+	// The leading AT_FDCWD is not decoration. The kernel's `rmdir` takes the
+	// same `(dirfd, path, len)` triple as `unlink` so the two share one shape,
+	// and every caller in the libc passes no descriptor at all. Omitting it
+	// shifts every argument along by one, and the kernel then reads the path
+	// pointer as the descriptor.
+	if (!path)
+		return EFAULT;
+	auto result = syscall(SYSCALL_RMDIR, (long)AT_FDCWD, (long)path,
+	                      (long)strlen(path));
+	if (result < 0) {
+		return -result;
+	}
+	return 0;
+}
+
+int Sysdeps<Rename>::operator()(const char *old_path, const char *new_path) {
+	if (!old_path || !new_path)
+		return EFAULT;
+	// The kernel moves the directory entry and leaves the file alone, so a
+	// program that writes a temporary name and renames it into place never
+	// exposes a half-written file under the real name.
+	// The kernel takes both descriptors so `renameat` needs no separate
+	// syscall; see `Rmdir` for why the leading AT_FDCWD is not decoration.
+	auto result = syscall(SYSCALL_RENAME, (long)AT_FDCWD, (long)old_path,
+	                      (long)strlen(old_path), (long)AT_FDCWD, (long)new_path,
+	                      (long)strlen(new_path));
+	if (result < 0) {
+		return -result;
+	}
+	return 0;
+}
+
+int Sysdeps<Renameat>::operator()(int olddirfd, const char *old_path,
+                                   int newdirfd, const char *new_path) {
+	// Only AT_FDCWD resolves here, which is what every caller in the libc
+	// passes. See `Unlinkat` for the same documented gap.
+	(void)olddirfd;
+	(void)newdirfd;
+	if (!old_path || !new_path)
+		return EFAULT;
+	// The kernel moves the directory entry and leaves the file alone, so a
+	// program that writes a temporary name and renames it into place never
+	// exposes a half-written file under the real name.
+	// The kernel takes both descriptors so `renameat` needs no separate
+	// syscall; see `Rmdir` for why the leading AT_FDCWD is not decoration.
+	auto result = syscall(SYSCALL_RENAME, (long)AT_FDCWD, (long)old_path,
+	                      (long)strlen(old_path), (long)AT_FDCWD, (long)new_path,
+	                      (long)strlen(new_path));
+	if (result < 0) {
+		return -result;
+	}
+	return 0;
+}
+
+int Sysdeps<Link>::operator()(const char *old_path, const char *new_path) {
+	if (!old_path || !new_path)
+		return EFAULT;
+	// Both names resolve to one node rather than to a copy, so a file written
+	// through either is visible through the other.
+	// Both descriptors are passed for the same reason as in `Rename`.
+	auto result = syscall(SYSCALL_LINK, (long)AT_FDCWD, (long)old_path,
+	                      (long)strlen(old_path), (long)AT_FDCWD, (long)new_path,
+	                      (long)strlen(new_path));
+	if (result < 0) {
+		return -result;
+	}
+	return 0;
+}
+
+int Sysdeps<Linkat>::operator()(int olddirfd, const char *old_path, int newdirfd,
+                                 const char *new_path, int flags) {
+	// `flags` is discarded. `AT_SYMLINK_FOLLOW` asks for a link to the target
+	// rather than to the link, and the kernel already follows, so the two
+	// spellings of the same request give the same answer here.
+	(void)olddirfd;
+	(void)newdirfd;
+	(void)flags;
+	if (!old_path || !new_path)
+		return EFAULT;
+	// Both descriptors are passed for the same reason as in `Rename`.
+	auto result = syscall(SYSCALL_LINK, (long)AT_FDCWD, (long)old_path,
+	                      (long)strlen(old_path), (long)AT_FDCWD, (long)new_path,
+	                      (long)strlen(new_path));
+	if (result < 0) {
+		return -result;
+	}
+	return 0;
+}
+
 int Sysdeps<Unlinkat>::operator()(int dirfd, const char *path, int flags) {
 	// AT_FDCWD (-100) is the "resolve against my working directory" sentinel,
 	// which is what every caller in the libc passes. The kernel has no
 	// directory-relative resolution, so a real `dirfd` is not honored -- the
 	// same documented gap as `openat`.
 	//
-	// `flags` is discarded, and that is a real gap rather than a formality:
-	// `AT_REMOVEDIR` is how `rmdir(2)` is expressed, so a caller asking to
-	// remove a directory gets ENOTEMPTY from `unlink` instead. Directories
-	// cannot be removed on this system yet.
+	// `flags` is discarded. `AT_REMOVEDIR` is how a directory removal is
+	// expressed here, and the kernel distinguishes the two, but the libc routes
+	// `rmdir(2)` through the `Rmdir` tag above, so nothing arrives here asking
+	// for a directory to be removed through this path.
 	(void)flags;
 	if (!path)
 		return EFAULT;

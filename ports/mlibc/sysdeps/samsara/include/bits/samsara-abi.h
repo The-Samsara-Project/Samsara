@@ -73,7 +73,13 @@
  * floor. `SYSCALL_DUP` is the same operation without the floor, and it returns
  * the lowest free descriptor -- normally 0-2, which is exactly what a shell
  * calling this is trying to move a descriptor away from. */
+#define SYSCALL_RMDIR           96
+#define SYSCALL_RENAME          97
+#define SYSCALL_LINK            98
 #define SYSCALL_DUPFD          95
+#define SYSCALL_RMDIR          96
+#define SYSCALL_RENAME         97
+#define SYSCALL_LINK           98
 /* `symlink(2)`: the link's contents are the target, stored verbatim. Recorded
  * rather than resolved, because a relative target is meaningless without knowing
  * the directory the link sits in -- resolving at creation time produces a link

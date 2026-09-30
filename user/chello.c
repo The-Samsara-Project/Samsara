@@ -314,6 +314,76 @@ int main(int argc, char **argv) {
 		      "mkdir on an existing directory is EEXIST");
 	}
 
+	// rmdir(2), rename(2) and link(2).
+	//
+	// `unlink` answers EISDIR for a directory, which is right but leaves a
+	// system with no way to remove one -- and `mkdtemp`, which every build that
+	// wants a scratch directory needs, is built on `rmdir`. `rename` is what
+	// makes "write a temporary file, then put it in place" possible, and `link`
+	// is how two names share one file. All three were absent.
+	{
+		int ok = mkdir("/tmp/chello-rm", 0755) == 0;
+		int fd = ok ? open("/tmp/chello-rm/f", O_WRONLY | O_CREAT, 0644) : -1;
+		if (fd >= 0) {
+			ssize_t w = write(fd, "data\n", 5);
+			close(fd);
+			ok = ok && (w == 5);
+		} else {
+			ok = 0;
+		}
+		// A directory with something in it is not removed, and says so
+		// distinctly: ENOTEMPTY tells a caller "in the way", EEXIST would
+		// only tell it "already there", and a caller cannot retry its way out
+		// of the second one.
+		check(ok && rmdir("/tmp/chello-rm") == -1 && errno == ENOTEMPTY,
+		      "rmdir on a non-empty directory is ENOTEMPTY");
+		unlink("/tmp/chello-rm/f");
+		check(ok && rmdir("/tmp/chello-rm") == 0, "rmdir removes an empty directory");
+		struct stat gone;
+		check(stat("/tmp/chello-rm", &gone) == -1 && errno == ENOENT,
+		      "the removed directory is gone");
+		// rmdir on a plain file is the wrong call, not a permission problem.
+		fd = open("/tmp/chello-plain", O_WRONLY | O_CREAT, 0644);
+		if (fd >= 0) {
+			ssize_t w = write(fd, "xy\n", 3);
+			close(fd);
+			ok = (w == 3);
+		} else {
+			ok = 0;
+		}
+		check(ok && rmdir("/tmp/chello-plain") == -1 && errno == ENOTDIR,
+		      "rmdir on a file is ENOTDIR");
+		// rename(2): the file keeps its contents under the new name and the
+		// old name stops resolving.
+		check(ok && rename("/tmp/chello-plain", "/tmp/chello-moved") == 0, "rename");
+		char rb[8] = {0};
+		int rfd = open("/tmp/chello-moved", O_RDONLY, 0);
+		int rn = rfd >= 0 ? read(rfd, rb, sizeof(rb) - 1) : -1;
+		if (rfd >= 0)
+			close(rfd);
+		check(ok && rn == 3 && strcmp(rb, "xy\n") == 0, "rename keeps the contents");
+		check(stat("/tmp/chello-plain", &gone) == -1, "the old name is gone");
+		// A rename onto an occupied name is refused rather than silently
+		// replacing what was there.
+		fd = open("/tmp/chello-occupied", O_WRONLY | O_CREAT, 0644);
+		if (fd >= 0)
+			close(fd);
+		check(rename("/tmp/chello-moved", "/tmp/chello-occupied") == -1 &&
+		      errno == EEXIST,
+		      "rename onto an existing name is EEXIST");
+		// link(2): a second name for the same file, sharing its contents.
+		check(link("/tmp/chello-moved", "/tmp/chello-hard") == 0, "link");
+		int hfd = open("/tmp/chello-hard", O_RDONLY, 0);
+		char hb[8] = {0};
+		int hn = hfd >= 0 ? read(hfd, hb, sizeof(hb) - 1) : -1;
+		if (hfd >= 0)
+			close(hfd);
+		check(hn == 3 && strcmp(hb, "xy\n") == 0, "the hard link reads the same data");
+		unlink("/tmp/chello-hard");
+		unlink("/tmp/chello-moved");
+		unlink("/tmp/chello-occupied");
+	}
+
 	// lseek(2) on a real file, and the ESPIPE contract on a stream. Both matter
 	// to stdio: it calls lseek to decide whether a stream can be repositioned
 	// and picks its buffering strategy from the answer, so a wrong answer here

@@ -696,6 +696,19 @@ pub trait Vnode: Send + Sync {
     fn remove_child(&self, _name: &str) -> Result<(), FsError> {
         Err(FsError::NotSupported)
     }
+    /// Publish an *existing* node under a new name in this directory.
+    ///
+    /// This is what `rename(2)` and `link(2)` are made of: neither creates
+    /// anything, they move an existing node's name from one directory to
+    /// another, or give it a second name. Keeping the node and moving only the
+    /// entry is what makes a rename atomic from a reader's point of view, and
+    /// what makes a hard link share one inode rather than copy the file.
+    ///
+    /// A filesystem that cannot express this -- one where every path is a
+    /// distinct object -- leaves the default.
+    fn attach_child(&self, _name: &str, _node: VnodeRef) -> Result<(), FsError> {
+        Err(FsError::NotSupported)
+    }
     /// Permission mode bits (see the `S_*` constants). `0` = no metadata.
     fn mode(&self) -> u32 {
         0

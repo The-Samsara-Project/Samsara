@@ -329,6 +329,25 @@ impl Vnode for RamNode {
         }
     }
 
+    fn attach_child(&self, name: &str, node: VnodeRef) -> Result<(), FsError> {
+        match &self.inner {
+            Inner::Dir(d) => {
+                let mut kids = d.children.lock();
+                // Refuse to clobber. `rename` and `link` check for this first and
+                // report `EEXIST`; a filesystem that silently replaced the entry
+                // would turn "the name is taken" into "something you had open is
+                // now a different file", which is the one outcome neither caller
+                // can detect.
+                if kids.contains_key(name) {
+                    return Err(FsError::Exists);
+                }
+                kids.insert(String::from(name), node);
+                Ok(())
+            }
+            Inner::File(_) | Inner::Symlink(_) => Err(FsError::NotADirectory),
+        }
+    }
+
     fn size_hint(&self) -> u64 {
         match &self.inner {
             Inner::File(f) => f.data.lock().len() as u64,

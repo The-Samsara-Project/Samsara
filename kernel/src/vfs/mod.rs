@@ -781,6 +781,92 @@ pub fn remove_checked(
     Ok((dir,))
 }
 
+/// Move the entry at `old` to `new`, keeping the node it names.
+///
+/// This is `rename(2)`. The node is not touched: only the directory entry moves,
+/// which is what makes a rename safe to use for "write a temporary file, then
+/// put it in place" -- a reader either sees the old name or the new one, never
+/// a half-written file under either.
+///
+/// The source is removed only once the new name is in place, so a failure part
+/// way through leaves the original where it was rather than losing it.
+pub fn rename_checked(
+    old: &str,
+    new: &str,
+    cred: &crate::cred::Credentials,
+) -> Result<(VnodeRef, VnodeRef), FsError> {
+    let (old_parent, old_name) = split_entry(old)?;
+    let (new_parent, new_name) = split_entry(new)?;
+    let from = resolve_checked(&old_parent, cred)?;
+    let to = resolve_checked(&new_parent, cred)?;
+    if to.kind() != NodeKind::Dir {
+        return Err(FsError::NotADirectory);
+    }
+    let node = from.lookup(&old_name)?;
+    // A caller that replaces a file must be able to, and must have said so with
+    // its own flags; this ABI has none, so an occupied destination is refused
+    // rather than silently overwritten.
+    if to.lookup(&new_name).is_ok() {
+        return Err(FsError::Exists);
+    }
+    to.attach_child(&new_name, node.clone())?;
+    match from.remove_child(&old_name) {
+        Ok(()) => Ok((from, to)),
+        Err(e) => {
+            // The new name is in place but the old one could not be taken back.
+            // Undo, so a failed rename leaves nothing half-done.
+            let _ = to.remove_child(&new_name);
+            Err(e)
+        }
+    }
+}
+
+/// Give the node at `old` a second name at `new`.
+///
+/// This is `link(2)`. Both names resolve to the same node, so a file written
+/// through one is visible through the other -- which is the point, and why this
+/// is not a copy.
+pub fn link_checked(
+    old: &str,
+    new: &str,
+    cred: &crate::cred::Credentials,
+) -> Result<(VnodeRef, VnodeRef), FsError> {
+    let (new_parent, new_name) = split_entry(new)?;
+    let to = resolve_checked(&new_parent, cred)?;
+    if to.kind() != NodeKind::Dir {
+        return Err(FsError::NotADirectory);
+    }
+    // `resolve` follows a final symlink, which is right for "the file this name
+    // refers to". Resolving the source is what makes a link to a link point at
+    // the file rather than at the link.
+    let node = resolve_checked(old, cred)?;
+    if node.kind() == NodeKind::Dir {
+        return Err(FsError::AccessDenied);
+    }
+    if to.lookup(&new_name).is_ok() {
+        return Err(FsError::Exists);
+    }
+    to.attach_child(&new_name, node.clone())?;
+    Ok((node, to))
+}
+
+/// Split an absolute path into the parent directory and the entry name.
+///
+/// `.` and `..` are not entries in this filesystem's tables, and a name that is
+/// empty addresses nothing, so both are reported as absent rather than resolved.
+fn split_entry(path: &str) -> Result<(String, String), FsError> {
+    let norm = normalize_abs(path);
+    let (parent, name) = match norm.rfind('/') {
+        Some(0) => ("/", &norm[1..]),
+        Some(pos) => (&norm[..pos], &norm[pos + 1..]),
+        None => return Err(FsError::NotFound),
+    };
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(FsError::NotFound);
+    }
+    Ok((String::from(parent), String::from(name)))
+}
+
 /// Open (or create for files) a path and install it in `task`'s table.
 pub fn open_fd(task_id: usize, path: &str, kind: NodeKind) -> Result<usize, FsError> {
     let node = resolve(path).or_else(|e| match e {

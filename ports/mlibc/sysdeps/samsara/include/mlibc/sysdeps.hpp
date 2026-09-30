@@ -52,6 +52,16 @@ struct SamsaraSysdepTags :
 	ReadEntries,
 	Mkdir,
 	Mkdirat,
+	// Directory removal, renaming and hard links. See Sysdeps<Rmdir> in
+	// sysdeps.cpp: without these a directory could be created but never
+	// removed, `mkdtemp` had nothing to build on, and a program that writes a
+	// temporary file and renames it into place -- the safe way to replace a
+	// file -- could not.
+	Rmdir,
+	Rename,
+	Renameat,
+	Link,
+	Linkat,
 	// Time.
 	ClockGet,
 	ClockSet,

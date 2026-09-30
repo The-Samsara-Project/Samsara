@@ -54,6 +54,12 @@ pub mod errno {
     pub const ENOTDIR: i64 = -20;
     /// Is a directory where a file was required (POSIX `EISDIR`).
     pub const EISDIR: i64 = -21;
+    /// Directory not empty (POSIX `ENOTEMPTY`).
+    ///
+    /// Distinct from `EEXIST` so a caller can tell "something is already there"
+    /// from "something is there and is in the way", which is the difference
+    /// between retrying and giving up.
+    pub const ENOTEMPTY: i64 = -39;
     /// Broken pipe: a write with no reader end open.
     pub const EPIPE: i64 = -32;
     /// Function not implemented.
@@ -514,6 +520,30 @@ pub mod nr {
     /// tty; job control turned off" and stayed that way for the whole session,
     /// on a terminal that worked.
     pub const DUPFD: u64 = 95;
+    /// Remove a directory: `(dirfd, path, path_len) -> 0`.
+    ///
+    /// `unlink(2)` answers `EISDIR` for a directory, which is the right answer
+    /// but leaves a system with no way to remove one at all. `rmdir(2)` is what
+    /// fills that gap, and `mkdtemp(3)` -- which every build that wants a
+    /// scratch directory needs -- is built on it.
+    ///
+    /// Fails with `ENOTEMPTY` when the directory still has entries, so a
+    /// recursive removal is the caller's decision to make rather than something
+    /// a single call does behind its back.
+    pub const RMDIR: u64 = 96;
+    /// Rename a file or directory: `(oldfd, old, old_len, newfd, new, new_len) -> 0`.
+    ///
+    /// `mv(2)` is this, and so is every build step that renames a file it just
+    /// wrote. Without it a program that writes to a temporary name and renames
+    /// it into place -- the safe way to replace a file, because a reader never
+    /// sees a half-written one -- has no way to do that and must write in place
+    /// instead.
+    pub const RENAME: u64 = 97;
+    /// Hard link: `(oldfd, old, old_len, newfd, new, new_len) -> 0`.
+    ///
+    /// A second name for an existing file, which is how a program publishes
+    /// something that several readers can share without copying it.
+    pub const LINK: u64 = 98;
     /// First number reserved for out-of-tree/experimental use.
     pub const EXPERIMENTAL_BASE: u64 = 0x8000_0000_0000_0000;
 }
@@ -819,6 +849,9 @@ pub fn register_defaults() {
     register(nr::DUP2, sys_dup2);
     register(nr::PSELECT6, sys_pselect6);
     register(nr::MKDIR, sys_mkdir);
+    register(nr::RMDIR, sys_rmdir);
+    register(nr::RENAME, sys_rename);
+    register(nr::LINK, sys_link);
     register(nr::SHM_CREATE, sys_shm_create);
     register(nr::SHM_MAP, sys_shm_map);
     register(nr::SHM_DESTROY, sys_shm_destroy);
@@ -3341,6 +3374,126 @@ fn sys_unlink(dirfd: u64, path: u64, path_len: u64, _a4: u64, _a5: u64, _a6: u64
         }
     }
     match crate::vfs::remove_checked(&abs, &cred) {
+        Ok(_) => 0,
+        Err(e) => e.into(),
+    }
+}
+
+fn sys_rmdir(dirfd: u64, path: u64, path_len: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    const AT_FDCWD: i64 = -100;
+    let fd = dirfd as i64;
+    if fd != AT_FDCWD && fd < 0 {
+        return errno::EBADF;
+    }
+    let path = match user_str(path, path_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let cred = crate::cred::get(task);
+    let abs = task_abs_path(&path);
+    // `rmdir` on something that is not a directory is ENOTDIR, which is what
+    // tells a caller it used the wrong call rather than that the file is
+    // protected.
+    let node = match crate::vfs::resolve_checked(&abs, &cred) {
+        Ok(n) => n,
+        Err(e) => return e.into(),
+    };
+    if node.kind() != crate::vfs::NodeKind::Dir {
+        return errno::ENOTDIR;
+    }
+    // A directory that still has entries is not removed. Recursing here instead
+    // would delete a tree the caller may not have meant to delete, and would do
+    // it in a half-finished state if it ran out of room partway.
+    match node.list() {
+        Ok(entries) if !entries.is_empty() => return errno::ENOTEMPTY,
+        Ok(_) => {}
+        Err(e) => return e.into(),
+    }
+    match crate::vfs::remove_checked(&abs, &cred) {
+        Ok(_) => 0,
+        Err(e) => e.into(),
+    }
+}
+
+fn sys_rename(
+    oldfd: u64,
+    old: u64,
+    old_len: u64,
+    newfd: u64,
+    new: u64,
+    new_len: u64,
+) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    const AT_FDCWD: i64 = -100;
+    for f in [oldfd as i64, newfd as i64] {
+        if f != AT_FDCWD && f < 0 {
+            return errno::EBADF;
+        }
+    }
+    let old_path = match user_str(old, old_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let new_path = match user_str(new, new_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let cred = crate::cred::get(task);
+    let old_abs = task_abs_path(&old_path);
+    let new_abs = task_abs_path(&new_path);
+    match crate::vfs::rename_checked(&old_abs, &new_abs, &cred) {
+        Ok(_) => 0,
+        Err(e) => e.into(),
+    }
+}
+
+fn sys_link(
+    oldfd: u64,
+    old: u64,
+    old_len: u64,
+    newfd: u64,
+    new: u64,
+    new_len: u64,
+) -> i64 {
+    let task = match current_task() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    const AT_FDCWD: i64 = -100;
+    for f in [oldfd as i64, newfd as i64] {
+        if f != AT_FDCWD && f < 0 {
+            return errno::EBADF;
+        }
+    }
+    let old_path = match user_str(old, old_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let new_path = match user_str(new, new_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let cred = crate::cred::get(task);
+    let old_abs = task_abs_path(&old_path);
+    let new_abs = task_abs_path(&new_path);
+    let node = match crate::vfs::resolve_checked(&old_abs, &cred) {
+        Ok(n) => n,
+        Err(e) => return e.into(),
+    };
+    // A hard link to a directory would create a second route into the tree and
+    // make a cycle the resolver cannot answer, so it is refused the way it is on
+    // every other system.
+    if node.kind() == crate::vfs::NodeKind::Dir {
+        return errno::EPERM;
+    }
+    match crate::vfs::link_checked(&old_abs, &new_abs, &cred) {
         Ok(_) => 0,
         Err(e) => e.into(),
     }
