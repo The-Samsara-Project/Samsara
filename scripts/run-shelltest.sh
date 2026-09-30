@@ -254,7 +254,11 @@ sleep 2
 # an unterminated line, so the screen never scrolls and the test reports a frozen
 # terminal that was never asked to do anything.
 key ret
-sleep 8
+# Long enough for the command to start, produce its output and redraw. Typing
+# alone takes 32 * 0.35s, and `ls` does not run until the final Enter, so a wait
+# sized for the typing rather than for the command photographs the screen before
+# the output exists -- which looks exactly like output that never came.
+sleep 15
 shot 08-scroll
 echo "--- every row the terminal still has, top to bottom ---"
 decode "$SHOTS/08-scroll.ppm"
