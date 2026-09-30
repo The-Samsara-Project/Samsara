@@ -175,10 +175,22 @@ fn keycode_for(ch: u8, mods: u8) -> Option<u16> {
 /// punctuation is looked at twice.
 fn punctuation(ch: u8, shift: bool) -> Option<u16> {
     Some(match (ch, shift) {
-        (b'-', false) => KEY_MINUS,
-        (b'-', true) | (b'_', _) => KEY_MINUS - 1,
-        (b'=', false) => KEY_EQUAL,
-        (b'=', true) | (b'+', _) => KEY_EQUAL - 1,
+        // Both `-` and `_` are the *same physical key*, and the shift state is
+        // what tells them apart -- that is the whole point of a shifted
+        // character, and it is how the user-space keymap in inputd reads it
+        // (key 0x0C is `-` unshifted and `_` shifted).
+        //
+        // These used to return `KEY_MINUS - 1` and `KEY_EQUAL - 1` for the
+        // shifted forms, on the theory that a second character needed a second
+        // key. It does not: `- 1` is 11, which is the `0` key, and `=` - 1 is
+        // 12, which is the `-` key. So pressing shift and `-` reported a `0`
+        // keypress, the keymap looked that up, found `0`, and typed a zero.
+        // Shift-minus therefore typed a `0` and underscore typed a `-` -- which
+        // is why a command line looked as though it had no dashes in it. The
+        // `- 1` idiom is right for the digit row, where `!` really is the key
+        // below `1`, and wrong here.
+        (b'-', _) | (b'_', _) => KEY_MINUS,
+        (b'=', _) | (b'+', _) => KEY_EQUAL,
         (b'[', _) | (b'{', _) => KEY_LEFTBRACE,
         (b']', _) | (b'}', _) => KEY_RIGHTBRACE,
         (b'\\', _) | (b'|', _) => KEY_BACKSLASH,
