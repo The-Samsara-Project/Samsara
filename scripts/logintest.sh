@@ -154,48 +154,22 @@ PY
 }
 
 say "booting"
-wait_for "setup wizard online" 90 || fail "installer did not start"
-sleep 3
-shot 00-intro
-
-# --- installer: reach the password prompt -------------------------------
-# The wizard's steps differ from run-shelltest.sh's because this script also has
-# to type a password, so the key sequence is the short one plus the new prompt.
-say "walking the installer"
-# The welcome screen consumes one key, and any key -- so the number that selects
-# a menu entry has to wait until the menu is actually up, or it is eaten here.
-# That is why this sends the key that leaves Welcome, then *waits* for the menu
-# rather than following it immediately.
-key ret; sleep 2
-shot 01-wizard
-
-# Menu entry 7 is "Live boot (try it without installing)". Choosing it goes
-# straight to the summary, with nothing installed and no password to type.
-key 7; sleep 2
-shot 01b-live
-key ret; sleep 2
-
-say "finishing setup"
-# The password screen hands over to the summary, and the summary's Enter is what
-# runs the final self-test pass, populates /bin and starts the terminal.
+# There is no installer any more: the system comes up on a login prompt.
 #
-# The wait is on the log line rather than a sleep, because the self-test pass
-# takes minutes and a fixed sleep either wastes that time or cuts it short --
-# and cutting it short looks exactly like a login that never appeared.
-# One Enter confirms the summary and hands the display over. The self-test pass
-# is off in a live session, so there is no second confirmation to wait for.
-key ret; sleep 3
-if ! wait_for "handing the display to fbterm" 120; then
-    fail "the installer never handed the display to the terminal"
-fi
-# The terminal then runs the getty, which prints its prompt. Wait for that too
-# rather than assuming a fixed delay is long enough.
-wait_for "Samsara login" 60 || true
-sleep 6
+# The wait is on the terminal emulator starting, not on the prompt text. The
+# prompt goes to the terminal now rather than to the console, so it is not in
+# the serial log for a wait_for to match -- and it appears on the framebuffer
+# only once fbterm is up and drawing, which is what has to have happened first.
+# Short: the terminal is spawned by the kernel a few milliseconds after the
+# boot servers, so it is either up by now or not coming. Waiting 150s for
+# something that happens in the first second only hides a failure behind a
+# timeout.
+wait_for "staged \"fbterm\"" 20 || fail "the terminal emulator did not start"
+sleep 4
 shot 04-prompt
 
 echo
-echo "--- the screen after the handoff ---"
+echo "--- the screen after boot ---"
 decode "$SHOTS/04-prompt.ppm" | tail -8
 
 # 1. A login prompt, not a shell.
