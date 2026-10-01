@@ -398,6 +398,31 @@ pub fn spawn_program(index: usize) -> Result<crate::task::TaskId, i32> {
     spawn_program_args(index, alloc::vec::Vec::new(), None)
 }
 
+/// Spawn a program as uid 0 rather than as the default session user.
+///
+/// For the boot-time setup steps, which write into directories the session user
+/// has no business writing: `/bin` is root-owned and mode 0755, so a program
+/// running as uid 1000 cannot create a link in it. The programs used this way are
+/// the embedded images the kernel chose to run at boot, not anything a session
+/// asked for.
+pub fn spawn_program_args_as_root(
+    index: usize,
+    args: Vec<String>,
+) -> Result<crate::task::TaskId, i32> {
+    let as_root = match index {
+        // A table entry that is already privileged needs nothing done to it.
+        i if PROGRAMS[i].root => i,
+        _ => {
+            let Ok(task) = spawn_program_args(index, args, None) else {
+                return Err(-9);
+            };
+            crate::cred::seed_root(task.0);
+            return Ok(task);
+        }
+    };
+    spawn_program_args(as_root, args, None)
+}
+
 /// Spawn a program whose three standard descriptors are a terminal rather than
 /// the console. For the login prompt, which has to be on the display a person is
 /// looking at.
@@ -587,6 +612,33 @@ pub fn start_first_user() {
             return;
         }
     };
+
+    // Make the applet links, before anything that needs one runs.
+    //
+    // `/bin/ls` and the rest are all this one busybox image reached by name, and
+    // busybox makes the links itself: `busybox --install -s /bin` readslinks its
+    // own exec path, so spawning it as `/bin/busybox` is the whole of the
+    // wiring. The list of names lives in busybox's generated applet table, so
+    // asking busybox is the only way to get one that is not a second copy which
+    // goes stale the moment the port's config changes.
+    //
+    // Without this, `/bin` holds three real images and no commands at all, and
+    // every command a person types fails -- which is what removing the installer
+    // did, since it used to run this.
+    if let Ok(tid) = spawn_program_args_as_root(
+        PROG_BUSYBOX,
+        alloc::vec![
+            alloc::string::String::from("/bin/busybox"),
+            alloc::string::String::from("--install"),
+            alloc::string::String::from("-s"),
+            alloc::string::String::from("/bin"),
+        ],
+    ) {
+        // Reaped but not waited on: this runs once at boot and nothing else at
+        // this point depends on it having *finished*, only on it having started.
+        // The links appear as it writes them.
+        let _ = tid;
+    }
 
     // Stop the kernel console painting over the display.
     //
