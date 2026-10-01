@@ -186,9 +186,14 @@ pub extern "C" fn kmain(magic: u32, mbi_phys: u64) -> ! {
     // `getpwnam` -- which parses one entry per line -- found no entry it could
     // use. Every login was refused with "Login incorrect": a password file
     // with no newlines in it, written by code that read as though it had them.
+    // The seven fields a passwd entry has: name, password, uid, gid, gecos,
+    // home directory, login shell. All seven are here and in that order --
+    // `getpwnam` parses by position, so an entry missing any of them is not
+    // "root with some fields unset", it is not an entry at all.
     let passwd = concat!(
         "root:$6$YI2UVUNzKgLmxLfg$jmzW2NRFInnlcZGLYmZnsH83BkzEaMWsMgaF6pKH.",
-        "8kb8ezuUjoVQJ8RQMyvORjhNMeEbPCymdOlUMZQO4Kh41\n",
+        "8kb8ezuUjoVQJ8RQMyvORjhNMeEbPCymdOlUMZQO4Kh41",
+        ":0:0:root:/root:/bin/sh\n",
         "nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n",
     )
     .as_bytes();
