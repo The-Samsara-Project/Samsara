@@ -55,6 +55,9 @@ const PROG_POLLTEST: u64 = 8;
 const PROG_CHELLO: u64 = 12;
 /// `fbterm`, the ported Linux terminal emulator. The installer hands it the
 /// display when setup finishes; see the `handoff` method.
+/// `getty`, the login prompt. The kernel seeds it as root, because a getty
+/// has to be able to become whoever logs in.
+const PROG_GETTY: u64 = 15;
 const PROG_FBTERM: u64 = 13;
 /// `mkpasswd`, which turns a typed password into a `crypt(3)` hash.
 const PROG_MKPASSWD: u64 = 14;
@@ -63,7 +66,7 @@ const PROG_BUSYBOX: u64 = 16;
 
 /// Every (program name, index) pair this crate spawns, for the compile-time
 /// check against the kernel's table below.
-const SPAWNED: [(&str, usize); 10] = [
+const SPAWNED: [(&str, usize); 11] = [
     ("forkx", PROG_FORKX as usize),
     ("pipetest", PROG_PIPETEST as usize),
     ("credtst", PROG_CREDTST as usize),
@@ -72,6 +75,7 @@ const SPAWNED: [(&str, usize); 10] = [
     ("polltest", PROG_POLLTEST as usize),
     ("chello", PROG_CHELLO as usize),
     ("fbterm", PROG_FBTERM as usize),
+    ("getty", PROG_GETTY as usize),
     ("mkpasswd", PROG_MKPASSWD as usize),
     ("busybox", PROG_BUSYBOX as usize),
 ];
@@ -1145,10 +1149,22 @@ impl App {
         if !self.live_boot {
             self.install_userland();
         }
-        // 1. The child reads keys from the pty, so give it the pty on stdin.
+        // 1. Give the terminal to the programs that are about to start.
+        //
+        // All three standard descriptors, not just stdin. The getty prompts on
+        // fd 1 and reads on fd 0, so a pty on stdin alone leaves it writing its
+        // prompt to the kernel console -- which is exactly what happened: the
+        // screen showed nothing and "Samsara login:" turned up in the serial
+        // log instead, where a person cannot see it.
+        //
+        // The pty is also put back on stdout and stderr afterwards, because the
+        // installer keeps reporting what it is doing and that has nowhere else
+        // useful to go once the framebuffer has changed hands.
         let pts = self.pts;
-        if syscall::dup2(pts as u64, 0).is_err() {
-            println!("[installer] could not put the terminal on stdin");
+        for fd in 0..3u64 {
+            if syscall::dup2(pts as u64, fd).is_err() {
+                println!("[installer] could not put the terminal on fd {}", fd);
+            }
         }
 
         // 2. Stop the kernel console painting over the display.
@@ -1183,10 +1199,32 @@ impl App {
             }
         }
 
-        // 4. Start the terminal.
+        // 4. Start the login prompt, then the terminal that draws it.
+        //
+        // The getty is started here rather than by fbterm, and that ordering is
+        // the whole point of it. fbterm execs its own shell, which makes it the
+        // parent of the login program, and a child inherits its parent's
+        // identity: fbterm is uid 1000, so the getty was too, and a getty that
+        // cannot setuid(0) refuses every root login. It refused them *after*
+        // accepting the password, so the screen said "could not set up the
+        // session" and nothing on it pointed at the missing privilege.
+        //
+        // Started from here it is the kernel that seeds it, and the kernel
+        // seeds the getty as root because that is what a getty is. It inherits
+        // the descriptor table wholesale, so the pty above is already its
+        // terminal.
+        //
+        // fbterm then draws that same pty instead of forking a second one,
+        // which is what `--attach-fd` is for.
         if self.launch_term {
+            let argv = ["/bin/getty"];
+            if syscall::proc_spawn(PROG_GETTY, Some(&argv)).is_err() {
+                println!("[installer] could not start the login prompt");
+            }
+            let attach = alloc::format!("--attach-fd=0");
+            let argv = ["fbterm", attach.as_str()];
             println!("[installer] handing the display to fbterm");
-            let _ = syscall::proc_spawn(PROG_FBTERM, None);
+            let _ = syscall::proc_spawn(PROG_FBTERM, Some(&argv));
         }
         println!(
             "[installer] setup complete (hostname={}, keymap={})",
