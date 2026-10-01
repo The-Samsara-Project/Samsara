@@ -25,8 +25,10 @@ export PATH := $(HOME)/.cargo/bin:$(PATH)
 #     The kernel launches these during boot; each links its own linker script.
 #   * the userland — the busybox port (ports/busybox/), which is also what
 #     `/bin/sh` is; spawned on demand with an argv and dispatched by argv[0].
-#   * system programs — crates under user/servers/ (the console server, the
-#     keyboard driver, the installer, the getty that fronts a terminal).
+#   * system programs — C, linked against the mlibc port (getty, which fronts a
+#     terminal, and mkpasswd, which turns a password into a crypt(3) hash). The
+#     kernel launches the getty directly, because a login program has to start
+#     privileged: it becomes whoever logs in.
 #   * example programs — crates under user/nutcracker-rt/examples/ (self-tests
 #     and the shell). Nothing here is needed to boot or to be usable: they exist
 #     to be run and checked, not to set the system up.
@@ -34,7 +36,7 @@ export PATH := $(HOME)/.cargo/bin:$(PATH)
 # as their dynamic linker (mapping PT_LOADs + resolving .rela). Their flags
 # live in user/.cargo/config.toml (built from `user/`); the kernel's
 # code-model=kernel config is scoped to kernel/.cargo/config.toml.
-USER_SERVERS   := consoled inputd installer
+USER_SERVERS   := consoled inputd
 USER_EXAMPLES  := hello forkx exectst pipetest credtst signaltst polltest termiostst sh
 
 .PHONY: all kernel iso run run-fbterm debug clean user-bins fbterm-run

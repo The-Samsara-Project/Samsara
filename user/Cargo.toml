@@ -4,7 +4,6 @@ members = [
     "nutcracker-rt",
     "servers/consoled",
     "servers/inputd",
-    "servers/installer",
 ]
 
 [profile.release]
