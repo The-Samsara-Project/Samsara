@@ -1,0 +1,125 @@
+SPDX-License-Identifier: GPL-3.0-or-later
+Copyright (C) 2026 Harsh Nikarsa
+
+Attach to a terminal somebody else already owns, instead of forking one.
+
+fbterm always calls forkpty() and execs a shell on the fresh slave, which
+makes fbterm the parent of the login program. A child inherits its parent's
+identity, so on Samsara the getty it execs is a uid 1000 program, and a getty
+that cannot setuid(0) refuses every root login -- after already having
+accepted the password, so the screen says only "could not set up the
+session".
+
+That is not a getty bug: a getty has to start privileged because it becomes
+whoever logs in, and nothing unprivileged can start one. So the kernel starts
+it and passes the terminal to fbterm with --attach-fd=N. fbterm reads and
+writes that descriptor and starts no process of its own, which is the
+arrangement a terminal emulator is normally given when told to use a terminal
+somebody else opened.
+
+Without the option this is exactly upstream.
+
+Generated with `git diff` against the pinned fbterm commit
+419c6be55413a7069fbcc66883d58caa94ba3933. Regenerate with
+ports/fbterm/build.sh; never edit by hand.
+
+diff --git a/src/fbconfig.cpp b/src/fbconfig.cpp
+index 8249746..0d949aa 100644
+--- a/src/fbconfig.cpp
++++ b/src/fbconfig.cpp
+@@ -37,6 +37,7 @@ Config::Config()
+ 	mShellCommand = 0;
+ 	mConfigBuf = 0;
+ 	mConfigEntrys = 0;
++	mAttachFd = -1;
+ 
+ 	const s8 *home = getenv("HOME");
+ 	if (!home) {
+@@ -228,6 +229,8 @@ bool Config::parseArgs(s32 argc, s8 **argv)
+ 	static const option options[] = {
+ 		{ "help", no_argument, 0, 'h' },
+ 		{ "version", no_argument, 0, 'V' },
++		/* Samsara: draw a terminal somebody else owns. See createShellProcess. */
++		{ "attach-fd", required_argument, 0, 'A' },
+ 		{ "verbose", no_argument, 0, 'v' },
+ 		{ "font-names", required_argument, 0, 'n' },
+ 		{ "font-size", required_argument, 0, 's' },
+@@ -250,8 +253,12 @@ bool Config::parseArgs(s32 argc, s8 **argv)
+ 	};
+ 
+ 	s32 index;
+-	while ((index = getopt_long(argc, argv, "Vvhn:s:f:b:e:r:i:c:C:W:H:B:al", options, 0)) != -1) {
++	while ((index = getopt_long(argc, argv, "VAvhn:s:f:b:e:r:i:c:C:W:H:B:al", options, 0)) != -1) {
+ 		switch (index) {
++		case 'A':
++			mAttachFd = atoi(optarg);
++			break;
++
+ 		case 'V':
+ 			printf("FbTerm version " VERSION "\n");
+ 			return false;
+diff --git a/src/fbconfig.h b/src/fbconfig.h
+index 6051002..4e2923c 100644
+--- a/src/fbconfig.h
++++ b/src/fbconfig.h
+@@ -33,6 +33,9 @@ public:
+ 	bool parseArgs(s32 argc, s8 **argv);
+ 	s8** getShellCommand() { return mShellCommand; }
+ 
++	/* Samsara: the terminal to draw instead of forking one, or -1. */
++	s32 getAttachFd() { return mAttachFd; }
++
+ private:
+ 	void checkConfigFile(const s8 *name);
+ 	void parseOption(s8 *str);
+@@ -49,6 +52,9 @@ private:
+ 	s8 *mConfigBuf;
+ 	OptionEntry *mConfigEntrys;
+ 	s8 **mShellCommand;
++
++	/* Samsara: see getAttachFd(). */
++	s32 mAttachFd;
+ };
+ 
+ #endif
+diff --git a/src/lib/shell.cpp b/src/lib/shell.cpp
+index 0dfdef7..09a2173 100644
+--- a/src/lib/shell.cpp
++++ b/src/lib/shell.cpp
+@@ -31,6 +31,7 @@
+ #include <sys/ioctl.h>
+ #include <sys/wait.h>
+ #include "shell.h"
++#include "../fbconfig.h"
+ 
+ void waitChildProcessExit(s32 pid)
+ {
+@@ -71,6 +72,28 @@ Shell::~Shell()
+ 
+ void Shell::createShellProcess(s8 **command)
+ {
++	/*
++	 * Samsara: attach to a terminal somebody else owns, when told to.
++	 *
++	 * forkpty() below makes this process the parent of the shell, and a
++	 * child inherits its parent's identity. On Samsara that makes the
++	 * login program a uid 1000 program, and a getty that cannot setuid(0)
++	 * refuses every root login -- after accepting the password, so the
++	 * screen says only "could not set up the session" and nothing points
++	 * at the cause.
++	 *
++	 * The privileged program is started by the kernel instead, which seeds
++	 * it as root because that is what a getty is, and passes the terminal
++	 * in with --attach-fd. fbterm draws it and starts nothing.
++	 */
++	s32 attach = Config::instance()->getAttachFd();
++	if (attach >= 0) {
++		setFd(attach);
++		setCodec("UTF-8", localCodec());
++		resize(w(), h());
++		return;
++	}
++
+ 	s32 fd;
+ 	mPid = forkpty(&fd, NULL, NULL, NULL);
+ 
