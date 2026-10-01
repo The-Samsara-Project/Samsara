@@ -1246,6 +1246,16 @@ impl App {
             for fd in 0..3u64 {
                 let _ = syscall::dup2(pty as u64, fd);
             }
+            // Put the terminal back the way a login prompt wants it.
+            //
+            // The wizard set this pty to raw for its own sake, so that arrow
+            // keys arrive unedited and nothing is echoed back over a framebuffer
+            // the wizard is painting itself. It never put it back, so the login
+            // prompt inherited a terminal with ECHO off: every character typed
+            // at `Samsara login:` was accepted by the getty and displayed by
+            // nobody, which looks exactly like a terminal that has stopped
+            // listening to the keyboard.
+            cooked(pty);
             let argv = ["/bin/getty"];
             if syscall::proc_spawn(PROG_GETTY, Some(&argv)).is_err() {
                 println!("[installer] could not start the login prompt");
@@ -1299,6 +1309,28 @@ fn hand_off_to_hasher(pid: u64, pwd_wr: usize, hash_rd: usize, password: &[u8]) 
     let _ = syscall::close(hash_rd);
     let _ = syscall::waitpid(pid, &mut 0);
     hash.trim().to_string()
+}
+
+/// Restore a pty to the settings a terminal program expects: lines assembled,
+/// echo and erase on, and signals delivered.
+///
+/// The inverse of `set_raw`, and needed for the same reason: whatever the wizard
+/// did to the terminal to drive it belongs to the wizard, and the program that
+/// comes after inherits the terminal rather than the wizard's opinion of it.
+fn cooked(fd: usize) {
+    let mut t = core::mem::MaybeUninit::<syscall::Termios>::uninit();
+    let mut t = unsafe { t.assume_init() };
+    if syscall::ioctl(fd, syscall::TCGETS, &mut t).is_err() {
+        println!("[installer] could not read the terminal settings");
+        return;
+    }
+    t.c_lflag |= syscall::ISIG | syscall::ICANON | syscall::ECHO | syscall::ECHOE
+        | syscall::ECHOK;
+    t.c_iflag |= syscall::ICRNL;
+    t.c_oflag |= syscall::OPOST;
+    if syscall::ioctl(fd, syscall::TCSETS, &mut t).is_err() {
+        println!("[installer] could not restore the terminal settings");
+    }
 }
 
 /// Read a line of output from a child, bounded.
