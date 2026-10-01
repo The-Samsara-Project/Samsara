@@ -1,7 +1,7 @@
 SPDX-License-Identifier: GPL-3.0-or-later
 Copyright (C) 2026 Harsh Nikarsa
 
-Attach to a terminal somebody else already owns, instead of forking one.
+Attach to a terminal somebody else owns, instead of forking one.
 
 fbterm always calls forkpty() and execs a shell on the fresh slave, which
 makes fbterm the parent of the login program. A child inherits its parent's
@@ -16,6 +16,14 @@ it and passes the terminal to fbterm with --attach-fd=N. fbterm reads and
 writes that descriptor and starts no process of its own, which is the
 arrangement a terminal emulator is normally given when told to use a terminal
 somebody else opened.
+
+Three things follow from not having made the pty, and each is silent when wrong.
+fbterm must take its keyboard from the attached descriptor rather than from
+stdin, because stdin is now the end the program on the other side is reading,
+and two readers of one descriptor is a race rather than a terminal. It must
+not size itself before it has been sized, since its own dimensions are zero
+until the caller resizes it. And it must not reach for forkpty at all, which
+would put it back in the position of being the login program's parent.
 
 Without the option this is exactly upstream.
 
@@ -82,8 +90,47 @@ index 6051002..4e2923c 100644
  };
  
  #endif
+diff --git a/src/input.cpp b/src/input.cpp
+index f1304a2..2148b8d 100644
+--- a/src/input.cpp
++++ b/src/input.cpp
+@@ -27,6 +27,7 @@
+ #include <linux/kd.h>
+ #include <linux/input.h>
+ #include "input.h"
++#include "../fbconfig.h"
+ #include "input_key.h"
+ #include "fbshell.h"
+ #include "fbshellman.h"
+@@ -92,7 +93,25 @@ TtyInput *TtyInput::createInstance()
+ 
+ TtyInput::TtyInput()
+ {
+-	setFd(dup(STDIN_FILENO));
++	/*
++	 * Samsara: when attaching to a terminal somebody else owns, the keyboard
++	 * is on that descriptor.
++	 *
++	 * Upstream reads the keyboard from stdin, because upstream made the pty:
++	 * the master it holds is stdin's other end, so reading stdin reads what
++	 * was typed. With --attach-fd the pty already exists and the program on
++	 * the other end holds the slave -- so stdin here is that same slave, and
++	 * fbterm competes with the program for every keystroke instead of
++	 * forwarding it. Two readers of one descriptor is not a terminal, it is a
++	 * race neither side wins, and what it looks like is a prompt where nothing
++	 * typed ever appears.
++	 *
++	 * The attached descriptor is the master: the end the keyboard writes to
++	 * and the end the program's output is read from, which is both of the
++	 * things this class wants, and neither is shared with the program.
++	 */
++	s32 attach = Config::instance()->getAttachFd();
++	setFd(attach >= 0 ? dup(attach) : dup(STDIN_FILENO));
+ }
+ 
+ TtyInput::~TtyInput()
 diff --git a/src/lib/shell.cpp b/src/lib/shell.cpp
-index 0dfdef7..09a2173 100644
+index 0dfdef7..c0bd6f1 100644
 --- a/src/lib/shell.cpp
 +++ b/src/lib/shell.cpp
 @@ -31,6 +31,7 @@
@@ -94,7 +141,7 @@ index 0dfdef7..09a2173 100644
  
  void waitChildProcessExit(s32 pid)
  {
-@@ -71,6 +72,28 @@ Shell::~Shell()
+@@ -71,6 +72,32 @@ Shell::~Shell()
  
  void Shell::createShellProcess(s8 **command)
  {
@@ -111,12 +158,16 @@ index 0dfdef7..09a2173 100644
 +	 * The privileged program is started by the kernel instead, which seeds
 +	 * it as root because that is what a getty is, and passes the terminal
 +	 * in with --attach-fd. fbterm draws it and starts nothing.
++	 *
++	 * No resize() here. `w()` and `h()` are this shell's own dimensions and
++	 * are still zero, so sizing to them gives a 0x0 terminal that draws
++	 * nothing at all. The caller resizes immediately afterwards, against
++	 * the real screen, which is what sizes a forked shell too.
 +	 */
 +	s32 attach = Config::instance()->getAttachFd();
 +	if (attach >= 0) {
 +		setFd(attach);
 +		setCodec("UTF-8", localCodec());
-+		resize(w(), h());
 +		return;
 +	}
 +
