@@ -192,7 +192,11 @@ const BUFFER_SIZE: usize = 4096;
 pub struct PtyMaster {
     id: u32,
     slave: Arc<PtySlave>,
-    input_buffer: Mutex<VecDeque<u8>>,
+    /// What the program on the slave has written, waiting to be drawn.
+    ///
+    /// Only one direction passes through the master: out. Keystrokes go
+    /// master-write to slave-read and never queue here, so a terminal emulator
+    /// reading this gets exactly what it should draw and nothing else.
     output_buffer: Mutex<VecDeque<u8>>,
     packet_mode: AtomicBool,
     closed: AtomicBool,
@@ -329,7 +333,6 @@ impl PtyManager {
         let master = Arc::new(PtyMaster {
             id,
             slave: slave.clone(),
-            input_buffer: Mutex::new(VecDeque::with_capacity(BUFFER_SIZE)),
             output_buffer: Mutex::new(VecDeque::with_capacity(BUFFER_SIZE)),
             packet_mode: AtomicBool::new(false),
             closed: AtomicBool::new(false),
@@ -455,17 +458,27 @@ impl PtyMaster {
             return 0;
         }
         
-        let mut input = self.input_buffer.lock();
+        // What the terminal draws is what the program on the slave wrote, which
+        // is `output_buffer`. `input_buffer` is the other direction: bytes typed
+        // into the master, on their way to the program.
+        //
+        // Reading `input_buffer` here is what made a login prompt invisible. Both
+        // directions shared one buffer, so the program's output was queued
+        // alongside the user's keystrokes and the terminal emulator -- which
+        // draws what it reads and sends what it types -- read its own echo back
+        // and nothing that was ever meant to be seen. The prompt went somewhere
+        // real and simply had no reader.
+        let mut output = self.output_buffer.lock();
         let mut n = 0;
         while n < buf.len() {
-            if let Some(byte) = input.pop_front() {
+            if let Some(byte) = output.pop_front() {
                 buf[n] = byte;
                 n += 1;
             } else {
                 break;
             }
         }
-        drop(input);
+        drop(output);
         // Whatever was just taken is room a blocked writer can use. Waking them
         // here -- rather than on the write side, which cannot know when the
         // terminal has caught up -- is what lets a command emitting more than
@@ -515,9 +528,13 @@ impl PtyMaster {
             let mut n = 0;
             while n < echo.len() {
                 {
-                    let mut master_input = self.input_buffer.lock();
-                    while n < echo.len() && master_input.len() < BUFFER_SIZE {
-                        master_input.push_back(echo[n]);
+                    // The echo is drawn by the terminal, so it goes where the
+                    // terminal reads -- the same place the program's own output
+                    // goes. Keystrokes themselves never pass through the master:
+                    // they go master-write to slave-read.
+                    let mut master_out = self.output_buffer.lock();
+                    while n < echo.len() && master_out.len() < BUFFER_SIZE {
+                        master_out.push_back(echo[n]);
                         n += 1;
                     }
                 }
@@ -527,7 +544,7 @@ impl PtyMaster {
                 // SAFETY: reached only from a user task writing to the pty.
                 let me = unsafe { tty_current_task() };
                 self.write_waiters.register(me);
-                if self.input_buffer.lock().len() < BUFFER_SIZE {
+                if self.output_buffer.lock().len() < BUFFER_SIZE {
                     // Drained between the push attempt and here.
                     self.write_waiters.unregister(me);
                     continue;
@@ -573,7 +590,8 @@ impl PtyMaster {
     
     /// Check if data is available to read
     pub fn has_data(&self) -> bool {
-        !self.input_buffer.lock().is_empty()
+        // Readable means the program has produced something to draw.
+        !self.output_buffer.lock().is_empty()
     }
     
     /// Enable/disable packet mode
@@ -656,9 +674,9 @@ impl PtySlave {
             let mut n = 0;
             while n < out.len() {
                 {
-                    let mut master_input = master.input_buffer.lock();
-                    while n < out.len() && master_input.len() < BUFFER_SIZE {
-                        master_input.push_back(out[n]);
+                    let mut master_out = master.output_buffer.lock();
+                    while n < out.len() && master_out.len() < BUFFER_SIZE {
+                        master_out.push_back(out[n]);
                         n += 1;
                     }
                 }
@@ -672,8 +690,8 @@ impl PtySlave {
                 let me = unsafe { tty_current_task() };
                 master.write_waiters.register(me);
                 {
-                    let master_input = master.input_buffer.lock();
-                    if master_input.len() < BUFFER_SIZE {
+                    let master_out = master.output_buffer.lock();
+                    if master_out.len() < BUFFER_SIZE {
                         // Drained between the push attempt and here.
                         master.write_waiters.unregister(me);
                         continue;
@@ -876,14 +894,17 @@ impl PtySlave {
                 // Replay whatever was written while stopped.
                 let pending = core::mem::take(&mut self.ldisc.lock().held_output);
                 if !pending.is_empty() {
+                    // Held output is the program's own output, waiting for the
+                    // terminal, so it belongs in the output buffer rather than
+                    // with the keystrokes.
                     if let Some(master) = self.master.lock().as_ref() {
-                        let mut mi = master.input_buffer.lock();
+                        let mut mo = master.output_buffer.lock();
                         for b in pending {
-                            if mi.len() < BUFFER_SIZE {
-                                mi.push_back(b);
+                            if mo.len() < BUFFER_SIZE {
+                                mo.push_back(b);
                             }
                         }
-                        drop(mi);
+                        drop(mo);
                         master.read_waiters.wake_all();
                     }
                 }
