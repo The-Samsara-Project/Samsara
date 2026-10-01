@@ -187,6 +187,14 @@ int main(int argc, char **argv) {
 	//
 	// Checking it here means the disagreement is caught by a test rather than by
 	// someone typing `whoami`.
+	/* uid 0 specifically. `getpwuid` for a non-zero uid is a weaker test than it
+	 * looks: the passwd parser tests the converted uid for falsiness, which
+	 * rejects 0 along with a failed conversion, so the root entry could be
+	 * discarded while every other uid resolved. Only uid 0 catches that. */
+	struct passwd *pwroot = getpwnam("root");
+	check(pwroot != NULL && pwroot->pw_name != NULL, "getpwnam resolves root");
+	check(pwroot != NULL && pwroot->pw_uid == 0, "root's entry reports uid 0");
+
 	struct passwd *pw = getpwuid(getuid());
 	if (pw && pw->pw_name) {
 		printf("[chello] uid %u is %s\n", (unsigned)getuid(), pw->pw_name);
