@@ -5,7 +5,6 @@ members = [
     "servers/consoled",
     "servers/inputd",
     "servers/installer",
-    "samutils",
 ]
 
 [profile.release]

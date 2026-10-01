@@ -9,7 +9,7 @@
 // dropped so they never end up in a command line.
 //
 // Commands live OUTSIDE the shell: the fork/exec/waitpid trio runs the
-// `samutils` multi-call binary (PROG_SAMUTILS) with an argv whose argv[0]
+// `busybox` multi-call binary (PROG_BUSYBOX) with an argv whose argv[0]
 // names the command and whose remaining entries are its arguments. Only `cd`
 // (which must change the shell's own working directory) and `exit` are
 // builtins. The prompt is bash/zsh-flavoured: a green `user@host`-style label
@@ -32,8 +32,13 @@ use nutcracker_rt::println;
 use nutcracker_rt::syscall::{self, poll_events, PollFd};
 
 const MAX_LINE: usize = 512;
-/// Index of the samutils multi-call binary (matches kernel `PROG_SAMUTILS`).
-const PROG_SAMUTILS: u64 = 12;
+/// Index of `busybox`, the multi-call binary this shell runs its commands
+/// through (matches kernel `PROG_BUSYBOX`).
+///
+/// busybox and not the old hand-written utility binary: this is the system's
+/// userland, it is what `/bin/sh` itself is a link to, and a second set of
+/// commands beside it meant two answers to "what does `ls` do here".
+const PROG_BUSYBOX: u64 = 17;
 
 /// Write the whole slice to `fd`, tolerating short writes.
 fn write_all(fd: usize, bytes: &[u8]) {
@@ -107,7 +112,7 @@ fn tokenize(line: &str) -> Vec<String> {
 }
 
 /// Run one command line: either a builtin (cd / exit) or an external command
-/// via fork -> exec(samutils, argv) -> waitpid.
+/// via fork -> exec(busybox, argv) -> waitpid.
 fn run_line(fd: usize, line: &[u8]) {
     let s = match core::str::from_utf8(line) {
         Ok(s) => s.trim(),
@@ -141,13 +146,13 @@ fn run_line(fd: usize, line: &[u8]) {
 
 /// Fork, exec the utility binary with the given argv in the child, and reap.
 fn run_external(fd: usize, cmd: &str, words: &[String]) {
-    // argv[0] is the command name (samutils dispatches on it), like bash.
+    // argv[0] is the command name (busybox dispatches on it), like bash.
     let argv: Vec<&str> = words.iter().map(|w| w.as_str()).collect();
 
     match syscall::fork() {
-        // Child: replace this image with samutils. Only exec failure returns.
+        // Child: replace this image with busybox. Only exec failure returns.
         0 => {
-            if let Err(e) = syscall::exec(PROG_SAMUTILS, Some(&argv)) {
+            if let Err(e) = syscall::exec(PROG_BUSYBOX, Some(&argv)) {
                 let mut w = SlaveWriter { fd };
                 let _ = write!(w, "sh: {}: {}\n", cmd, errstr(e));
                 syscall::proc_exit_code(127);

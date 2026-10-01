@@ -23,8 +23,8 @@ export PATH := $(HOME)/.cargo/bin:$(PATH)
 # Ring-3 user programs come from three places:
 #   * boot servers — their own crates under user/servers/ (consoled, inputd).
 #     The kernel launches these during boot; each links its own linker script.
-#   * the utility multi-call binary — user/samutils/ (the real commands the
-#     shell runs); spawned on demand with an argv.
+#   * the userland — the busybox port (ports/busybox/), which is also what
+#     `/bin/sh` is; spawned on demand with an argv and dispatched by argv[0].
 #   * system programs — crates under user/servers/ (the console server, the
 #     keyboard driver, the installer, the getty that fronts a terminal).
 #   * example programs — crates under user/nutcracker-rt/examples/ (self-tests
@@ -35,7 +35,6 @@ export PATH := $(HOME)/.cargo/bin:$(PATH)
 # live in user/.cargo/config.toml (built from `user/`); the kernel's
 # code-model=kernel config is scoped to kernel/.cargo/config.toml.
 USER_SERVERS   := consoled inputd installer
-USER_UTILS     := samutils
 USER_EXAMPLES  := hello forkx exectst pipetest credtst signaltst polltest termiostst sh
 
 .PHONY: all kernel iso run run-fbterm debug clean user-bins fbterm-run
@@ -125,8 +124,6 @@ user-bins: build/.mlibc.stamp build/.fbterm.stamp build/.busybox.stamp
 	@for b in $(USER_EXAMPLES); do cp \
 	    target/user/x86_64-unknown-none/release/examples/$$b target/user-$$b.elf; done
 	@for b in $(USER_SERVERS); do cp \
-	    target/user/x86_64-unknown-none/release/$$b target/user-$$b.elf; done
-	@for b in $(USER_UTILS); do cp \
 	    target/user/x86_64-unknown-none/release/$$b target/user-$$b.elf; done
 	@# Programs linked against mlibc rather than built by cargo, because they need
 	@# the C library: the self-test, the password hasher and the getty. They are

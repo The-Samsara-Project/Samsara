@@ -41,30 +41,27 @@ pub const PROG_SHELL: usize = 9;
 pub const PROG_INSTALLER: usize = 10;
 /// Index of the bounded exec target (reached via `exec()` from `forkx`).
 pub const PROG_EXECTST: usize = 11;
-/// Index of the ring-3 utility multi-call binary (busybox-style `samutils`),
-/// spawned with an argv by the shell and other users.
-pub const PROG_SAMUTILS: usize = 12;
 /// Index of `chello`, the C program linked against the mlibc port. It is the
 /// only non-Rust user image, so it is what proves the libc port runs rather
 /// than merely links; the installer runs it as a boot self-test.
-pub const PROG_CHELLO: usize = 13;
+pub const PROG_CHELLO: usize = 12;
 /// Index of `fbterm`, the ported Linux terminal emulator. Present in the table
 /// unconditionally so the index is stable whether or not the port has been
 /// built; see the table entry for how the image is gated.
-pub const PROG_FBTERM: usize = 14;
+pub const PROG_FBTERM: usize = 13;
 /// Index of `busybox`, the ported multi-call binary and the system userland.
 /// One image; the applet is chosen by `argv[0]`, which is why every name under
 /// `/bin` is a symlink to it rather than a copy.
-pub const PROG_BUSYBOX: usize = 17;
+pub const PROG_BUSYBOX: usize = 16;
 /// Index of `mkpasswd`, the helper that turns a password into a `crypt(3)` hash.
 ///
 /// A separate program rather than part of the installer because the installer is
 /// Rust and the Rust programs here do not link mlibc, so it cannot call `crypt(3)`
 /// itself. Hashing stays in user space, in a program that can be checked against
 /// a reference implementation, rather than in the kernel.
-pub const PROG_MKPASSWD: usize = 15;
+pub const PROG_MKPASSWD: usize = 14;
 /// Index of `getty`, the program that fronts a terminal and runs a login.
-pub const PROG_GETTY: usize = 16;
+pub const PROG_GETTY: usize = 15;
 
 /// A boot-time user-space program.
 pub(crate) struct Program {
@@ -77,7 +74,7 @@ pub(crate) struct Program {
     pub(crate) image: &'static [u8],
 }
 
-pub(crate) const PROGRAMS: [Program; 18] = [
+pub(crate) const PROGRAMS: [Program; 17] = [
     Program {
         name: "hello",
         endpoint: None,
@@ -151,12 +148,6 @@ pub(crate) const PROGRAMS: [Program; 18] = [
         endpoint: None,
         root: false,
         image: include_bytes!("../../target/user-exectst.elf"),
-    },
-    Program {
-        name: "samutils",
-        endpoint: None,
-        root: false,
-        image: include_bytes!("../../target/user-samutils.elf"),
     },
     // The C smoke test. Not a boot server and not spawned at boot: the
     // installer launches it with the rest of the self-tests, which is where a
@@ -269,7 +260,6 @@ const _: () = {
         else if same!(n, "sh") { PROG_SHELL }
         else if same!(n, "installer") { PROG_INSTALLER }
         else if same!(n, "exectst") { PROG_EXECTST }
-        else if same!(n, "samutils") { PROG_SAMUTILS }
         else if same!(n, "chello") { PROG_CHELLO }
         else if same!(n, "fbterm") { PROG_FBTERM }
         else if same!(n, "mkpasswd") { PROG_MKPASSWD }
@@ -284,9 +274,9 @@ const _: () = {
     }
 };
 
-/// Default search path for spawned programs. `samutils` lives in `/bin`, and
-/// a shell in `/bin` as well; `/usr/bin` is included so a
-/// later port has somewhere obvious to install.
+/// Default search path for spawned programs. The userland and the shell both
+/// live in `/bin`; `/usr/bin` is included so a later port has somewhere
+/// obvious to install.
 pub const DEFAULT_PATH: &str = "/bin:/usr/bin";
 
 /// The environment every newly spawned process starts with, before any

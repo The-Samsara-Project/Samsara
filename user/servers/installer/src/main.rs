@@ -52,14 +52,14 @@ const PROG_TERMIOS_TST: u64 = 7;
 const PROG_POLLTEST: u64 = 8;
 /// `chello`, the C program linked against the mlibc port. The only non-Rust
 /// user image, so it is what shows the libc port runs and not merely links.
-const PROG_CHELLO: u64 = 13;
+const PROG_CHELLO: u64 = 12;
 /// `fbterm`, the ported Linux terminal emulator. The installer hands it the
 /// display when setup finishes; see the `handoff` method.
-const PROG_FBTERM: u64 = 14;
+const PROG_FBTERM: u64 = 13;
 /// `mkpasswd`, which turns a typed password into a `crypt(3)` hash.
-const PROG_MKPASSWD: u64 = 15;
+const PROG_MKPASSWD: u64 = 14;
 /// `busybox`, the ported userland. Spawned once, to make its own applet links.
-const PROG_BUSYBOX: u64 = 17;
+const PROG_BUSYBOX: u64 = 16;
 
 /// Every (program name, index) pair this crate spawns, for the compile-time
 /// check against the kernel's table below.
@@ -84,7 +84,7 @@ const SPAWNED: [(&str, usize); 10] = [
 /// bytes the kernel was built from, so comparing them here compares the
 /// installer's belief against the kernel's reality. Same bytes means the same
 /// table, and therefore the same meaning for every index in it.
-const KERNEL_PROGRAMS: [(&str, &[u8]); 18] = [
+const KERNEL_PROGRAMS: [(&str, &[u8]); 17] = [
     ("hello", include_bytes!("../../../../target/user-hello.elf")),
     ("consoled", include_bytes!("../../../../target/user-consoled.elf")),
     ("inputd", include_bytes!("../../../../target/user-inputd.elf")),
@@ -97,7 +97,6 @@ const KERNEL_PROGRAMS: [(&str, &[u8]); 18] = [
     ("sh", include_bytes!("../../../../target/user-sh.elf")),
     ("installer", include_bytes!("../../../../target/user-installer.elf")),
     ("exectst", include_bytes!("../../../../target/user-exectst.elf")),
-    ("samutils", include_bytes!("../../../../target/user-samutils.elf")),
     ("chello", include_bytes!("../../../../target/user-chello.elf")),
     ("fbterm", include_bytes!("../../../../target/user-fbterm.elf")),
     ("mkpasswd", include_bytes!("../../../../target/user-mkpasswd.elf")),
