@@ -17,13 +17,15 @@ writes that descriptor and starts no process of its own, which is the
 arrangement a terminal emulator is normally given when told to use a terminal
 somebody else opened.
 
-Three things follow from not having made the pty, and each is silent when wrong.
+Four things follow from not having made the pty, and each is silent when wrong.
 fbterm must take its keyboard from the attached descriptor rather than from
 stdin, because stdin is now the end the program on the other side is reading,
 and two readers of one descriptor is a race rather than a terminal. It must
-not size itself before it has been sized, since its own dimensions are zero
-until the caller resizes it. And it must not reach for forkpty at all, which
-would put it back in the position of being the login program's parent.
+leave the terminal's settings alone, because TCSAFLUSH discards input that has
+been typed but not yet read -- which silently ate the password. It must not
+size itself before it has been sized, since its own dimensions are zero until
+the caller resizes it. And it must not reach for forkpty at all, which would
+put it back in the position of being the login program's parent.
 
 Without the option this is exactly upstream.
 
@@ -91,7 +93,7 @@ index 6051002..4e2923c 100644
  
  #endif
 diff --git a/src/input.cpp b/src/input.cpp
-index f1304a2..2148b8d 100644
+index f1304a2..6088cbe 100644
 --- a/src/input.cpp
 +++ b/src/input.cpp
 @@ -27,6 +27,7 @@
@@ -129,6 +131,35 @@ index f1304a2..2148b8d 100644
  }
  
  TtyInput::~TtyInput()
+@@ -121,6 +140,28 @@ void TtyInput::switchVc(bool enter)
+ 	tcgetattr(STDIN_FILENO, &oldTm);
+ 
+ 	ioctl(STDIN_FILENO, KDGKBMODE, &oldKbMode);
++
++	/*
++	 * Samsara: with --attach-fd the terminal belongs to the program on the
++	 * other end, so its settings are left alone.
++	 *
++	 * Upstream makes the pty, which makes it the owner: it configures the
++	 * terminal for its own child and the child is expected to cope. Attached
++	 * to somebody else's pty it is a guest, and reconfiguring it fights the
++	 * program for it. The cost is not a rendering artefact: TCSAFLUSH throws
++	 * away whatever has not been read yet, so the password a person had
++	 * already typed was discarded the moment fbterm decided the terminal was
++	 * in the wrong mode, and the next prompt read the line after it instead.
++	 * A correct password was then compared against the following one, and
++	 * every login failed with "Login incorrect".
++	 *
++	 * The program manages the terminal's settings, which is what a login
++	 * program does: it has to turn echo off for the password and on again
++	 * afterwards, and nothing else is in a position to do it.
++	 */
++	if (Config::instance()->getAttachFd() >= 0)
++		return;
++
+ 	setRawMode(false, true);
+ 
+ 	termios tm = oldTm;
 diff --git a/src/lib/shell.cpp b/src/lib/shell.cpp
 index 0dfdef7..c0bd6f1 100644
 --- a/src/lib/shell.cpp
