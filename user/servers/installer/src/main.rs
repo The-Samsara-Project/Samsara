@@ -1201,26 +1201,47 @@ impl App {
 
         // 4. Start the login prompt, then the terminal that draws it.
         //
-        // The getty is started here rather than by fbterm, and that ordering is
-        // the whole point of it. fbterm execs its own shell, which makes it the
-        // parent of the login program, and a child inherits its parent's
-        // identity: fbterm is uid 1000, so the getty was too, and a getty that
-        // cannot setuid(0) refuses every root login. It refused them *after*
-        // accepting the password, so the screen said "could not set up the
-        // session" and nothing on it pointed at the missing privilege.
+        // The getty is started here rather than by fbterm, because fbterm execs
+        // its own shell, which makes it the parent of the login program, and a
+        // child inherits its parent's identity: fbterm is uid 1000, so the getty
+        // was too, and a getty that cannot setuid(0) refuses every root login.
+        // It refused them *after* accepting the password, so the screen said
+        // "could not set up the session" and nothing pointed at the cause.
         //
-        // Started from here it is the kernel that seeds it, and the kernel
-        // seeds the getty as root because that is what a getty is. It inherits
-        // the descriptor table wholesale, so the pty above is already its
-        // terminal.
+        // Started from here it is the kernel that spawns it, and the kernel
+        // seeds the getty as root because that is what a getty is.
         //
-        // fbterm then draws that same pty instead of forking a second one,
-        // which is what `--attach-fd` is for.
+        // A fresh pty pair is made for them, because the two need opposite ends
+        // of one: the getty writes the slave, fbterm reads the master. Handing
+        // both of them the same descriptor is what broke before, and it looks
+        // like nothing at all -- fbterm started, opened its end, and painted an
+        // empty screen forever, because it was reading back its own end.
+        //
+        // This is a new pair rather than the wizard's own, because that one
+        // belongs to the boot console and its master is still held by the console
+        // server, so it is not ours to hand to a terminal emulator.
         if self.launch_term {
+            let pair = match new_pty_pair() {
+                Some(p) => p,
+                None => {
+                    println!("[installer] could not allocate a terminal");
+                    println!("[installer] no terminal will appear");
+                    syscall::proc_exit_code(1);
+                }
+            };
+            // The getty gets the slave on all three descriptors: it reads the
+            // name on 0 and writes its prompt on 1, so a slave on stdin alone
+            // leaves the prompt going to the kernel console, where a person
+            // sitting at the screen cannot see it.
+            for fd in 0..3u64 {
+                let _ = syscall::dup2(pair.slave as u64, fd);
+            }
             let argv = ["/bin/getty"];
             if syscall::proc_spawn(PROG_GETTY, Some(&argv)).is_err() {
                 println!("[installer] could not start the login prompt");
             }
+            // fbterm reads the master, so the pty's output reaches the display.
+            let _ = syscall::dup2(pair.master as u64, 0);
             let attach = alloc::format!("--attach-fd=0");
             let argv = ["fbterm", attach.as_str()];
             println!("[installer] handing the display to fbterm");
@@ -1259,6 +1280,40 @@ fn hand_off_to_hasher(pid: u64, pwd_wr: usize, hash_rd: usize, password: &[u8]) 
     let _ = syscall::close(hash_rd);
     let _ = syscall::waitpid(pid, &mut 0);
     hash.trim().to_string()
+}
+
+/// One end of a new pty pair.
+struct PtyPair {
+    /// The master: whatever a terminal emulator reads to find out what the
+    /// program on the other end is saying.
+    master: usize,
+    /// The slave: what the program itself reads and writes.
+    slave: usize,
+}
+
+/// Allocate a pty pair, the way `openpty(3)` does.
+///
+/// The kernel hands out a fresh pair for every open of `/dev/ptmx` and names
+/// the slave by its index, which `TIOCGPTN` reports; `TIOCSPTLCK` unlocks it so
+/// the slave can be opened at all. Both descriptors come back open.
+///
+/// This is spelled out rather than reached through `openpty` because the
+/// installer is Rust and does not link the C library, and `/dev/ptmx` plus two
+/// ioctls is the whole of what `openpty` does.
+fn new_pty_pair() -> Option<PtyPair> {
+    let master = syscall::open("/dev/ptmx", syscall::O_RDWR, 0).ok()?;
+
+    let mut unlock: i32 = 0;
+    if syscall::ioctl(master, syscall::TIOCSPTLCK, &mut unlock).is_err() {
+        return None;
+    }
+    let mut index: u32 = 0;
+    if syscall::ioctl(master, syscall::TIOCGPTN, &mut index).is_err() {
+        return None;
+    }
+    let name = alloc::format!("/dev/pts/{}", index);
+    let slave = syscall::open(name.as_str(), syscall::O_RDWR, 0).ok()?;
+    Some(PtyPair { master, slave })
 }
 
 /// Read a line of output from a child, bounded.
