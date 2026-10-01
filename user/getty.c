@@ -251,18 +251,33 @@ static int login_once(void)
 		return -1;
 
 	pw = getpwnam(user);
-	/* The same message for "no such user" and "wrong password". Distinguishing
-	 * them would let someone enumerate the accounts on the system, and there is
-	 * nothing to learn from the difference that matters here. */
-	if (!pw) {
-		/* Still read a password, so the timing does not give it away either. */
+
+	/* Name the account in the password prompt.
+	 *
+	 * The password prompt is the point at which somebody is about to type a
+	 * secret, and "Password: " on its own does not say *whose*. By then they have
+	 * typed a name and may well have mistyped it, or been interrupted, or have
+	 * come from a different machine they have just used. Saying it back is what
+	 * lets them notice before they have typed the password rather than after.
+	 *
+	 * The name cannot appear in the first prompt instead, because nobody has said
+	 * who they are yet. That one names the machine, which is what a login prompt
+	 * is for; the account appears as soon as there is one to show.
+	 */
+	if (pw) {
+		char line[128];
+		snprintf(line, sizeof line, "Password (%s): ", pw->pw_name);
+		if (prompt(line, 0, password, sizeof password) < 0)
+			return -1;
+	} else {
+		/* The same message for "no such user" and "wrong password".
+		 * Distinguishing them would let someone enumerate the accounts on the
+		 * system, and there is nothing to learn from the difference that matters
+		 * here. */
 		prompt("Password: ", 0, password, sizeof password);
 		put("Login incorrect\n\n");
 		return -1;
 	}
-
-	if (prompt("Password: ", 0, password, sizeof password) < 0)
-		return -1;
 
 	/* An account with no password field is refused rather than admitted. An
 	 * empty field means "no password required" to `login(1)`, and that is the
