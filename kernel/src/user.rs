@@ -607,7 +607,7 @@ pub fn start_first_user() {
     // It has to be privileged: it becomes whoever logs in, and nothing
     // unprivileged can start one. That is also why the kernel starts it rather
     // than the terminal, which is an unprivileged drawing program.
-    let _ = spawn_program_on_terminal(PROG_GETTY, slave);
+    let _ = spawn_program_on_terminal(PROG_GETTY, slave.clone());
 
     // The terminal, drawing the master.
     //
@@ -616,9 +616,33 @@ pub fn start_first_user() {
     // leave the parser with no arguments at all -- and the terminal then quietly
     // falls back to making its own pty, which is the arrangement that cannot
     // work.
-    let args = alloc::vec![
-        alloc::string::String::from("fbterm"),
-        alloc::string::String::from("--attach-fd=0"),
-    ];
-    let _ = spawn_program_args(PROG_FBTERM, args, Some(master));
+    // Built after the spawn, because the descriptor it names is a fact about the
+    // spawn: three standard descriptors are already taken, so the master lands
+    // on 3. Hardcoding the number before the spawn means guessing at where the
+    // allocator puts it, and a wrong guess is the same silent failure as no
+    // terminal at all.
+    let attach = alloc::string::String::from("--attach-fd=3");
+    let args = alloc::vec![alloc::string::String::from("fbterm"), attach];
+    // The *slave* on 0, 1 and 2, and the master on the descriptor --attach-fd
+    // names.
+    //
+    // Not the other way round, which is what this did first. fbterm decides
+    // whether to run at all by asking `isatty(STDIN_FILENO)`, and a pty master
+    // is not a terminal -- it has no line discipline and no termios -- so with
+    // the master on stdin the check fails, `TtyInput` comes back null, and the
+    // terminal exits with status 0 before printing anything. That is why it
+    // "started and did nothing": it did not start.
+    //
+    // So stdin stays the slave, which is the end the keyboard writes to and the
+    // end that is a terminal, and the master goes on the low descriptor the
+    // option names.
+    if let Ok(tid) = spawn_program_args(PROG_FBTERM, args, Some(slave)) {
+        // The master, on the descriptor the option names. This is the end the
+        // program on the far side of the pair writes to and the end the terminal
+        // reads, so it is what has to be drawn from.
+        let m = crate::vfs::fdtab::install(tid.0, master);
+        if m != 3 {
+            crate::log::kwarn!("user: fbterm's terminal is on fd {}, not 3", m);
+        }
+    }
 }

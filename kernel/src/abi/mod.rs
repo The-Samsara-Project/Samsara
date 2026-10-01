@@ -3008,7 +3008,16 @@ fn sys_get_epid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i
 }
 
 fn sys_proc_exit(code: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
-    crate::log::kinfo!("proc: process exiting (status {})", code as i32);
+    // With the name. A bare "process exiting (status 0)" says a program left
+    // and nothing about which one, and on a boot that starts four programs the
+    // question is always which -- it was the reason a terminal emulator that
+    // died on startup could not be told apart from one that was never asked to
+    // start.
+    crate::log::kinfo!(
+        "proc: {} exiting (status {})",
+        crate::task::sched::current_name(),
+        code as i32
+    );
     crate::task::sched::exit_current(code as i32)
 }
 
