@@ -162,6 +162,9 @@ const INIT_CONF: &str = "/etc/init.conf";
 
 /// The setup wizard answers on this PTY slave for keyboard input.
 const KEY_SLAVE: &str = "/dev/pts/0";
+/// Pair 0's master -- the end consoled writes keystrokes into, and the end a
+/// terminal emulator reads. NOT `/dev/ptmx`: that name allocates a new pair.
+const BOOT_MASTER: &str = "/dev/ptmx0";
 
 // --- Framebuffer rendering ------------------------------------------------
 // The 8x8 console font, VGA palette and cell rasterizer are shared with the
@@ -1211,37 +1214,46 @@ impl App {
         // Started from here it is the kernel that spawns it, and the kernel
         // seeds the getty as root because that is what a getty is.
         //
-        // A fresh pty pair is made for them, because the two need opposite ends
-        // of one: the getty writes the slave, fbterm reads the master. Handing
-        // both of them the same descriptor is what broke before, and it looks
-        // like nothing at all -- fbterm started, opened its end, and painted an
-        // empty screen forever, because it was reading back its own end.
+        // Both of them then use the boot console's pty, which is the one the
+        // keyboard is already wired to.
         //
-        // This is a new pair rather than the wizard's own, because that one
-        // belongs to the boot console and its master is still held by the console
-        // server, so it is not ours to hand to a terminal emulator.
+        // That is not a detail. A *new* pair is a pair nothing is typing into:
+        // consoled owns the master of pair 0 and copies keystrokes into it, so a
+        // freshly allocated pair receives no input at all and its program sits at
+        // a prompt nobody can answer. `/dev/ptmx0` is that same master under a
+        // name that means "pair 0's master", which is different from `/dev/ptmx`,
+        // where opening it allocates a new pair rather than finding this one.
         if self.launch_term {
-            let pair = match new_pty_pair() {
-                Some(p) => p,
-                None => {
-                    println!("[installer] could not allocate a terminal");
-                    println!("[installer] no terminal will appear");
+            // The getty reads the name on 0 and writes its prompt on 1, so the
+            // slave goes on all three. With it on stdin alone the prompt goes to
+            // the kernel console, where a person at the screen cannot see it.
+            // Through a private duplicate, not the descriptor number itself.
+            //
+            // `pts` is descriptor 0 in this process -- it was opened as the first
+            // thing the wizard did -- so `dup2(pts, 0)` closes `pts` and replaces
+            // it. That one call is harmless, but the second iteration asks the
+            // same question again about a descriptor number that is now a
+            // *different* pty end, and the third about one that is not a
+            // terminal at all. `dup` first, so the number stays valid for all
+            // three.
+            let pty = match syscall::dup(pts) {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("[installer] could not duplicate the terminal: {}", e);
                     syscall::proc_exit_code(1);
                 }
             };
-            // The getty gets the slave on all three descriptors: it reads the
-            // name on 0 and writes its prompt on 1, so a slave on stdin alone
-            // leaves the prompt going to the kernel console, where a person
-            // sitting at the screen cannot see it.
             for fd in 0..3u64 {
-                let _ = syscall::dup2(pair.slave as u64, fd);
+                let _ = syscall::dup2(pty as u64, fd);
             }
             let argv = ["/bin/getty"];
             if syscall::proc_spawn(PROG_GETTY, Some(&argv)).is_err() {
                 println!("[installer] could not start the login prompt");
             }
-            // fbterm reads the master, so the pty's output reaches the display.
-            let _ = syscall::dup2(pair.master as u64, 0);
+            // fbterm reads the master, which is where the getty's output and the
+            // keyboard both arrive.
+            let master = syscall::open(BOOT_MASTER, syscall::O_RDWR, 0).unwrap_or(pts);
+            let _ = syscall::dup2(master as u64, 0);
             let attach = alloc::format!("--attach-fd=0");
             let argv = ["fbterm", attach.as_str()];
             println!("[installer] handing the display to fbterm");
@@ -1280,40 +1292,6 @@ fn hand_off_to_hasher(pid: u64, pwd_wr: usize, hash_rd: usize, password: &[u8]) 
     let _ = syscall::close(hash_rd);
     let _ = syscall::waitpid(pid, &mut 0);
     hash.trim().to_string()
-}
-
-/// One end of a new pty pair.
-struct PtyPair {
-    /// The master: whatever a terminal emulator reads to find out what the
-    /// program on the other end is saying.
-    master: usize,
-    /// The slave: what the program itself reads and writes.
-    slave: usize,
-}
-
-/// Allocate a pty pair, the way `openpty(3)` does.
-///
-/// The kernel hands out a fresh pair for every open of `/dev/ptmx` and names
-/// the slave by its index, which `TIOCGPTN` reports; `TIOCSPTLCK` unlocks it so
-/// the slave can be opened at all. Both descriptors come back open.
-///
-/// This is spelled out rather than reached through `openpty` because the
-/// installer is Rust and does not link the C library, and `/dev/ptmx` plus two
-/// ioctls is the whole of what `openpty` does.
-fn new_pty_pair() -> Option<PtyPair> {
-    let master = syscall::open("/dev/ptmx", syscall::O_RDWR, 0).ok()?;
-
-    let mut unlock: i32 = 0;
-    if syscall::ioctl(master, syscall::TIOCSPTLCK, &mut unlock).is_err() {
-        return None;
-    }
-    let mut index: u32 = 0;
-    if syscall::ioctl(master, syscall::TIOCGPTN, &mut index).is_err() {
-        return None;
-    }
-    let name = alloc::format!("/dev/pts/{}", index);
-    let slave = syscall::open(name.as_str(), syscall::O_RDWR, 0).ok()?;
-    Some(PtyPair { master, slave })
 }
 
 /// Read a line of output from a child, bounded.
