@@ -31,25 +31,121 @@ use nutcracker_rt::println;
 use nutcracker_rt::syscall::{self, poll_events, PollFd};
 
 // --- Embedded program indices (kernel/src/user.rs; append-only) ----------
-// Boot servers    : consoled = 1, inputd = 2
-// Self-test apps  : forkx = 3, pipetest = 4, credtst = 5, signaltst = 6,
-//                   termiostst = 7, polltest = 8
-// Shell = 9, term = 10, installer = 11.
+//
+// These are indices into the kernel's `PROGRAMS` table, and they are numbers,
+// so nothing in the type system connects them to the program they name. A
+// wrong one does not fail: the kernel happily loads a different image and
+// runs it, and what you get is the wrong program doing the wrong job. That is
+// not hypothetical -- three of these were stale, and `mkpasswd` resolving to
+// `getty` hung the installer on a login prompt while it waited for a hash.
+//
+// The list is therefore declared as (name, index) pairs, and `PROGRAMS` in the
+// kernel is the authority that is read back at compile time: the guard at the
+// bottom of this block fails the build if the kernel's table and these
+// numbers ever disagree. To add a program, add it to the kernel's table and to
+// this list together; the compiler refuses anything else.
 const PROG_FORKX: u64 = 3;
 const PROG_PIPETEST: u64 = 4;
 const PROG_CREDTST: u64 = 5;
 const PROG_SIGNALTST: u64 = 6;
 const PROG_TERMIOS_TST: u64 = 7;
 const PROG_POLLTEST: u64 = 8;
-/// `busybox`, the ported userland. Spawned once, to make its own applet links.
-const PROG_BUSYBOX: u64 = 15;
 /// `chello`, the C program linked against the mlibc port. The only non-Rust
 /// user image, so it is what shows the libc port runs and not merely links.
 const PROG_CHELLO: u64 = 13;
-const PROG_MKPASSWD: u64 = 16;
 /// `fbterm`, the ported Linux terminal emulator. The installer hands it the
 /// display when setup finishes; see the `handoff` method.
 const PROG_FBTERM: u64 = 14;
+/// `mkpasswd`, which turns a typed password into a `crypt(3)` hash.
+const PROG_MKPASSWD: u64 = 15;
+/// `busybox`, the ported userland. Spawned once, to make its own applet links.
+const PROG_BUSYBOX: u64 = 17;
+
+/// Every (program name, index) pair this crate spawns, for the compile-time
+/// check against the kernel's table below.
+const SPAWNED: [(&str, usize); 10] = [
+    ("forkx", PROG_FORKX as usize),
+    ("pipetest", PROG_PIPETEST as usize),
+    ("credtst", PROG_CREDTST as usize),
+    ("signaltst", PROG_SIGNALTST as usize),
+    ("termiostst", PROG_TERMIOS_TST as usize),
+    ("polltest", PROG_POLLTEST as usize),
+    ("chello", PROG_CHELLO as usize),
+    ("fbterm", PROG_FBTERM as usize),
+    ("mkpasswd", PROG_MKPASSWD as usize),
+    ("busybox", PROG_BUSYBOX as usize),
+];
+
+/// The kernel's own table of embedded images.
+///
+/// The installer runs as a ring-3 process and cannot read the kernel's memory,
+/// so it genuinely cannot ask at run time which index is which program. What
+/// it *can* do is carry the table with it: these are byte arrays of exactly the
+/// bytes the kernel was built from, so comparing them here compares the
+/// installer's belief against the kernel's reality. Same bytes means the same
+/// table, and therefore the same meaning for every index in it.
+const KERNEL_PROGRAMS: [(&str, &[u8]); 18] = [
+    ("hello", include_bytes!("../../../../target/user-hello.elf")),
+    ("consoled", include_bytes!("../../../../target/user-consoled.elf")),
+    ("inputd", include_bytes!("../../../../target/user-inputd.elf")),
+    ("forkx", include_bytes!("../../../../target/user-forkx.elf")),
+    ("pipetest", include_bytes!("../../../../target/user-pipetest.elf")),
+    ("credtst", include_bytes!("../../../../target/user-credtst.elf")),
+    ("signaltst", include_bytes!("../../../../target/user-signaltst.elf")),
+    ("termiostst", include_bytes!("../../../../target/user-termiostst.elf")),
+    ("polltest", include_bytes!("../../../../target/user-polltest.elf")),
+    ("sh", include_bytes!("../../../../target/user-sh.elf")),
+    ("installer", include_bytes!("../../../../target/user-installer.elf")),
+    ("exectst", include_bytes!("../../../../target/user-exectst.elf")),
+    ("samutils", include_bytes!("../../../../target/user-samutils.elf")),
+    ("chello", include_bytes!("../../../../target/user-chello.elf")),
+    ("fbterm", include_bytes!("../../../../target/user-fbterm.elf")),
+    ("mkpasswd", include_bytes!("../../../../target/user-mkpasswd.elf")),
+    ("getty", include_bytes!("../../../../target/user-getty.elf")),
+    ("busybox", include_bytes!("../../../../target/user-busybox.elf")),
+];
+
+const _: () = {
+    // Every name the installer spawns must sit at the index it claims, in this
+    // copy of the kernel's table. Two const fns and a loop, all folded away.
+    const fn same_name(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    // Spot the same ELF a couple of ways, so a name that matches at an index
+    // but a program that is not there is still a failure.
+    const fn is_elf(b: &[u8]) -> bool {
+        b.len() > 4 && b[0] == 0x7f && b[1] == b'E' && b[2] == b'L' && b[3] == b'F'
+    }
+
+    let mut s = 0;
+    while s < SPAWNED.len() {
+        let (name, index) = SPAWNED[s];
+        // Out of range, wrong name, or not an image: fail the build.
+        if index >= KERNEL_PROGRAMS.len() {
+            core::panic!("installer: a program index is past the end of the kernel's table");
+        }
+        let (table_name, image) = KERNEL_PROGRAMS[index];
+        if !same_name(table_name, name) {
+            core::panic!("installer: a program index does not name the program it spawns");
+        }
+        if !is_elf(image) {
+            core::panic!("installer: a program index does not point at a loadable image");
+        }
+        s += 1;
+    }
+};
 
 /// inputd's well-known IPC endpoint.
 const EP_INPUTD: u64 = 3;
@@ -781,21 +877,19 @@ impl App {
     /// pasted into the passwd database, which would look like a working login
     /// and be a special case in the one program that must not have any.
     fn hash_known(&mut self, password: &str) -> Option<String> {
-        let (rd, wr) = syscall::pipe().ok()?;
-        let in_arg = alloc::format!("{}", rd);
-        let out_arg = alloc::format!("{}", wr);
+        // Two pipes, for the reason spelled out in `hash_password`: a password
+        // going in and a hash coming out are two directions and cannot share a
+        // pipe. The password here is one the installer already has, so it skips
+        // the prompting and goes straight into the child's end.
+        let (pwd_rd, pwd_wr) = syscall::pipe().ok()?;
+        let (hash_rd, hash_wr) = syscall::pipe().ok()?;
+        let in_arg = alloc::format!("{}", pwd_rd);
+        let out_arg = alloc::format!("{}", hash_wr);
         let argv = ["mkpasswd", in_arg.as_str(), out_arg.as_str()];
         let pid = syscall::proc_spawn(PROG_MKPASSWD, Some(&argv)).ok()?;
-        if syscall::write(wr, password.as_bytes()).is_err() {
-            syscall::close(wr).ok()?;
-            let _ = syscall::waitpid(pid, &mut 0);
-            return None;
-        }
-        let _ = syscall::write(wr, b"\n");
-        syscall::close(wr).ok()?;
-        let hash = read_hash(rd);
-        syscall::close(rd).ok()?;
-        let _ = syscall::waitpid(pid, &mut 0);
+        // The password never becomes a `String` on the way out, so it is not
+        // left in the installer's heap where a later bug could print it.
+        let hash = hand_off_to_hasher(pid, pwd_wr, hash_rd, password.as_bytes());
         if hash.len() > 3 && hash.starts_with("$6$") {
             Some(hash)
         } else {
@@ -840,37 +934,28 @@ impl App {
         // printed the hash to the console instead of the pipe. This read an
         // empty pipe and reported "could not hash the password" for every
         // password, which is indistinguishable from the hasher being broken.
-        let (rd, wr) = syscall::pipe().ok()?;
-        // The child reads the password from the pipe's *read* end and writes
-        // the hash to its *write* end -- which is the opposite order to the one
-        // that reads naturally off `pipe()`. Getting it the other way round
-        // leaves the child writing to a read-only descriptor, so the hash never
-        // arrives and the installer reports "could not hash the password" for
-        // every password.
-        let in_arg = alloc::format!("{}", rd);
-        let out_arg = alloc::format!("{}", wr);
+        //
+        // Two pipes, not one, and this is the third version of this mistake.
+        //
+        // A single pipe cannot carry both directions. `pipe()` returns
+        // `(read_end, write_end)`; the installer wrote the password to the
+        // write end and then read the hash from the *read* end, which is the
+        // same pipe -- so it read its own password back, consumed it, and left
+        // the child blocked forever on a password that no longer existed.
+        // Nothing errored. Both sides simply waited on each other, which from
+        // the outside is a frozen installer.
+        //
+        // So: one pipe carries the password in, a second carries the hash out.
+        // They are separate objects with separate ends, which is what makes
+        // "the child writes the hash" and "the installer reads the hash"
+        // statements about different bytes at all.
+        let (pwd_rd, pwd_wr) = syscall::pipe().ok()?;
+        let (hash_rd, hash_wr) = syscall::pipe().ok()?;
+        let in_arg = alloc::format!("{}", pwd_rd);
+        let out_arg = alloc::format!("{}", hash_wr);
         let argv = ["mkpasswd", in_arg.as_str(), out_arg.as_str()];
         let pid = syscall::proc_spawn(PROG_MKPASSWD, Some(&argv)).ok()?;
-        // The password goes through this end, so it stays open until it has been
-        // written. Closing it first -- which this did -- means the two writes
-        // below go to a closed descriptor, the child never sees a line, and it
-        // blocks on a read that will never return. The parent then waits for a
-        // hash that cannot exist.
-        if syscall::write(wr, first.as_bytes()).is_err() {
-            syscall::close(wr).ok()?;
-            let _ = syscall::waitpid(pid, &mut 0);
-            self.msg = Some(String::from("could not hand the password to the hasher"));
-            return None;
-        }
-        let _ = syscall::write(wr, b"\n");
-        // Closed now, so the child sees end-of-file once it has the password.
-        syscall::close(wr).ok()?;
-
-        let hash = read_hash(rd);
-        syscall::close(rd).ok()?;
-        let _ = syscall::waitpid(pid, &mut 0);
-
-        let hash = hash.trim().to_string();
+        let hash = hand_off_to_hasher(pid, pwd_wr, hash_rd, first.as_bytes());
         // A hash from `crypt(3)` always starts with `$<id>$`. Anything else means
         // the hasher failed, and writing that into the passwd database would lock
         // the user out of a system they cannot then log into to repair.
@@ -1112,6 +1197,33 @@ impl App {
         );
         syscall::proc_exit_code(0);
     }
+}
+
+/// Give `pid` a password and take its hash back.
+///
+/// Both hashing paths go through here, which is the point: they differ in where
+/// the password comes from (typed, or already known) and in nothing else. The
+/// part that was easy to get wrong -- two pipes rather than one, and writing to
+/// the password pipe while reading from the hash pipe -- is therefore written
+/// once.
+///
+/// The write end is closed straight after the password, so the child sees a line
+/// and then a newline and does not sit waiting for bytes that are never coming.
+fn hand_off_to_hasher(pid: u64, pwd_wr: usize, hash_rd: usize, password: &[u8]) -> String {
+    if syscall::write(pwd_wr, password).is_err() {
+        syscall::close(pwd_wr).ok();
+        syscall::close(hash_rd).ok();
+        let _ = syscall::waitpid(pid, &mut 0);
+        return String::new();
+    }
+    // The newline terminates the password's line; it is not part of it.
+    let _ = syscall::write(pwd_wr, b"\n");
+    let _ = syscall::close(pwd_wr);
+
+    let hash = read_hash(hash_rd);
+    let _ = syscall::close(hash_rd);
+    let _ = syscall::waitpid(pid, &mut 0);
+    hash.trim().to_string()
 }
 
 /// Read a line of output from a child, bounded.
