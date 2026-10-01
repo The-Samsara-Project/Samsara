@@ -173,8 +173,25 @@ pub extern "C" fn kmain(magic: u32, mbi_phys: u64) -> ! {
     // -- being unable to log in at all would make the image useless for the one
     // thing it is for. An image that installs to disk must set a real password
     // and must not inherit this one.
-    let passwd = b"root:$6$YI2UVUNzKgLmxLfg$jmzW2NRFInnlcZGLYmZnsH83BkzEaMWsMgaF6pKH.8kb8ezuUjoVQJ8RQMyvORjhNMeEbPCymdOlUMZQO4Kh41\n\
-                   nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n";
+    // One line per entry, written as a concatenation rather than a continued
+    // string literal.
+    //
+    // A trailing backslash continues a Rust string literal onto the next line
+    // and strips *both* the newline and the indentation after it. Used here it
+    // silently removed the newline that ends the first entry, so the file was
+    // one long line with the second entry's leading whitespace eaten into it.
+    // Nothing about the write failed and the file was the right length.
+    //
+    // `fgets` then returned the entire file as a single "line", and
+    // `getpwnam` -- which parses one entry per line -- found no entry it could
+    // use. Every login was refused with "Login incorrect": a password file
+    // with no newlines in it, written by code that read as though it had them.
+    let passwd = concat!(
+        "root:$6$YI2UVUNzKgLmxLfg$jmzW2NRFInnlcZGLYmZnsH83BkzEaMWsMgaF6pKH.",
+        "8kb8ezuUjoVQJ8RQMyvORjhNMeEbPCymdOlUMZQO4Kh41\n",
+        "nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n",
+    )
+    .as_bytes();
     if let Ok(pw) = vfs::create_as("/etc/passwd", vfs::NodeKind::File, 0, 0, 0o644) {
         if let Err(e) = pw.write_at(0, passwd) {
             log::kwarn!("seed: /etc/passwd write failed: {:?}", e);
