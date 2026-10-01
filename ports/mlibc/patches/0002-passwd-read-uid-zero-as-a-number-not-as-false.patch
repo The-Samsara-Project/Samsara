@@ -1,0 +1,51 @@
+SPDX-License-Identifier: GPL-3.0-or-later
+Copyright (C) 2026 Harsh Nikarsa
+
+Read uid 0 and gid 0 as the numbers they are.
+
+`extract_entry` converted the uid and gid with `to_number<int>()`, which
+returns an `optional`, and tested the result with `if(!uid)`. That tests
+the number, not whether the conversion succeeded, so uid 0 and gid 0 were
+indistinguishable from a failed parse and the entry was rejected.
+
+This is not an edge case. uid 0 is root, and root is the account a login
+prompt most needs to resolve. `getpwnam("root")` returned NULL on every
+attempt, so the getty took its "no such user" path and refused every
+correct password with "Login incorrect" -- a message that points at the
+password rather than at the parse that threw the entry away. The passwd
+file was read correctly, the hash was correct, and the entry was discarded
+one line into being parsed.
+
+The test is `!uid.has_value()`.
+
+Generated with `git diff` against the pinned mlibc commit named in
+ports/mlibc/build.sh. Regenerate with ports/mlibc/build.sh; never edit by
+hand.
+
+diff --git a/options/posix/generic/pwd.cpp b/options/posix/generic/pwd.cpp
+index 1a3acb3b..7682057b 100644
+--- a/options/posix/generic/pwd.cpp
++++ b/options/posix/generic/pwd.cpp
+@@ -57,11 +57,20 @@ namespace {
+ 		auto passwd = strndup(segments[1].data(), segments[1].size());
+ 		__ensure(passwd);
+ 
++		/*
++		 * Samsara: `optional` has to be tested for emptiness, not for
++		 * falsiness. `if(!uid)` rejects a uid of 0 along with a failed
++		 * conversion, and uid 0 is root -- the one account a login prompt
++		 * must be able to resolve. The symptom is that
++		 * `getpwnam("root")` returns NULL, so every correct password is
++		 * refused with "Login incorrect", which points at the password
++		 * rather than at the parse that threw the entry away.
++		 */
+ 		auto uid = segments[2].to_number<int>();
+-		if(!uid)
++		if(!uid.has_value())
+ 			return false;
+ 		auto gid = segments[3].to_number<int>();
+-		if(!gid)
++		if(!gid.has_value())
+ 			return false;
+ 
+ 		auto real_name = strndup(segments[4].data(), segments[4].size());
