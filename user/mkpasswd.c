@@ -35,7 +35,7 @@
  * refuse to read back -- which would lock the owner out of their own password.
  */
 
-#include <stdio.h>
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -51,6 +51,52 @@
 static const char B64[] =
     "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
+/* Write a NUL-terminated string, in full.
+ *
+ * A short write is normal on a pipe and is not an error, but it does mean the
+ * rest has to go out separately, so this loops rather than assuming the whole
+ * string fitted. `off` advances by what was actually written, which is the only
+ * amount the kernel confirmed taking.
+ */
+static void write_str(int fd, const char *s)
+{
+	size_t len = strlen(s);
+	size_t off = 0;
+
+	while (off < len) {
+		ssize_t w = write(fd, s + off, len - off);
+		if (w < 0) {
+			if (errno == EINTR)
+				continue;
+			return;	/* nowhere left to complain to */
+		}
+		off += (size_t)w;
+	}
+}
+
+/* Diagnostics go to descriptor 2 as a plain write.
+ *
+ * stdio is deliberately absent from this program (see the read loop in `main`
+ * for why), which includes the diagnostics, so this is how one says something.
+ */
+static void warn(const char *msg)
+{
+	write_str(2, "mkpasswd: ");
+	write_str(2, msg);
+	write_str(2, "\n");
+}
+
+
+/* True when a failed call should simply be tried again.
+ *
+ * Without this a signal that interrupts a read, which is ordinary on a machine
+ * with a keyboard, would be reported as a failure to read the password.
+ */
+static int errno_is_retry(void)
+{
+	return errno == EINTR;
+}
+
 int main(int argc, char **argv)
 {
 	char password[MAX_PASSWORD];
@@ -58,7 +104,6 @@ int main(int argc, char **argv)
 	unsigned char rnd[SALT_LEN];
 	char salt[SALT_LEN + 1];
 	size_t len = 0;
-	int c;
 
 	/* The descriptors arrive as arguments and are re-pointed here rather than
 	 * being arranged by the caller.
@@ -81,42 +126,75 @@ int main(int argc, char **argv)
 	 * every password, including a perfectly good one, produced.
 	 */
 	if (argc < 3) {
-		fprintf(stderr, "usage: mkpasswd <password-fd> <output-fd>\n");
+		warn("usage: mkpasswd <password-fd> <output-fd>");
 		return 2;
 	}
 	int in_fd = atoi(argv[1]);
 	int out_fd = atoi(argv[2]);
 	if (in_fd < 0 || out_fd < 0) {
-		fprintf(stderr, "mkpasswd: bad descriptor arguments\n");
+		warn("bad descriptor arguments");
 		return 2;
 	}
 	if (in_fd != 0 && dup2(in_fd, 0) < 0) {
-		fprintf(stderr, "mkpasswd: could not adopt the password descriptor\n");
+		warn("could not adopt the password descriptor");
 		return 1;
 	}
 	if (out_fd != 1 && dup2(out_fd, 1) < 0) {
-		fprintf(stderr, "mkpasswd: could not adopt the output descriptor\n");
+		warn("could not adopt the output descriptor");
 		return 1;
 	}
 
-	/* Read one line, dropping the newline. A NUL cannot appear here: the pipe
-	 * carries exactly what the installer wrote, and the installer does not put
-	 * one in. */
-	while (len < sizeof password - 1) {
-		c = getchar();
-		if (c == EOF || c == '\n')
+	/* Read one line with read(2), NOT with stdio.
+	 *
+	 * This is the second version of this mistake, and the first one was worse:
+	 * `getchar()` reads through a stdio stream that mlibc built against
+	 * descriptor 0 as it was *before* the dup2 above -- the keyboard, not the
+	 * pipe. So this program sat waiting for somebody to press Enter on the
+	 * terminal while the installer sat waiting for a hash, and neither ever
+	 * moved. The duplicate was never in the stream, because the stream was
+	 * already open on the other descriptor.
+	 *
+	 * The lesson is that "the descriptor is 0 now" and "the stream reads from
+	 * descriptor 0 now" are different claims, and only the second one is what
+	 * stdio actually does. So there is no stdio in this program: it reads the
+	 * descriptor number it was given and writes the descriptor number it was
+	 * given, and neither is assumed to be 0 or 1.
+	 *
+	 * A NUL cannot appear here: the pipe carries exactly what the installer
+	 * wrote, and the installer does not put one in.
+	 */
+	for (;;) {
+		ssize_t n;
+		char *nl;
+
+		if (len >= sizeof password - 1)
+			break;	/* longer than we accept; the rest is discarded */
+		n = read(0, password + len, sizeof password - 1 - len);
+		if (n < 0) {
+			if (errno_is_retry())
+				continue;
+			warn("could not read the password");
+			return 1;
+		}
+		if (n == 0)
+			break;	/* end of file, without a newline */
+		len += (size_t)n;
+
+		nl = memchr(password, '\n', len);
+		if (nl) {
+			len = (size_t)(nl - password);	/* the newline is not part of it */
 			break;
-		password[len++] = (char)c;
+		}
 	}
 	password[len] = '\0';
 
 	if (len == 0) {
-		fprintf(stderr, "mkpasswd: refusing to hash an empty password\n");
+		warn("refusing to hash an empty password");
 		return 1;
 	}
 
 	if (getrandom(rnd, sizeof rnd, 0) != (ssize_t)sizeof rnd) {
-		fprintf(stderr, "mkpasswd: no entropy for a salt\n");
+		warn("no entropy for a salt");
 		return 1;
 	}
 	/* Rejection sampling, so every salt character is uniform. Taking the low six
@@ -133,12 +211,18 @@ int main(int argc, char **argv)
 	/* SHA-512-crypt at the default cost. See ports/mlibc/sysdeps/samsara/crypt.cpp
 	 * for why this scheme and not bcrypt or Argon2id: it is the strongest one
 	 * reachable through `crypt(3)`, which is the API everything that verifies a
-	 * password here calls. */
-	snprintf(setting, sizeof setting, "$6$%s", salt);
+	 * password here calls.
+	 *
+	 * Built with strcpy/strcat rather than snprintf, which came out with stdio.
+	 * The sizes are all fixed and checked by the compiler here, so the
+	 * formatting machinery was never buying anything: three literal bytes and a
+	 * salt whose length is a #define. */
+	strcpy(setting, "$6$");
+	strcat(setting, salt);
 
 	char *hash = crypt(password, setting);
 	if (!hash || hash[0] != '$') {
-		fprintf(stderr, "mkpasswd: crypt(3) refused the setting\n");
+		warn("crypt(3) refused the setting");
 		return 1;
 	}
 
@@ -146,10 +230,32 @@ int main(int argc, char **argv)
 	 * two disagree -- and a password that cannot be verified later is exactly
 	 * the failure this program exists to prevent. */
 	if (strncmp(hash + 3, salt, SALT_LEN) != 0) {
-		fprintf(stderr, "mkpasswd: crypt(3) did not use the salt it was given\n");
+		warn("crypt(3) did not use the salt it was given");
 		return 1;
 	}
 
-	puts(hash);
+	/* One line, written to the descriptor rather than through stdio, for the
+	 * same reason the password is read from one. A short write is retried, since
+	 * a hash truncated to half its length is not a hash and would silently lock
+	 * the account out. */
+	{
+		size_t off = 0;
+		size_t n = strlen(hash);
+
+		while (off < n) {
+			ssize_t w = write(1, hash + off, n - off);
+			if (w < 0) {
+				if (errno_is_retry())
+					continue;
+				warn("could not write the hash");
+				return 1;
+			}
+			off += (size_t)w;
+		}
+		if (write(1, "\n", 1) != 1) {
+			warn("could not write the hash");
+			return 1;
+		}
+	}
 	return 0;
 }
