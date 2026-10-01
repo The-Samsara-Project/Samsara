@@ -524,9 +524,24 @@ pub fn init() {
 /// Write raw bytes to the console (used by the logger and panics).
 pub fn write(bytes: &[u8]) {
     let mut guard = CONSOLE.lock();
-    if let Some(con) = guard.as_mut() {
-        con.write(bytes);
-        con.cursor_cell();
+    match guard.as_mut() {
+        Some(con) => {
+            con.write(bytes);
+            con.cursor_cell();
+        }
+        // Detached. The framebuffer belongs to a terminal emulator now, but the
+        // serial line is still ours and nothing else is writing to it.
+        //
+        // Dropping these bytes is what made a detached console a black hole: a
+        // program writing to /dev/console got no output and no error, which is
+        // indistinguishable from the program having written nothing. It is also
+        // why a login prompt could not be diagnosed after the display changed
+        // hands -- the prompt went to the terminal, so its diagnostics had
+        // nowhere to go either.
+        None => {
+            drop(guard);
+            crate::io::uart::write(bytes);
+        }
     }
 }
 
