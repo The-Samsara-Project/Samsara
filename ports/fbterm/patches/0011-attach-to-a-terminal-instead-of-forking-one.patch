@@ -27,6 +27,12 @@ size itself before it has been sized, since its own dimensions are zero until
 the caller resizes it. And it must not reach for forkpty at all, which would
 put it back in the position of being the login program's parent.
 
+The option is declared as taking a value, and the value is checked. Declared
+without the colon, getopt_long treats `--attach-fd=0` as a flag, leaves `optarg`
+NULL, and the atoi faults: the terminal dies before its first message, so there
+is nothing on the screen and nothing in the log to say why, and the display
+keeps showing the kernel console as though the terminal had never started.
+
 Without the option this is exactly upstream.
 
 Generated with `git diff` against the pinned fbterm commit
@@ -34,7 +40,7 @@ Generated with `git diff` against the pinned fbterm commit
 ports/fbterm/build.sh; never edit by hand.
 
 diff --git a/src/fbconfig.cpp b/src/fbconfig.cpp
-index 8249746..0d949aa 100644
+index 8249746..e532d79 100644
 --- a/src/fbconfig.cpp
 +++ b/src/fbconfig.cpp
 @@ -37,6 +37,7 @@ Config::Config()
@@ -54,14 +60,24 @@ index 8249746..0d949aa 100644
  		{ "verbose", no_argument, 0, 'v' },
  		{ "font-names", required_argument, 0, 'n' },
  		{ "font-size", required_argument, 0, 's' },
-@@ -250,8 +253,12 @@ bool Config::parseArgs(s32 argc, s8 **argv)
+@@ -250,8 +253,22 @@ bool Config::parseArgs(s32 argc, s8 **argv)
  	};
  
  	s32 index;
 -	while ((index = getopt_long(argc, argv, "Vvhn:s:f:b:e:r:i:c:C:W:H:B:al", options, 0)) != -1) {
-+	while ((index = getopt_long(argc, argv, "VAvhn:s:f:b:e:r:i:c:C:W:H:B:al", options, 0)) != -1) {
++	while ((index = getopt_long(argc, argv, "VA:vn:s:f:b:e:r:i:c:C:W:H:B:al", options, 0)) != -1) {
  		switch (index) {
 +		case 'A':
++			/* An option that takes a value and arrives without one has
++			 * to be an error, not a dereference of NULL: getopt_long
++			 * leaves optarg NULL in that case and the atoi faults.
++			 * The terminal then dies before its first message, so there
++			 * is nothing on the screen and nothing in the log to say why.
++			 */
++			if (!optarg) {
++				fprintf(stderr, "fbterm: --attach-fd needs a descriptor\n");
++				return false;
++			}
 +			mAttachFd = atoi(optarg);
 +			break;
 +
