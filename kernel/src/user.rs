@@ -588,6 +588,20 @@ pub fn start_first_user() {
         }
     };
 
+    // Stop the kernel console painting over the display.
+    //
+    // The installer used to do this as it handed the framebuffer over. Without
+    // it the text console keeps drawing the boot log over the whole screen for
+    // as long as the kernel is up, and a terminal emulator painting the same
+    // pixels has it erased underneath itself a line at a time. What a person
+    // sees is the boot log, which reads exactly like a terminal that never
+    // started.
+    //
+    // It happens after the console and keyboard drivers are up, because both
+    // report through the console, and their startup messages are the last thing
+    // worth seeing there.
+    crate::console::detach();
+
     // The login prompt, started before the terminal and privileged.
     //
     // It has to be privileged: it becomes whoever logs in, and nothing
