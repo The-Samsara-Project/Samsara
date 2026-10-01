@@ -1250,11 +1250,18 @@ impl App {
             if syscall::proc_spawn(PROG_GETTY, Some(&argv)).is_err() {
                 println!("[installer] could not start the login prompt");
             }
-            // fbterm reads the master, which is where the getty's output and the
-            // keyboard both arrive.
-            let master = syscall::open(BOOT_MASTER, syscall::O_RDWR, 0).unwrap_or(pts);
-            let _ = syscall::dup2(master as u64, 0);
-            let attach = alloc::format!("--attach-fd=0");
+            // fbterm draws from the master and takes input from stdin, and those
+            // are opposite ends of the pair.
+            //
+            // The master goes on the descriptor named by --attach-fd, because
+            // that is where the getty's output arrives and a terminal emulator
+            // reads its terminal from there. The *slave* stays on stdin: fbterm
+            // checks `isatty(STDIN_FILENO)` before it will read anything, and a
+            // master is not a terminal, so putting it there made fbterm give up
+            // at once and paint nothing at all.
+            let master = syscall::open(BOOT_MASTER, syscall::O_RDWR, 0).unwrap_or(pty);
+            let _ = syscall::dup2(pty as u64, 0);
+            let attach = alloc::format!("--attach-fd={}", master);
             let argv = ["fbterm", attach.as_str()];
             println!("[installer] handing the display to fbterm");
             let _ = syscall::proc_spawn(PROG_FBTERM, Some(&argv));
