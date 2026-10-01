@@ -299,6 +299,26 @@ fn seed_userland() {
         }
     }
 
+    // `/bin/sh`, linked by hand like `/bin/getty` below.
+    //
+    // This port's busybox is configured with `CONFIG_SH_IS_ASH`, so the shell's
+    // name in the applet table is `ash` and it is not reported by `--list` --
+    // which is why no amount of asking the binary would produce this name. Every
+    // system expects `/bin/sh` to exist, and a login shell named in the passwd
+    // database that is not there fails with ENOENT from inside `execve`, so the
+    // symptom is a login that authenticates and then goes nowhere.
+    //
+    // It also has to exist before anything can run: the self-tests and the
+    // installer both reached `/bin/sh`, and there is nothing to install now.
+    let _ = vfs::symlink_as(
+        "/bin/sh",
+        "/bin/busybox",
+        0,
+        0,
+        0o777,
+        &crate::cred::Credentials::root(),
+    );
+
     // `/bin/getty` is this system's own login program rather than a busybox
     // applet, so it is seeded as a real image for the same reason busybox is.
     //
