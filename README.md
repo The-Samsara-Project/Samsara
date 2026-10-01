@@ -345,12 +345,6 @@ The kernel itself is a zero-dependency #![no_std] static library, linked by
 hand with lld against a custom linker script. Any Multiboot2-capable loader
 can boot it, and the ISO works off a CD or a USB stick.
 
-DOCS
-----
-
-  docs/ABI.md          the syscall contract, and what "stable" means
-
-
 WHERE THIS IS GOING
 --------------------
 

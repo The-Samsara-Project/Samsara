@@ -491,7 +491,8 @@ pub enum NodeKind {
     /// This is the last value, appended to the ABI's node-kind numbering, and it
     /// has to stay that way: the discriminant is passed to user space as
     /// `st_mode`'s type bits, so inserting a variant would re-type every
-    /// existing node. Append, as `docs/ABI.md` requires of the syscall table.
+    /// existing node. Append, as the syscall table in `kernel/src/abi/mod.rs`
+    /// requires: a number that has been used keeps its meaning.
     Symlink = 4,
 }
 

@@ -117,7 +117,7 @@ const STOP_PENDINGS: u64 =
     (1u64 << SIGSTOP) | (1u64 << SIGTSTP) | (1u64 << SIGTTIN) | (1u64 << SIGTTOU);
 
 // ---------------------------------------------------------------------------
-// ABI structs and constants shared with user space (see `docs/ABI.md`)
+// ABI structs and constants shared with user space (see `kernel/src/abi/mod.rs`)
 // ---------------------------------------------------------------------------
 
 /// Default disposition: reset to the kernel's default (mostly terminate).

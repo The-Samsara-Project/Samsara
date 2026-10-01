@@ -15,7 +15,8 @@
 //! | clobbered    | `rcx` (return rip), `r11` (caller rflags)    |
 //! | preserved    | all other registers, per SysV callee-saved   |
 //!
-//! See `docs/ABI.md` for the full contract and the stable number table.
+//! The table below is the contract: the number a call keeps is the number it
+//! was given, and new calls are appended rather than slotted in between.
 
 use crate::sig::samsara_post_syscall;
 use alloc::boxed::Box;

@@ -31,7 +31,7 @@
 #ifndef _SYS_SYSCALL_H
 #define _SYS_SYSCALL_H
 
-/* The ABI, for reference. See kernel/src/abi/mod.rs and docs/ABI.md.
+/* The ABI, for reference. See kernel/src/abi/mod.rs.
  *
  *   syscall nr -> rax
  *   arguments  -> rdi, rsi, rdx, r10, r8, r9

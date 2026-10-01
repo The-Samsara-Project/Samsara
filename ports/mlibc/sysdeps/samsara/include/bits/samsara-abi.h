@@ -2,7 +2,7 @@
 #define _BITS_SAMSARA_ABI_H
 
 /*
- * The Samsara system call ABI (kernel/src/abi/mod.rs; see also docs/ABI.md):
+ * The Samsara system call ABI (see kernel/src/abi/mod.rs):
  *
  *   syscall nr   -> `rax`
  *   arguments    -> `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`

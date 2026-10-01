@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Harsh Nikarsa
 //
-// Raw `syscall` ABI. Numbers here MUST match `abi/nr` in the kernel and
-// `docs/ABI.md`; the list is append-only.
+// Raw `syscall` ABI. Numbers here MUST match `abi/nr` in the kernel; the
+// list is append-only.
 
 extern crate alloc;
 
