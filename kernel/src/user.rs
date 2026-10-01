@@ -37,31 +37,29 @@ pub const PROG_TERMIOS_TST: usize = 7;
 pub const PROG_POLLTEST: usize = 8;
 /// Index of the standalone shell, run directly on the console PTY.
 pub const PROG_SHELL: usize = 9;
-/// Index of the interactive setup wizard (the boot-time user front end).
-pub const PROG_INSTALLER: usize = 10;
 /// Index of the bounded exec target (reached via `exec()` from `forkx`).
-pub const PROG_EXECTST: usize = 11;
+pub const PROG_EXECTST: usize = 10;
 /// Index of `chello`, the C program linked against the mlibc port. It is the
 /// only non-Rust user image, so it is what proves the libc port runs rather
 /// than merely links; the installer runs it as a boot self-test.
-pub const PROG_CHELLO: usize = 12;
+pub const PROG_CHELLO: usize = 11;
 /// Index of `fbterm`, the ported Linux terminal emulator. Present in the table
 /// unconditionally so the index is stable whether or not the port has been
 /// built; see the table entry for how the image is gated.
-pub const PROG_FBTERM: usize = 13;
+pub const PROG_FBTERM: usize = 12;
 /// Index of `busybox`, the ported multi-call binary and the system userland.
 /// One image; the applet is chosen by `argv[0]`, which is why every name under
 /// `/bin` is a symlink to it rather than a copy.
-pub const PROG_BUSYBOX: usize = 16;
+pub const PROG_BUSYBOX: usize = 15;
 /// Index of `mkpasswd`, the helper that turns a password into a `crypt(3)` hash.
 ///
 /// A separate program rather than part of the installer because the installer is
 /// Rust and the Rust programs here do not link mlibc, so it cannot call `crypt(3)`
 /// itself. Hashing stays in user space, in a program that can be checked against
 /// a reference implementation, rather than in the kernel.
-pub const PROG_MKPASSWD: usize = 14;
+pub const PROG_MKPASSWD: usize = 13;
 /// Index of `getty`, the program that fronts a terminal and runs a login.
-pub const PROG_GETTY: usize = 15;
+pub const PROG_GETTY: usize = 14;
 
 /// A boot-time user-space program.
 pub(crate) struct Program {
@@ -74,7 +72,7 @@ pub(crate) struct Program {
     pub(crate) image: &'static [u8],
 }
 
-pub(crate) const PROGRAMS: [Program; 17] = [
+pub(crate) const PROGRAMS: [Program; 16] = [
     Program {
         name: "hello",
         endpoint: None,
@@ -134,14 +132,6 @@ pub(crate) const PROGRAMS: [Program; 17] = [
         endpoint: None,
         root: false,
         image: include_bytes!("../../target/user-sh.elf"),
-    },
-    Program {
-        name: "installer",
-        endpoint: None,
-        // The setup wizard runs privileged: it must stat/open block devices
-        // (mode-0 devfs nodes) and manage /etc without permission surprises.
-        root: true,
-        image: include_bytes!("../../target/user-installer.elf"),
     },
     Program {
         name: "exectst",
@@ -258,7 +248,6 @@ const _: () = {
         else if same!(n, "termiostst") { PROG_TERMIOS_TST }
         else if same!(n, "polltest") { PROG_POLLTEST }
         else if same!(n, "sh") { PROG_SHELL }
-        else if same!(n, "installer") { PROG_INSTALLER }
         else if same!(n, "exectst") { PROG_EXECTST }
         else if same!(n, "chello") { PROG_CHELLO }
         else if same!(n, "fbterm") { PROG_FBTERM }
@@ -406,7 +395,17 @@ pub(crate) fn build_image_bytes(
 
 /// Spawn a process from the embedded program table. Returns its task id.
 pub fn spawn_program(index: usize) -> Result<crate::task::TaskId, i32> {
-    spawn_program_args(index, alloc::vec::Vec::new())
+    spawn_program_args(index, alloc::vec::Vec::new(), None)
+}
+
+/// Spawn a program whose three standard descriptors are a terminal rather than
+/// the console. For the login prompt, which has to be on the display a person is
+/// looking at.
+pub fn spawn_program_on_terminal(
+    index: usize,
+    tty: crate::vfs::VnodeRef,
+) -> Result<crate::task::TaskId, i32> {
+    spawn_program_args(index, alloc::vec::Vec::new(), Some(tty))
 }
 
 /// Spawn a process from the embedded program table with an argument vector.
@@ -416,6 +415,7 @@ pub fn spawn_program(index: usize) -> Result<crate::task::TaskId, i32> {
 pub fn spawn_program_args(
     index: usize,
     args: Vec<String>,
+    stdio: Option<crate::vfs::VnodeRef>,
 ) -> Result<crate::task::TaskId, i32> {
     // The env has to exist before `build_image`, because it goes onto the
     // newborn's initial stack. A parent's env is inherited verbatim; `PWD` is
@@ -479,7 +479,24 @@ pub fn spawn_program_args(
         // Kernel boot: no caller to inherit from, so the newborn needs a set of
         // standard descriptors of its own or every write to fd 1 fails with
         // EBADF and the program's output is lost.
-        None => install_standard_fds(tid.0),
+        //
+        // `stdio` is what it should be. It is set when the program belongs on
+        // the terminal rather than the console -- the login prompt, which has to
+        // read keystrokes and write its prompt where the terminal draws them.
+        // Changing the descriptors afterwards does not work: the task has
+        // already been created and may already have run, and displacing
+        // `/dev/console` takes away the very thing every diagnostic is printed
+        // through, so the failure is one that cannot be reported.
+        None => {
+            let node = match stdio {
+                Some(n) => n,
+                None => match crate::vfs::devfs::console_node() {
+                    Ok(n) => n,
+                    Err(_) => return Err(-9),
+                },
+            };
+            install_standard_fds(tid.0, node);
+        }
     }
     // A process spawned from user space (via `PROC_SPAWN`) becomes a child of
     // its spawner so the caller can reap it with `waitpid` — the installer
@@ -521,21 +538,73 @@ pub fn spawn_program_args(
 /// has gone to the trouble of arranging a child's descriptors -- a terminal on
 /// stdin, an output file on stdout -- means it. Overwriting them here is what
 /// used to make that impossible.
-fn install_standard_fds(task: usize) {
-    let Ok(node) = crate::vfs::devfs::console_node() else {
-        return;
-    };
+fn install_standard_fds(task: usize, node: crate::vfs::VnodeRef) {
     for _ in 0..3 {
         crate::vfs::fdtab::install(task, node.clone());
     }
 }
 
 /// Spawn the boot-time user environment: the console server, the keyboard
-/// driver, then the interactive installer. Everything else — the example
-/// programs, and the terminal — is launched on demand by the
-/// installer, which is the first thing the user actually talks to.
+/// driver, then a login prompt and the terminal that draws it.
+///
+/// There is no installer between the keyboard and the login prompt. It was a
+/// wizard for setting a machine up, and on a system that boots into ramfs there
+/// is nothing to set up: no disk was found, so there is no filesystem to write,
+/// no account to create, and no configuration to collect. The only thing a
+/// person at the keyboard wants is to be let in.
+///
+/// The order matters and is not interchangeable. `consoled` owns the master of
+/// pair 0 and copies keystrokes into it, so it has to be running before
+/// anything reads that end. `inputd` is what feeds it, and has to be running
+/// before anything types. The getty is started before the terminal because it
+/// must be privileged -- it becomes whoever logs in, and nothing unprivileged
+/// can start one -- while the terminal is an unprivileged drawing program that
+/// has no business holding that privilege even briefly.
 pub fn start_first_user() {
     let _ = spawn_program(PROG_CONSOLED);
     let _ = spawn_program(PROG_INPUTD);
-    let _ = spawn_program(PROG_INSTALLER);
+
+    // The console pty's two ends. `consoled` writes keystrokes into the master
+    // and the terminal reads the master's output; the getty reads and writes the
+    // slave.
+    //
+    // Both nodes are the ones already published as `/dev/pts/0` and
+    // `/dev/ptmx0`. Resolving the registered names rather than building fresh
+    // wrappers is what makes this the same pair the console server is using:
+    // two nodes for one pair would be two sets of buffers, and a login prompt on
+    // one of them would show nothing on the other.
+    let slave = match crate::vfs::resolve("/dev/pts/0") {
+        Ok(n) => n,
+        Err(e) => {
+            crate::log::kwarn!("user: no console pty ({:?}); there will be no login", e);
+            return;
+        }
+    };
+    let master = match crate::vfs::resolve("/dev/ptmx0") {
+        Ok(n) => n,
+        Err(e) => {
+            crate::log::kwarn!("user: no console pty master ({:?}); no terminal", e);
+            return;
+        }
+    };
+
+    // The login prompt, started before the terminal and privileged.
+    //
+    // It has to be privileged: it becomes whoever logs in, and nothing
+    // unprivileged can start one. That is also why the kernel starts it rather
+    // than the terminal, which is an unprivileged drawing program.
+    let _ = spawn_program_on_terminal(PROG_GETTY, slave);
+
+    // The terminal, drawing the master.
+    //
+    // `argv[0]` is the program's own name and the option parser starts after it,
+    // so a vector of just the option would make that string the program name and
+    // leave the parser with no arguments at all -- and the terminal then quietly
+    // falls back to making its own pty, which is the arrangement that cannot
+    // work.
+    let args = alloc::vec![
+        alloc::string::String::from("fbterm"),
+        alloc::string::String::from("--attach-fd=0"),
+    ];
+    let _ = spawn_program_args(PROG_FBTERM, args, Some(master));
 }

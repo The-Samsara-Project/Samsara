@@ -3145,7 +3145,7 @@ fn sys_waitpid(pid: u64, status_ptr: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64
 
 fn sys_proc_spawn(prog: u64, argv: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
     let args = unsafe { read_argv(argv) };
-    match crate::user::spawn_program_args(prog as usize, args) {
+    match crate::user::spawn_program_args(prog as usize, args, None) {
         Ok(pid) => pid.0 as i64,
         Err(_) => errno::ENOENT,
     }
