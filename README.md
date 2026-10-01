@@ -1,7 +1,7 @@
 SAMSARA / NUTCRACKER
 --------------------
 <div align="center">
-  <img src="samsara.svg" width="200" height="200" style="border-radius: 50%; object-fit: cover;">
+  <img src="samsara.svg" width="200" height="200">
 </div>
 
 A 64-bit micro-kernel-based operating system and kernel written in Rust. Copyright (C) 2026 Harsh Nikarsa.
@@ -193,6 +193,31 @@ Servers:
   human actually talks to: it takes the display, runs the boot self-tests
   and shows the results.
 
+  The installer either finishes an installation, or offers a live boot:
+  nothing installed, nothing written to disk, the session gone at reboot.
+  Live boot hands the display to a login prompt where `root` / `root`
+  works, which is what a distribution's live image does for the same
+  reason -- on a session that is discarded and cannot be reached from
+  outside, a known password is the point rather than the risk. An
+  installation never takes that path: it asks for a password and stores a
+  real hash, and a blank one leaves the account locked rather than open.
+
+Logging in:
+  /bin/getty is the login prompt. It reads a name from /etc/passwd, hashes
+  the typed password with crypt(3) and compares, then drops to that
+  account's privileges and execs its login shell. It loops on logout rather
+  than exec-ing, so logging out returns to a prompt instead of to nothing.
+  Root's login shell is /bin/sh; pointing it at the getty would make the
+  getty exec itself forever.
+
+  /bin/mkpasswd is what turns a password into that hash. It is a separate C
+  program because the installer is Rust and the Rust programs here use a
+  freestanding std that does not link the libc port -- so it cannot call
+  crypt(3) itself, and password hashing does not belong in the kernel.
+  It reads the password from a descriptor and writes the hash to another,
+  both passed as numbers, which keeps the password off the command line,
+  off the filesystem, and out of the installer entirely.
+
 The libc port:
   mlibc, pinned to one commit and built from ports/mlibc/build.sh. The
   sysdeps are Samsara's own ABI, one wrapper per tag, and the pinned
@@ -210,6 +235,20 @@ The libc port:
   Second, where a capability is missing the sysdep returns ENOSYS rather
   than a plausible-looking answer. A caller that is told "no" can fall
   back; one handed a wrong number acts on it.
+
+  The port also implements crypt(3) (ports/mlibc/sysdeps/samsara/crypt.cpp),
+  because nothing above it can: busybox's passwd applet calls crypt(3) and
+  nothing else, and that call has to land somewhere real. SHA-512-crypt ($6$)
+  is the scheme, because it is the strongest one reachable through that exact
+  entry point -- bcrypt, scrypt and Argon2 are different APIs entirely
+  (crypt_blowfish, crypt_gensalt, crypt_ra) and would need a patched busybox
+  or an unreadable hash. It is glibc's current default and so portable, and it
+  is checked against glibc over randomised inputs rather than against a test
+  vector, because a transcription error in a hash function passes its own test
+  vectors happily. It is not memory-hard; `rounds=N` is the only mitigation
+  crypt(3) offers. DES and MD5-crypt are deliberately absent: crypt(3)
+  returns NULL for them, so they fail closed rather than offering something
+  weaker by accident.
 
   The port also supplies ioctl(3) and <sys/ioctl.h> itself
   (ports/mlibc/sysdeps/samsara/ioctl.cpp). mlibc defines both only
@@ -244,21 +283,26 @@ Thread blocks:
 
 Smoke test:
   user/chello.c is a C program linked against that sysroot, and it is the
-  only non-Rust user image. It checks the things a libc actually needs to
-  work - stdio and buffering, the thread pointer, syscalls, directory
-  listing, timestamps, entropy, mmap - and the installer runs it with the
-  other self-tests. If the libc port is broken, this is what notices.
+  one the installer runs with the other self-tests. It checks the things a
+  libc actually needs to work - stdio and buffering, the thread pointer,
+  syscalls, directory listing, timestamps, entropy, mmap, and crypt(3) -
+  and if the libc port is broken, this is what notices.
 
-  A passing suite is not the same as a working machine, and the gap is
-  worth naming because two real failures lived in it. Every one of those
-  tests runs a program that prints to a pipe; none of them types at a
-  terminal and waits for a shell to answer. A shell that could not be
-  exec'd at all passed the whole suite, and so did a terminal that
-  cleared the screen and drew a cursor but no glyphs - both read as "the
-  terminal is dead" from the outside and neither is visible to a test that
-  never renders anything. scripts/run-shelltest.sh drives the keyboard
-  and reads the answers back off the framebuffer, which is the only check
-  here that would have caught either.
+  The login path is the clearest example of that gap. Every one of the
+  self-test programs runs, prints, and exits; none of them waits for a
+  person to type a password and then exec a shell. Four separate bugs lived
+  in exactly that gap -- a getty spawned where a password hasher was meant
+  to be, a hasher that read a descriptor the stream was not reading from, a
+  single pipe used for both directions of a conversation, and a login shell
+  set to the getty itself -- and every one of them presented as the same
+  thing: a wizard that stops responding. Nothing crashed. Nothing returned
+  an error. A program that would have caught any of them has to actually log
+  in and check who it ended up as.
+
+  So: scripts/run-shelltest.sh drives the keyboard and reads the answers
+  back off the framebuffer, and scripts/logintest.sh does the same for a
+  login, a wrong password, and the right one. Both are the only checks here
+  that would have caught any of the above.
 
 BUILDING
 --------
@@ -266,32 +310,45 @@ BUILDING
 You'll need a Rust nightly toolchain with the x86_64-unknown-none
 target, plus nasm, grub-mkrescue, xorriso, and qemu-system-x86_64.
 
-  make          builds target/samsara.elf and samsara.iso
-  make mlibc    builds the mlibc libc port (sysroot under build/sysroot)
-  make run      boots it in QEMU, kernel log goes to serial/stdout
-  make clean    wipes build artifacts
+  make            builds target/samsara.elf and samsara.iso, and pulls in the
+                  userland it embeds: the libc port, fbterm and busybox
+  make user-bins  builds the ring-3 images on their own
+  make run        boots it in QEMU, kernel log goes to serial/stdout
+  make run-fbterm boots it with a graphical terminal emulator
+  make debug      boots with the debug kernel
+  make clean      wipes build artifacts
+
+The libc port is built as part of the normal build, because a kernel without
+the programs that link against it is not a bootable machine. `make user-bins`
+is the target to reach for when working on userspace.
+
+C programs are built by their own scripts, each a worked example of the same
+path -- freestanding clang, -static-pie, the sysroot headers, and lld's
+default linker script with only --image-base changed:
+
+  user/build-chhello.sh    the libc smoke test
+  user/build-getty.sh      the login prompt
+  user/build-mkpasswd.sh   the password hasher
+
+The default linker script is deliberate: it already gets PT_LOAD, PT_TLS, the
+init array and .bss right, and a hand-written one gets several of them wrong
+at once.
 
 The libc port is fully self-contained under ports/mlibc/ (see its README):
 a pinned, deterministic build of mlibc - patches, sysdeps and cross file are
-all committed there, and `make mlibc` reproduces the sysroot on any host with
-git, meson, ninja and a freestanding clang toolchain.
+all committed there, and ports/mlibc/build.sh reproduces the sysroot on any
+host with git, meson, ninja and a freestanding clang toolchain. No mlibc
+source is vendored; the build pins one upstream commit and applies the
+in-tree patches to it, so the same commit gives the same sysroot every time.
 
-It's a zero-dependency #![no_std] static library, linked by hand with
-lld against a custom linker script. Any Multiboot2-capable loader can
-boot it, and the ISO works fine off a CD or USB stick.
-
-C programs are built with user/build-chhello.sh, which is a worked example
-of the whole path: freestanding clang, -static-pie, the sysroot headers, and
-lld's default linker script with only --image-base changed. That last part is
-deliberate - the default script already gets PT_LOAD, PT_TLS, the init array
-and .bss right, and a hand-written one gets several of them wrong at once.
-
+The kernel itself is a zero-dependency #![no_std] static library, linked by
+hand with lld against a custom linker script. Any Multiboot2-capable loader
+can boot it, and the ISO works off a CD or a USB stick.
 
 DOCS
 ----
 
-  docs/ARCHITECTURE.md   subsystem tour, memory layout
-  docs/ABI.md            the syscall contract, and what "stable" means
+  docs/ABI.md          the syscall contract, and what "stable" means
 
 
 WHERE THIS IS GOING
@@ -342,7 +399,9 @@ output of an AI tool.
 
 WHAT WE ASK INSTEAD
 
-  - Read the relevant section of docs/ARCHITECTURE.md before touching
+  - Read the subsystem before touching it. The source is commented for this:
+    the reason a thing is the way it is usually sits next to it, and the
+    reasons the code looks strange are almost always load-bearing.
     a subsystem you haven't worked in.
   - Keep patches small and focused. One logical change per patch.
   - Explain *why* in the commit message, not just what changed. The

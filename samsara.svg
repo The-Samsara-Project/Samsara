@@ -16,9 +16,16 @@
   the only reason a mark like this survives being scaled from a README heading
   back up to a wall.
 
-  A ground, not a disc. A disc on a transparent field disappears against a dark
-  background, and most of the places a logo ends up are dark. The square is
-  deliberate.
+  A ground, and it is round. The field is a disc rather than a square, so the
+  mark is circular on its own terms: rendered as an image it needs no CSS, no
+  border-radius and no clipping, which means it looks the same in a browser, in
+  a README, in a terminal emulator and in anything that rasterises SVG without
+  a stylesheet. The shape is in the file, not in whatever happens to display it.
+
+  The cost is honest and worth naming: on a dark background the indigo field
+  recedes, leaving the white rim and spokes floating. That is the intended
+  reading anyway (the wheel is the mark, and the field only holds it), but it
+  is a real difference from a square, which would have sat on any page.
 
   All the coordinates below were computed, not eyeballed: the spoke is a quad from
   a narrow base at the hub to a wider tip, and the eight are one element rotated
@@ -33,7 +40,7 @@
    version="1.1"
    id="samsara-logo">
   <title id="samsara-logo-title">Samsara</title>
-  <desc id="samsara-logo-desc">A wheel of eight spokes turning about a hub, inside a ring, on an indigo field.</desc>
+  <desc id="samsara-logo-desc">A wheel of eight spokes turning about a hub, inside a ring, on a round indigo field.</desc>
 
   <defs id="samsara-logo-defs">
     <!--
@@ -51,10 +58,13 @@
           Z" />
   </defs>
 
-  <!-- The field the mark sits on. See the note above on why this is a square. -->
-  <rect
+  <!--
+    The field the mark sits on: a disc, so the mark is circular by itself. See
+    the note above.
+  -->
+  <circle
      id="samsara-ground"
-     x="0" y="0" width="210" height="210"
+     cx="105" cy="105" r="105"
      fill="#241a4d" />
 
   <!--
