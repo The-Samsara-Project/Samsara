@@ -177,7 +177,16 @@ fn lock() -> crate::sync::SpinlockGuard<'static, FrameAllocator> {
 
 /// Allocate one physical frame, returning its physical address.
 pub fn alloc_frame() -> Option<usize> {
-    lock().alloc()
+    let mut a = lock();
+    match a.alloc() {
+        Some(f) => Some(f),
+        None => {
+            let (total, used) = (a.total_frames, a.used_frames);
+            drop(a);
+            crate::log::kwarn!("pmm: out of frames ({} of {} in use)", used, total);
+            None
+        }
+    }
 }
 
 /// Allocate `count` contiguous frames, returning the first physical address.

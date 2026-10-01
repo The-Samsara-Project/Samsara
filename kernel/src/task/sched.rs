@@ -1140,7 +1140,10 @@ pub fn fork_current() -> Result<TaskId, i64> {
     };
     let cr3 = match as_root {
         Some(root) => crate::memory::user_map::clone_user_as(root).map_err(|e| e)?,
-        None => return Err(crate::abi::errno::EPERM),
+        None => {
+            crate::log::kwarn!("fork: caller has no address space to clone");
+            return Err(crate::abi::errno::EPERM);
+        }
     };
 
     let mut g = SCHED.lock();

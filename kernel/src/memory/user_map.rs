@@ -677,7 +677,15 @@ pub fn clone_user_as(parent_root: usize) -> Result<usize, i64> {
         // leaves were already refcounted above and are released again here,
         // which keeps every retain/release pair balanced.
         destroy_user_as(child.root());
-        return Err(crate::abi::errno::ENOSYS);
+        crate::log::kwarn!("clone_user_as: out of frames cloning a user address space");
+        // ENOMEM, not ENOSYS. This is not a capability that is missing -- the
+        // clone is implemented and works right up until the allocator runs dry.
+        //
+        // ENOSYS here said "operation not implemented", which is both untrue and
+        // useless: it names no subsystem and no cause, and it is what a shell
+        // prints when it cannot fork, so every command on the machine reported
+        // the same thing and pointed at the kernel rather than at memory.
+        return Err(crate::abi::errno::ENOMEM);
     }
     Ok(child.root())
 }
