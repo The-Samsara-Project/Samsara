@@ -1601,6 +1601,7 @@ mod terminal_ioctl {
     pub const TCXONC: u32 = 0x540A;
     pub const TCFLSH: u32 = 0x540B;
     pub const TIOCGPTN: u32 = 0x80045430;
+    pub const TIOCSPTLCK: u32 = 0x40045431;
 }
 
 /// Return the ABI argument size for a terminal ioctl request.
@@ -1620,6 +1621,12 @@ fn ioctl_arg_len(cmd: u32) -> Option<usize> {
         TIOCGWINSZ | TIOCSWINSZ => Some(core::mem::size_of::<crate::drivers::pty::Winsize>()),
         // These all take or return a single `int`/`pid_t`.
         TIOCGPGRP | TIOCSPGRP | TIOCGSID | FIONREAD | TCXONC | TCFLSH | TIOCGPTN => Some(4),
+        // `TIOCSPTLCK` unlocks a pty slave so it can be opened. The driver
+        // accepts it, but the request never reached it: this table is consulted
+        // first, and a request that is not listed is rejected as unknown, so
+        // `unlockpt(3)` failed with ENOTTY and no `openpty(3)` could succeed --
+        // a whole pty pair was unreachable from every C program on the system.
+        TIOCSPTLCK => Some(4),
         TCSBRK => Some(4),
         // `TIOCSCTTY` is the one request whose argument is a *pointer* rather than
         // a value living in the caller's buffer, and the pointer is null in the
