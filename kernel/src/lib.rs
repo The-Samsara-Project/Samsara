@@ -154,6 +154,37 @@ pub extern "C" fn kmain(magic: u32, mbi_phys: u64) -> ! {
     if let Ok(km) = vfs::create("/etc/keymap.conf", vfs::NodeKind::File) {
         let _ = km.write_at(0, b"us\n");
     }
+
+    // `/etc/passwd`, so there is an account to log in as.
+    //
+    // The installer wrote this before. On a system that boots into ramfs there
+    // is nothing to install and no account to ask anyone for, so the kernel
+    // seeds the one it can vouch for: `root`, with the password `root`.
+    //
+    // That is not a shortcut around the password hasher -- the hash below was
+    // produced by `crypt(3)` in userspace, and the getty compares against it
+    // with the same `crypt(3)`. It is a real hash, checked the same way, and it
+    // was made for a password that is written down in this comment anyway.
+    //
+    // It is defensible only because of what a live session is: ramfs, gone at
+    // reboot, with no filesystem behind it and nothing outside it reachable. The
+    // account is uid 0 and the hash is readable by anything running, which is
+    // the same trade every distribution's live image makes for the same reason
+    // -- being unable to log in at all would make the image useless for the one
+    // thing it is for. An image that installs to disk must set a real password
+    // and must not inherit this one.
+    let passwd = b"root:$6$YI2UVUNzKgLmxLfg$jmzW2NRFInnlcZGLYmZnsH83BkzEaMWsMgaF6pKH.8kb8ezuUjoVQJ8RQMyvORjhNMeEbPCymdOlUMZQO4Kh41\n\
+                   nobody:x:65534:65534:nobody:/nonexistent:/bin/false\n";
+    if let Ok(pw) = vfs::create_as("/etc/passwd", vfs::NodeKind::File, 0, 0, 0o644) {
+        if let Err(e) = pw.write_at(0, passwd) {
+            log::kwarn!("seed: /etc/passwd write failed: {:?}", e);
+        }
+    }
+    // Group database, for the same reason: `setgid(0)` on a login reads it, and
+    // an absent file makes the group lookup fail for an account that exists.
+    if let Ok(g) = vfs::create_as("/etc/group", vfs::NodeKind::File, 0, 0, 0o644) {
+        let _ = g.write_at(0, b"root:x:0:\nnogroup:x:65534:\n");
+    }
     // World-writable scratch directory (sticky, so children only create).
     let _ = vfs::create_as("/tmp", vfs::NodeKind::Dir, 0, 0, 0o1777);
 
