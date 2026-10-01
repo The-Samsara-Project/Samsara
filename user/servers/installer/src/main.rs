@@ -877,18 +877,16 @@ impl App {
     /// pasted into the passwd database, which would look like a working login
     /// and be a special case in the one program that must not have any.
     fn hash_known(&mut self, password: &str) -> Option<String> {
-        // Two pipes, for the reason spelled out in `hash_password`: a password
-        // going in and a hash coming out are two directions and cannot share a
-        // pipe. The password here is one the installer already has, so it skips
-        // the prompting and goes straight into the child's end.
+        // Two pipes: a password going in and a hash coming out are two
+        // directions and cannot share one pipe. See `hash_password`, which is
+        // where this went wrong and why it was silent. The password here is one
+        // the installer already has, so it skips the prompting.
         let (pwd_rd, pwd_wr) = syscall::pipe().ok()?;
         let (hash_rd, hash_wr) = syscall::pipe().ok()?;
         let in_arg = alloc::format!("{}", pwd_rd);
         let out_arg = alloc::format!("{}", hash_wr);
         let argv = ["mkpasswd", in_arg.as_str(), out_arg.as_str()];
         let pid = syscall::proc_spawn(PROG_MKPASSWD, Some(&argv)).ok()?;
-        // The password never becomes a `String` on the way out, so it is not
-        // left in the installer's heap where a later bug could print it.
         let hash = hand_off_to_hasher(pid, pwd_wr, hash_rd, password.as_bytes());
         if hash.len() > 3 && hash.starts_with("$6$") {
             Some(hash)
