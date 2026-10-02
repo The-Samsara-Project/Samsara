@@ -166,7 +166,7 @@ say "booting"
 # something that happens in the first second only hides a failure behind a
 # timeout.
 wait_for "staged \"fbterm\"" 20 || fail "the terminal emulator did not start"
-sleep 4
+sleep 2
 shot 04-prompt
 
 echo
@@ -183,7 +183,7 @@ echo "PASS: the terminal came up asking who you are"
 
 # 2. A wrong password is refused.
 say "a wrong password is refused"
-type_str "root"; key ret; sleep 2
+type_str "root"; key ret; sleep 4
 type_str "definitely-not-it"; key ret; sleep 4
 shot 05-bad
 echo "--- screen after a wrong password ---"
@@ -196,7 +196,7 @@ echo "PASS: a wrong password is refused"
 
 # 3. The right password gets in, and the shell is not root.
 say "the right password gets in"
-type_str "root"; key ret; sleep 2
+type_str "root"; key ret; sleep 4
 type_str "$LIVE_PASSWORD"; key ret; sleep 6
 shot 06-in
 echo "--- screen after logging in ---"
@@ -220,10 +220,10 @@ echo "PASS: the shell is running as the user who logged in"
 # between a person and running one, and both failed silently for a long time: the
 # applet links in /bin have to exist, and there has to be memory to fork with.
 say "running a command"
-type_str "ls /"; key ret; sleep 5
+type_str "ls /"; key ret; sleep 6
 shot 07b-ls
 echo "--- ls / ---"
-decode "$SHOTS/07b-ls.ppm" | tail -6
+decode "$SHOTS/07b-ls.ppm" | tail -8
 # The root directory is seeded by the kernel and always has these, so their
 # absence means the command did not run -- not that there was nothing to list.
 if ! decode "$SHOTS/07b-ls.ppm" | grep -q 'bin'; then
