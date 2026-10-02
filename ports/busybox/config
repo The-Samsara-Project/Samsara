@@ -174,7 +174,31 @@ CONFIG_BASH_IS_NONE=y
 # is most of what makes a busybox shell feel fast, and it costs one comparison
 # per command.
 CONFIG_FEATURE_SH_STANDALONE=y
-CONFIG_FEATURE_SH_NOFORK=y
+
+# NOT enabled, and the reason is worth writing down because the option is
+# described as costing nothing.
+#
+# NOFORK runs an applet by calling its main() inside the shell process: no fork,
+# no exec, one comparison per command. It needs the applet to share the shell's
+# stdio, allocator and globals, and it gets that by saving and restoring the
+# ones it knows about.
+#
+# On this system `ls /` printed nothing at all. Not an error, no output, prompt
+# straight back -- and `ls` run as an ordinary exec of `/bin/busybox` listed the
+# directory correctly, from the same binary and the same libc. So the applet was
+# fine and the in-process path was not.
+#
+# What it does that a fork does not: it never execs, so it never rebuilds the
+# process image. The applet's own libc state -- stdio buffers already holding
+# the shell's output, the allocator's arena, `errno` -- is whatever the shell
+# left behind, and the save area covers the busybox globals but not mlibc's.
+# An applet that writes through stdio therefore writes into buffers that were
+# filled for output the shell has already "sent", and its output goes nowhere.
+#
+# Forking costs a page-table copy and costs it honestly, which is the trade this
+# system wants: a command that prints what it was asked to print, with nothing
+# shared with the shell that could swallow it.
+# CONFIG_FEATURE_SH_NOFORK is not set
 
 # Job control. Not speculative: the pty layer implements process groups, setsid
 # and TIOCSPGRP, and without this the shell would be unable to use what it has.
