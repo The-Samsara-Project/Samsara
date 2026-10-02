@@ -59,6 +59,7 @@ fail() {
 qemu-system-x86_64 \
     -cdrom "$ISO" \
     -cpu qemu64,+rdseed,+rdrand \
+    -m "${SAMSARA_MEM:-2048}" \
     -serial "file:$LOG" \
     -display none \
     -no-reboot \
@@ -210,6 +211,29 @@ if ! decode "$SHOTS/07-whoami.ppm" | grep -q "root"; then
 fi
 echo
 echo "PASS: the shell is running as the user who logged in"
+
+# 3c. An ordinary command.
+#
+# This is the check that says whether the machine is usable rather than merely
+# bootable. `whoami` and `exit` are the shell's own builtins; anything else is a
+# separate program that has to be found, forked and executed. Two things stand
+# between a person and running one, and both failed silently for a long time: the
+# applet links in /bin have to exist, and there has to be memory to fork with.
+say "running a command"
+type_str "ls /"; key ret; sleep 5
+shot 07b-ls
+echo "--- ls / ---"
+decode "$SHOTS/07b-ls.ppm" | tail -6
+# The root directory is seeded by the kernel and always has these, so their
+# absence means the command did not run -- not that there was nothing to list.
+if ! decode "$SHOTS/07b-ls.ppm" | grep -q 'bin'; then
+    fail "an ordinary command did not run: /bin is not in the listing of /"
+fi
+if decode "$SHOTS/07b-ls.ppm" | grep -qiE 'not found|not implemented|cannot|No such'; then
+    fail "an ordinary command was refused"
+fi
+echo
+echo "PASS: an ordinary command runs"
 
 # 4. Logout returns to a prompt.
 say "logging out"

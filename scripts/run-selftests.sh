@@ -37,6 +37,7 @@ mkdir -p "$SHOTS"
 qemu-system-x86_64 \
     -cdrom "$ROOT/samsara.iso" \
     -cpu qemu64,+rdseed,+rdrand \
+    -m "${SAMSARA_MEM:-2048}" \
     -serial "file:$LOG" \
     -display none \
     -no-reboot \

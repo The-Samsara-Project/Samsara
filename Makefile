@@ -15,6 +15,21 @@ KERNEL_ELF := target/samsara.elf
 ISO        := samsara.iso
 ISODIR     := isodir
 
+# RAM to give the machine, in megabytes.
+#
+# QEMU's default is 128 MiB, and that is not enough to run this one. A program
+# image is 8 MiB and every `fork` copies the whole user address space, so a
+# login prompt costs one copy of fbterm's image plus its own before any command
+# runs -- and there are four or five programs resident at once by then.
+#
+# With 128 MiB the allocator is completely full by the time anyone types
+# anything, and every command that needs a child fails. Nothing says the machine
+# is too small for what it is doing: `fork` reports ENOMEM, which is true, and
+# the frame counts in the log say 32639 of 32639, which is the whole story.
+#
+# So the machine is given room to work in, which is what a real one has.
+MEM       ?= 2048
+
 LLD := ld.lld
 
 # Prefer the rustup-managed toolchain over any distro rustc.
@@ -174,6 +189,7 @@ run: iso# `+rdseed,+rdrand` asks QEMU to present the hardware entropy instructio
 	qemu-system-x86_64 \
 	    -cdrom $(ISO) \
 	    -cpu qemu64,+rdseed,+rdrand \
+	    -m $(MEM) \
 	    -serial stdio \
 	    -display none \
 	    -no-reboot
@@ -183,6 +199,7 @@ run-fbterm:
 	qemu-system-x86_64 \
 	    -cdrom samsara-fbterm.iso \
 	    -cpu qemu64,+rdseed,+rdrand \
+	    -m $(MEM) \
 	    -serial stdio \
 	    -display none \
 	    -no-reboot
@@ -191,6 +208,7 @@ debug: iso
 	qemu-system-x86_64 \
 	    -cdrom $(ISO) \
 	    -cpu qemu64,+rdseed,+rdrand \
+	    -m $(MEM) \
 	    -serial stdio \
 	    -display none \
 	    -no-reboot \
