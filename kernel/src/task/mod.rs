@@ -217,10 +217,22 @@ impl Task {
             kstack,
             saved_rsp,
             entry: None,
-            started: false,
+            // Already true, and this is load-bearing rather than a detail.
+            //
+            // A forked child does not start at a program entry: it resumes by
+            // replaying its own copy of the parent's syscall frame, and
+            // `initial_fork_saved_rsp` above has already staged that context.
+            // Leaving this false made the scheduler treat the child as a thread
+            // that had never run and stage an entry for it instead, overwriting
+            // the staged frame with a null user stack -- so every child faulted
+            // on its first return to user land, before it could run a single
+            // instruction. The parent saw a successful `fork`, the child died
+            // silently, and a shell that forks to run a command got nothing at
+            // all: no output, no error, and a prompt straight back.
+            started: true,
             as_root: Some(as_root),
             fs_base: 0,
-            user: None, // patched by the fork machinery before it runs
+            user: None,
             endpoint: 0,
             parent: None,
             io_allow: [0xFF; 128],
