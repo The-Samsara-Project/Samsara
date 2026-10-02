@@ -357,6 +357,42 @@ fn seed_userland() {
             log::kdebug!("userland: /bin/getty seeded, {} bytes", getty.len());
         }
     }
+
+    // The self-test programs, under `/test` rather than `/bin`.
+    //
+    // They are images the kernel already carries, and the installer used to be
+    // what ran them -- its diagnostics menu was the only path that reached a tty,
+    // because a boot-spawned test does not: three tty bugs survived a green suite
+    // that way. With the installer gone they have to be run by someone at a login
+    // prompt instead, and that requires the images to be files.
+    //
+    // `/bin` is the wrong place for them. It is where `busybox --install` puts
+    // its links, and a test binary sitting there would be indistinguishable from
+    // an applet -- and `PROG_CHELLO` in particular is a different program from
+    // anything busybox ships, so nothing would say which is which.
+    let tests: [(usize, &str); 7] = [
+        (crate::user::PROG_CHELLO, "chello"),
+        (crate::user::PROG_FORKX, "forkx"),
+        (crate::user::PROG_PIPETEST, "pipetest"),
+        (crate::user::PROG_CREDTST, "credtst"),
+        (crate::user::PROG_SIGNALTST, "signaltst"),
+        (crate::user::PROG_TERMIOS_TST, "termiostst"),
+        (crate::user::PROG_EXECTST, "exectst"),
+    ];
+    let _ = vfs::create_as("/test", vfs::NodeKind::Dir, 0, 0, 0o755);
+    {
+        for (prog, name) in tests {
+            let image = crate::user::PROGRAMS[prog].image;
+            let path = alloc::format!("/test/{}", name);
+            match vfs::create_as(&path, vfs::NodeKind::File, 0, 0, 0o755) {
+                Ok(node) => match node.write_at(0, &image) {
+                    Ok(_) => log::kdebug!("userland: {} seeded, {} bytes", path, image.len()),
+                    Err(e) => log::kwarn!("userland: {} write failed: {:?}", path, e),
+                },
+                Err(e) => log::kwarn!("userland: {} create failed: {:?}", path, e),
+            }
+        }
+    }
 }
 
 /// Log the active framebuffer console's grid size, if one is up.
