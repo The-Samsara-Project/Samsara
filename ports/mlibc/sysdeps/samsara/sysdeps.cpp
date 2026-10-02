@@ -775,6 +775,29 @@ int Sysdeps<Fchdir>::operator()(int fd) {
 	return ENOSYS;
 }
 
+int Sysdeps<Access>::operator()(const char *path, int mode) {
+	// `access(2)` is what a program asks before it decides a file is runnable,
+	// and busybox asks it about every name on every PATH search: without it,
+	// `ls` is not merely unrunnable, it does not exist as far as the shell is
+	// concerned, and `ls /` prints nothing at all rather than an error.
+	//
+	// It is answered by asking the kernel for a stat, which resolves the path
+	// under the caller's own credentials. So existence, and permission to reach
+	// the node, are exact. The R_OK/W_OK/X_OK distinctions are not: the kernel's
+	// permission bits are not consulted separately here, so a caller asking only
+	// for X_OK gets the same answer as one asking for W_OK. That is stated here
+	// because the alternative -- refusing -- makes the function useless.
+	if (!path) {
+		return EFAULT;
+	}
+	struct stat st;
+	int e = sysdep<Stat>(mlibc::fsfd_target::fd_path, AT_FDCWD, path, 0, &st);
+	if (e)
+		return e;
+	(void)mode;
+	return 0;
+}
+
 int Sysdeps<Faccessat>::operator()(int dirfd, const char *pathname, int mode, int flags) {
 	(void)dirfd;
 	(void)flags;

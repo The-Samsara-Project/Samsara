@@ -41,6 +41,7 @@ struct SamsaraSysdepTags :
 	Chdir,
 	GetCwd,
 	Fchdir,
+	Access,
 	Faccessat,
 	Umask,
 	Chmod,
