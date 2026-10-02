@@ -19,8 +19,22 @@
 #include <poll.h>
 #include <stdint.h>
 
-/* The boot console pty slave: the only terminal a test process can reach. */
-#define KEY_SLAVE_PATH "/dev/pts/0"
+/* The terminal this process is actually running on.
+ *
+ * Not a fixed path. It used to be `/dev/pts/0`, which was the only pty there
+ * was while the installer ran these tests from its own menu. A login session gets
+ * a pty of its own now, so `/dev/pts/0` is the boot console and belongs to a
+ * different session -- and a test that opened it found a terminal with nothing
+ * on it, checked nothing, and reported success.
+ *
+ * `ttyname(3)` on stdin is what names the terminal the caller is attached to,
+ * which is the one whose line discipline and job control these checks are about.
+ */
+static const char *key_slave_path(void)
+{
+	const char *name = ttyname(0);
+	return name && *name ? name : "/dev/pts/0";
+}
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/random.h>
@@ -61,9 +75,10 @@ int main(int argc, char **argv) {
 	// isatty(3) must agree with the kernel. This is the check that motivated
 	// the TTY work: a stub that always answers "yes" makes stdio line-buffer a
 	// file, which silently corrupts redirected output.
-	int fd = open("/dev/pts/0", O_RDWR, 0);
+	int fd = open(key_slave_path(), O_RDWR, 0);
 	if (fd < 0) {
-		printf("[chello] SKIP terminal checks: %s\n", strerror(errno));
+		printf("[chello] SKIP terminal checks on %s: %s\n",
+		       key_slave_path(), strerror(errno));
 	} else {
 		check(isatty(fd) == 1, "isatty(tty) == 1");
 
@@ -518,7 +533,7 @@ int main(int argc, char **argv) {
 		check(0, "pipe() for fstat");
 	}
 
-	int tf = open("/dev/pts/0", O_RDWR, 0);
+	int tf = open(key_slave_path(), O_RDWR, 0);
 	if (tf >= 0) {
 		int ok = fstat(tf, &sb) == 0;
 		check(ok && S_ISCHR(sb.st_mode), "fstat: terminal is S_IFCHR");
@@ -1093,7 +1108,7 @@ int main(int argc, char **argv) {
 		// not this one. TIOCSPGRP must therefore be *refused*: a process
 		// outside a terminal's session has no business redirecting it, and
 		// letting it would hand one session control of another's terminal.
-		int boot_tty = open(KEY_SLAVE_PATH, O_RDWR, 0);
+		int boot_tty = open(key_slave_path(), O_RDWR, 0);
 		if (boot_tty >= 0) {
 			pid_t tsid = 0;
 			ioctl(boot_tty, TIOCGSID, &tsid);
