@@ -9,16 +9,6 @@
 # grub/ holds the prebuilt boot stub, not build products, so it stays tracked
 # despite the *.o / *.bin rules above.
 !grub/**
-
-# 7d3f9a2c/ is a reference checkout of another OS used as a gap-analysis
-# baseline (see DONTTOUCH.md). It is not Samsara source, nothing in the build
-# reads it, and it carries its own .git -- so it is deliberately untracked
-# rather than vendored, and its name is deliberately opaque so the tree does
-# not advertise where the reference came from. Re-create it with:
-#
-#   git clone <upstream> 7d3f9a2c
-#
-# DONTTOUCH.md is untracked for the same reason: it is a working note about
-# that checkout, not documentation of this system.
 /7d3f9a2c
 /DONTTOUCH.md
+/scripts
