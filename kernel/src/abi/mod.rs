@@ -3045,7 +3045,7 @@ fn sys_exec(prog: u64, argv: u64, _a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64
 /// program is whatever the path resolves to. That is the whole difference from
 /// [`EXEC`], which loads one of the kernel's own embedded images, and it is what
 /// lets a shell run a file it found rather than one the kernel happened to carry.
-fn sys_execve(path: u64, path_len: u64, argv: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
+fn sys_execve(path: u64, path_len: u64, argv: u64, envp: u64, _a5: u64, _a6: u64) -> i64 {
     let task = match current_task() {
         Ok(t) => t,
         Err(e) => return e,
@@ -3067,6 +3067,33 @@ fn sys_execve(path: u64, path_len: u64, argv: u64, _a4: u64, _a5: u64, _a6: u64)
         alloc::vec![task_abs_path(&path_str)]
     } else {
         args
+    };
+
+    // The caller's environment, not this task's recorded one.
+    //
+    // `envp` is the environment the new image should have, and it is not always
+    // the same as the one this task was started with: a shell builds a fresh one
+    // per command, so `FOO=bar ls` gives a child an `FOO` its parent never had.
+    //
+    // Using the recorded environment instead discarded the difference, and left
+    // libc's `environ` pointing into a buffer the kernel had not staged. ash
+    // assembles `envp` into a reallocating string stack, so the pointers in it
+    // are unrelated to the parent's; the new image was handed one set of strings
+    // while libc read another. The result was fragments of freed heap printed as
+    // program output -- no error, no crash, just wrong bytes on the terminal.
+    //
+    // Null is accepted and means "keep what this task had", so a caller that
+    // genuinely has no environment (a bare `execve` from an assembly stub) still
+    // gets the previous behaviour rather than an empty one.
+    let env = if envp == 0 {
+        crate::task::sched::task_env(task)
+    } else {
+        unsafe { read_argv(envp) }
+    };
+    let env = if env.is_empty() {
+        crate::task::sched::task_env(task)
+    } else {
+        env
     };
 
     let cred = crate::cred::get(task);
@@ -3111,7 +3138,7 @@ fn sys_execve(path: u64, path_len: u64, argv: u64, _a4: u64, _a5: u64, _a6: u64)
     // truncated underneath, and only the second one is what got loaded.
     crate::log::kdebug!("execve: {} -> {} bytes", path_str, image.len());
 
-    match crate::task::sched::exec_path(image, args, &path_str) {
+    match crate::task::sched::exec_path_with_env(image, args, &path_str, env) {
         // exec_path only returns on failure.
         Err(e) => e,
         Ok(()) => errno::ENOENT,

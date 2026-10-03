@@ -1408,6 +1408,38 @@ pub fn exec_path(image: Vec<u8>, args: Vec<String>, name: &str) -> Result<(), i6
     exec_finish(cur, loaded, args, env)
 }
 
+/// [`exec_path`] with an environment the caller chose.
+///
+/// A shell builds a fresh environment for every command it runs, from a buffer
+/// it reallocates as that grows. `exec_path` takes this task's *recorded*
+/// environment instead, which is not that one, so the new image is handed strings
+/// libc is not reading and the mismatch surfaces as fragments of the shell's old
+/// heap printed as a program's output.
+///
+/// Taking `env` from the caller is what `FOO=bar ls` needs and what `execve(3)`
+/// promises: the environment the caller handed over is the environment the
+/// program gets.
+pub fn exec_path_with_env(
+    image: Vec<u8>,
+    args: Vec<String>,
+    name: &str,
+    env: Vec<String>,
+) -> Result<(), i64> {
+    let cur = CURRENT_ID.load(Ordering::Relaxed);
+    if cur == SCHEDULER_ID {
+        return Err(crate::abi::errno::EPERM);
+    }
+    let args = with_program_name(name, args);
+    let cwd = current_cwd();
+    let env = if env.is_empty() {
+        crate::user::default_env(&cwd)
+    } else {
+        env
+    };
+    let loaded = crate::user::build_image_bytes(&image, name, &args, &env)?;
+    exec_finish(cur, loaded, args, env)
+}
+
 /// Swap task `cur` onto a freshly loaded image and drop to ring 3. Split out of
 /// [`exec_current`] so the envp-staging decision stays with its caller.
 fn exec_finish(

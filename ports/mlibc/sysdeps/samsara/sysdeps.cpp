@@ -417,7 +417,23 @@ int Sysdeps<Execve>::operator()(const char *path, char *const argv[],
 	// A successful exec never returns; mlibc's caller asserts as much. Reaching the
 	// return at all means the kernel reported a failure, and it reports failures
 	// as a negative value rather than by setting errno.
-	auto ret = syscall(SYSCALL_EXECVE, (long)path, (long)strlen(path), (long)argv);
+	// envp is passed on rather than discarded.
+	//
+	// The kernel used to take the environment from its own per-task record and
+	// ignore this argument, which worked while every program's environment was
+	// whatever the kernel seeded at exec. It stopped working when a program built
+	// one: ash assembles `envp` with `listvars` into a buffer it reallocates as it
+	// grows, so the environment a child inherits can differ from the parent's
+	// recorded one -- per-command variable assignments, exported changes, the lot.
+	//
+	// Discarding it left libc's `environ` pointing at the old buffer in the new
+	// image while the kernel had staged a different one. The shell then printed
+	// fragments of freed heap as program output: `echo hello` appeared to work and
+	// the row after it came out as the tail of earlier commands and stale variable
+	// assignments. Nothing failed, no program was killed, and the output was
+	// simply wrong -- which is why it looked like an unstable `echo` rather than
+	// a discarded argument.
+	auto ret = syscall(SYSCALL_EXECVE, (long)path, (long)strlen(path), (long)argv, (long)envp);
 	if (ret < 0) {
 		return -ret;
 	}
