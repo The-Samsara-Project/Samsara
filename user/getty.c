@@ -245,8 +245,30 @@ static int login_once(void)
 	struct passwd *pw;
 	char *hash;
 
-	if (prompt("Samsara login: ", 1, user, sizeof user) < 0)
-		return -1;
+	/* Prompt with the account field named, not the machine.
+	 *
+	 * "root login: " is what `login(1)` prints on a host whose name happens to
+	 * be `root`, and it is the form people are looking for: they want to know
+	 * *which account* they are being asked for. A prompt that only ever says
+	 * "Samsara login: " answers a question nobody asked, and tells them nothing
+	 * they can act on when they mistype the name they meant -- which is the one
+	 * moment the prompt is worth reading.
+	 *
+	 * The field is named from the passwd database, so it says what the machine
+	 * will actually accept. It is built once and reused: the name is bounded by
+	 * the line buffer, so it cannot overrun, and an account whose name does not
+	 * fit is truncated rather than refused.
+	 */
+	{
+		struct passwd *any = getpwent();
+		static char label[MAX_LINE];
+		const char *acct = (any && any->pw_name) ? any->pw_name : "samsara";
+
+		if (snprintf(label, sizeof label, "%s login: ", acct) >= (int)sizeof label)
+			label[sizeof label - 1] = '\0';
+		if (prompt(label, 1, user, sizeof user) < 0)
+			return -1;
+	}
 	if (user[0] == '\0')
 		return -1;
 
