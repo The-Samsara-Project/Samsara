@@ -562,7 +562,30 @@ pub fn block_until(deadline: Option<u64>) {
     }
     {
         let mut g = SCHED.lock();
-        g.tasks.get_mut(&TaskId(cur)).expect("unknown task").state = State::Blocked;
+        let t = g.tasks.get_mut(&TaskId(cur)).expect("unknown task");
+        // A wake that arrived between the caller's readiness check and this
+        // moment already set `wake_pending`; consume it and return without
+        // sleeping, so the caller re-checks and sees the data.
+        //
+        // `sleep_ticks` above has had this check since it was written, and
+        // `block_until` did not -- which is why the pty waiter could hang
+        // forever while everything built on `sleep_ticks` behaved. The sequence
+        // is short and needs no unlucky interruption: a reader checks for data,
+        // finds none, and is handed a keystroke in the window before it is
+        // marked blocked. The wake fires, finds a task that is not blocked yet,
+        // sets `wake_pending`, and the task then sleeps on a byte that arrived
+        // before it slept.
+        //
+        // With no deadline there is nothing to re-probe on -- an infinite
+        // `poll` or `select` passes `None` -- so the wake is simply lost and the
+        // process stops responding for the rest of the session. Nothing on the
+        // screen says why, which is why this presents as a terminal that
+        // freezes rather than as a lost interrupt.
+        if t.wake_pending {
+            t.wake_pending = false;
+            return;
+        }
+        t.state = State::Blocked;
         if let Some(at) = deadline {
             g.sleepers.push((TaskId(cur), at));
         }
@@ -576,6 +599,16 @@ pub fn block_until(deadline: Option<u64>) {
             core::arch::asm!("cli", options(nomem, nostack));
         }
     }
+    // Resumed by a wake: drop the flag it set, so the next park in this loop
+    // can actually block instead of returning immediately and spinning. Without
+    // this a `poll` loop would re-check its condition without ever sleeping,
+    // which is the same CPU burn as spinning -- just with more steps.
+    SCHED
+        .lock()
+        .tasks
+        .get_mut(&TaskId(cur))
+        .expect("unknown task")
+        .wake_pending = false;
 }
 
 /// Drop the current thread's pending timeout-sleeper entry (if any). Callers
