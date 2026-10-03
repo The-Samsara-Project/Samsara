@@ -15,8 +15,8 @@ Copyright (C) 2026 Harsh Nikarsa. Licensed under the GNU GPL v3 or later.
 
 Two halves, usually named together as Samsara/Nutcracker.
 
-- **Samsara** — the kernel. Boot path, memory, scheduler, drivers, syscall ABI.
-- **Nutcracker** — userspace. Ring-3 processes, a freestanding Rust runtime, and
+- **Samsara**, the kernel. Boot path, memory, scheduler, drivers, syscall ABI.
+- **Nutcracker**, userspace. Ring-3 processes, a freestanding Rust runtime, and
   an mlibc port so C programs can run on it.
 
 It is not Linux and does not try to be. There is no compatibility layer
@@ -55,7 +55,7 @@ GRUB hands off through Multiboot2. A stub walks 32-bit protected mode, PAE and
 LME into long mode, building identity and higher-half page tables on the way.
 Everything above the stub is linked in the higher half.
 
-`CR0`/`CR4` get the feature bits ring 3 needs before anything else runs —
+`CR0`/`CR4` get the feature bits ring 3 needs before anything else runs:
 OSFXSR and OSXMMEXCPT, because an x86-64 C binary emits SSE by default and traps
 on its first vector instruction without them.
 
@@ -91,7 +91,7 @@ process in turn.
 
 A real line discipline on a PTY, not a byte pump:
 
-- Canonical mode with the editing keys a terminal should have — ERASE, WERASE,
+- Canonical mode with the editing keys a terminal should have: ERASE, WERASE,
   KILL, LNEXT, REPRINT, DISCARD.
 - ISIG, plus VSUSP/VSTART/VSTOP so `^Z` and `^Q` work.
 - IXON flow control.
@@ -128,8 +128,8 @@ process. Worth getting right: a libc reporting milliseconds since boot as
 
 ### Input
 
-PS/2 keyboard on the main channel — scancode set 1, make/break, E0 extensions,
-modifier tracking with LED sync — and a mouse on the aux port. On top,
+PS/2 keyboard on the main channel (scancode set 1, make/break, E0 extensions,
+modifier tracking with LED sync) and a mouse on the aux port. On top,
 `/dev/input/event0` presents both as one evdev-style stream, which is the only
 input interface a ported terminal knows how to read.
 
@@ -185,8 +185,8 @@ slave.
 `/bin/getty` is the login prompt. It reads a name, hashes the typed password
 with `crypt(3)`, compares, drops privileges and execs the account's login shell.
 It loops on logout rather than exiting, so logging out returns to a prompt
-instead of to nothing. Root's shell is `/bin/sh`, not the getty — otherwise the
-getty execs itself forever.
+instead of to nothing. Root's shell is `/bin/sh`, not the getty, because
+otherwise the getty execs itself forever.
 
 `/bin/mkpasswd` is a separate C program because the Rust programs use a
 freestanding std that does not link the libc port, so it cannot call `crypt(3)`
@@ -202,7 +202,7 @@ the others are `forkx`, `pipetest`, `credtst`, `signaltst`, `termiostst` and
 `exectst`.
 
 Running them at a login prompt rather than spawning them is deliberate. Every
-one of them runs, prints and exits — none of them waits for somebody to type a
+one of them runs, prints and exits. None of them waits for somebody to type a
 password and then exec a shell. Four bugs lived in exactly that gap, and all
 four presented the same way: a program that stops responding, with nothing
 crashed and no error returned. The only check that catches them is one that
@@ -221,7 +221,7 @@ Two rules worth knowing before touching it:
 
 1. **An int sysdep returns the errno value**, not `-1`, and does not set errno.
    mlibc does that translation itself. Getting it backwards does not fail
-   loudly — it makes buffered writes fail silently while unbuffered ones keep
+   loudly. It makes buffered writes fail silently while unbuffered ones keep
    working, which is miserable to debug from the wrong end.
 2. **Say no when the answer is no.** A missing capability returns `ENOSYS` rather
    than a plausible-looking number. A caller told no can fall back; one handed a
@@ -253,7 +253,7 @@ request number, so a program cannot talk it into reading out of bounds.
 ### Thread blocks
 
 The loader lays out a thread block for every image with thread-local storage and
-the libc constructs it. The split is not a preference — the mlibc `Tcb` is a C++
+the libc constructs it. The split is not a preference. The mlibc `Tcb` is a C++
 type in a library the kernel does not link, and the kernel is what replaced the
 dynamic loader, so the kernel is what knows where the block is.
 
@@ -261,7 +261,7 @@ Layout is the one the toolchain assumed: thread-locals at the bottom, the `Tcb`
 directly above, `FS` pointing at the top. Two things bite if you change it. A
 libc finds its `Tcb` by treating the thread pointer as the block address, but
 the first field inside that block is a self-pointer, so the real address has to
-be handed over separately — `AT_TCB` in the initial stack auxv. And `wrmsr`
+be handed over separately: `AT_TCB` in the initial stack auxv. And `wrmsr`
 takes its value in `EDX:EAX`, not `RAX`; getting that wrong installs the ring-3
 code selector as the high half of the thread pointer.
 
@@ -284,12 +284,12 @@ code selector as the high half of the thread pointer.
 The libc port is part of the normal build: a kernel without the programs that
 link against it is not a bootable machine.
 
-Each C program has its own script — `user/build-chhello.sh`, `user/build-getty.sh`,
-`user/build-mkpasswd.sh` — and each is a worked example of the same path:
-freestanding clang, `-static-pie`, sysroot headers, and lld's default linker
-script with only `--image-base` changed. The default script is deliberate; it
-already gets `PT_LOAD`, `PT_TLS`, the init array and `.bss` right, where a
-hand-written one tends to get several of them wrong at once.
+Each C program has its own script (`user/build-chhello.sh`,
+`user/build-getty.sh`, `user/build-mkpasswd.sh`), and each is a worked example
+of the same path: freestanding clang, `-static-pie`, sysroot headers, and lld's
+default linker script with only `--image-base` changed. The default script is
+deliberate. It already gets `PT_LOAD`, `PT_TLS`, the init array and `.bss`
+right. A hand-written one tends to get several of them wrong at once.
 
 The kernel is a zero-dependency `#![no_std]` static library linked by hand with
 lld. Any Multiboot2 loader can boot it, and the ISO works from CD or USB.
@@ -319,7 +319,7 @@ Code, commit messages, commentary and documentation generated in whole or in par
 by an AI tool will not be accepted.
 
 This is not about code quality, even though AI output can compile and pass tests
-and still be wrong in ways that only show up in a kernel — wrong memory ordering,
+and still be wrong in ways that only show up in a kernel: wrong memory ordering,
 syscall paths that work but break the ABI contract, drivers that handle the common
 case and corrupt state on the edge. Reviewing that costs more time than writing
 it properly would, and there is not the reviewer bandwidth to do it safely.
@@ -330,7 +330,7 @@ even when it works.
 
 Using an AI tool to look something up, learn a concept, or sanity check your own
 understanding while writing a patch yourself is fine. That is research. The line
-is the code and the words in the patch — they have to be yours, written and
+is the code and the words in the patch. They have to be yours, written and
 understood by you.
 
 Submitting a patch confirms it is your own work and not the output of a tool.
