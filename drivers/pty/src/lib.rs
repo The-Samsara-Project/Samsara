@@ -1034,11 +1034,37 @@ impl CharDevice for PtyMasterDevice {
             if self.master.closed.load(Ordering::Acquire) {
                 return true;
             }
-            if self.master.has_data() {
-                return true;
-            }
+            // Register *before* looking for data, not after.
+            //
+            // Checking first and registering second leaves a window: a write
+            // landing between the two sees an empty waiter list, wakes nobody,
+            // and the reader parks on data that is already sitting in the buffer
+            // it was about to read. Nothing else wakes it -- the wake already
+            // happened, and the data will not arrive again -- so the reader is
+            // stuck for good. On a terminal that is a shell that stops accepting
+            // commands partway through a session, with nothing on screen saying
+            // why.
+            //
+            // Registering first inverts the failure: the write wakes a task that
+            // was about to park anyway, which costs one spurious wakeup and then
+            // finds the data. Strictly better, and the ordering is the whole
+            // fix.
+            //
             // SAFETY: the kernel exports this symbol (kernel/src/lib.rs).
             self.master.read_waiters.register(unsafe { tty_current_task() });
+            if self.master.has_data() {
+                // Left registered on purpose.
+                //
+                // Unregistering here is the obvious tidy-up and it reintroduces
+                // the bug one step later: a writer that pushed data and took the
+                // waiter list between this `has_data` and an `unregister` would
+                // wake a task that is no longer in the list, and the data that
+                // writer pushed would then sit unread with nobody waiting for it.
+                // The entry is stale but harmless -- `wake_all` clears the list,
+                // so the next write either wakes this task once more (it re-reads
+                // and finds the data) or finds the list already empty.
+                return true;
+            }
         }
         let _ = task;
         false
@@ -1125,11 +1151,22 @@ impl CharDevice for PtySlaveDevice {
                 // Closed terminal: report ready so the reader observes EOF.
                 return true;
             }
-            if self.slave.has_data() {
-                return true;
-            }
+            // Register before checking, for the reason given on the master above:
+            // checking first leaves a window in which input arrives, wakes nobody,
+            // and leaves the reader parked on data that is already buffered. The
+            // shell blocks in `read` waiting for a keystroke it already has, and
+            // a login that stops asking for the password is the same failure
+            // seen once instead of repeatedly.
+            //
             // SAFETY: the kernel exports this symbol (kernel/src/lib.rs).
             self.slave.read_waiters.register(unsafe { tty_current_task() });
+            if self.slave.has_data() {
+                // Left registered on purpose, for the reason given on the master
+                // above: unregistering here would let a writer that already took
+                // the waiter list drop a wakeup on the floor, and the data it
+                // pushed would sit unread with nobody left waiting for it.
+                return true;
+            }
         }
         let _ = task;
         false
